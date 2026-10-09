@@ -21,7 +21,7 @@ local HttpService = game:GetService("HttpService")
 local CoreGui = game:GetService("CoreGui")
 local LocalPlayer = Players.LocalPlayer
 if not LocalPlayer then return warn("[RankPilot] LocalPlayer not available") end
-print("[RankPilot] v2.8 loading...")
+print("[RankPilot] v2.9 loading...")
 
 local environment = (type(getgenv) == "function" and getgenv()) or _G
 if type(environment.RankPilot) == "table" and type(environment.RankPilot.Stop) == "function" then
@@ -60,6 +60,10 @@ local Config = {
     AutoUltimate = true,        -- Fire the equipped ultimate whenever it is charged
     UltimateSeconds = 3,
     SkipEggAnimation = true,    -- Patch out the egg-opening animation / auto-click "Click to open"
+    SmartHatchSettings = true,  -- Charged / Golden eggs OFF unless a quest needs them
+    ChargedForRareQuests = true, -- Charged (lucky, 20x cost) ON for "hatch legendary/rare pets" quests
+    GoldenEggsForGoldQuests = true, -- Golden eggs (50x cost) ON for golden/rainbow pet quests
+    AutoGoldRainbow = true,     -- Gold / Rainbow machine for "make golden/rainbow pets" quests
     TargetsPerTick = 6,         -- Breakables damaged / pets spread across per farm pass
     FastTickSeconds = 0.25,
     FastFarmSeconds = 0.1,
@@ -80,7 +84,7 @@ local Config = {
     SlotCheckSeconds = 28,
     GiftCheckSeconds = 65,
     HatchActionSeconds = 3.5,
-    FastHatchSeconds = 1.5,
+    FastHatchSeconds = 1.2,
     TripSettleSeconds = 0.3,   -- Wait after teleporting before acting, so the server sees the new position
     ConsumableSeconds = 6,
     SpawnItemSeconds = 14,
@@ -115,6 +119,10 @@ local optionOrder = {
     {"AutoTap", "Auto tap"},
     {"AutoUltimate", "Auto ultimate"},
     {"SkipEggAnimation", "Skip egg animation"},
+    {"SmartHatchSettings", "Charged/Golden eggs only for quests"},
+    {"ChargedForRareQuests", "Charged eggs for legendary quests"},
+    {"GoldenEggsForGoldQuests", "Golden eggs for gold/rainbow quests"},
+    {"AutoGoldRainbow", "Gold / rainbow machine quests"},
     {"RenderOff", "Disable 3D rendering"},
 }
 
@@ -129,7 +137,7 @@ local state = {
     lastFarm = 0, lastHatch = 0, lastConsumable = 0, lastEventItem = 0,
     lastPetAssign = 0, lastAssignedTarget = nil, lastEquip = 0, lastMagnet = 0,
     bulkUnsupported = false, upgradeSkip = {}, probing = {}, lastTargets = {}, lastTargetsAt = 0,
-    hatchLo = 1, hatchHi = 0, hatchResetAt = 0, hatchFails = 0, machineSpots = {}, eggCost = {}, farmHome = nil,
+    hatchLo = 1, hatchHi = 0, hatchResetAt = 0, hatchFails = 0, machineSpots = {}, eggCost = {}, farmHome = nil, hatchOptionTries = {}, hatchOptionPausedUntil = {}, activeGoals = {},
     lastSlots = 0, lastGifts = 0, lastFarmInterface = "none",
     attempts = {farm = 0, hatch = 0, zone = 0, consumable = 0},
     lastPosition = nil, generations = 0, connections = {}, gui = nil,
@@ -200,7 +208,8 @@ local function refreshClients()
     if type(c) ~= "table" then c = {} end
     for _,name in ipairs({"Save", "QuestCmds", "ZoneCmds", "RankCmds", "PetCmds", "EggCmds",
         "FruitCmds", "PotionCmds", "ZoneFlagCmds", "InventoryCmds", "RebirthCmds",
-        "MapCmds", "CurrencyCmds", "MachineCmds", "PlayerPet", "BreakableFrontend", "UltimateCmds"}) do
+        "MapCmds", "CurrencyCmds", "MachineCmds", "PlayerPet", "BreakableFrontend", "UltimateCmds",
+        "HatchingCmds", "MasteryCmds"}) do
         if not c[name] then c[name] = tryModule(findChild(clientFolder, name)) end
     end
     c.Network = c.Network or tryModule(findChild(clientFolder, "Network"))
@@ -208,6 +217,7 @@ local function refreshClients()
     c.RanksUtil = tryModule(findChild(findChild(lib, "Util"), "RanksUtil"))
     c.Directory = tryModule(findChild(lib, "Directory"))
     c.Balancing = tryModule(findChild(lib, "Balancing"))
+    c.HatchingTypes = tryModule(findChild(findChild(lib, "Types"), "Hatching"))
     state.clients = c
     state.activeWorld = findChild(Workspace, "Map") or findChild(Workspace, "Map2") or findChild(Workspace, "Map3")
     return type(c.Save) == "table" and type(c.Save.Get) == "function"
@@ -295,14 +305,14 @@ local function quickTrip(cframe, fn)
         root.CFrame = cframe
         task.wait(Config.TripSettleSeconds)
     end
-    local ok, a, b = pcall(fn)
+    local results = table.pack(pcall(fn))
     if far then
         local back = currentRoot()
         if back then back.CFrame = home end
     end
     state.tripActive = false
-    if not ok then return false, a end
-    return a, b
+    if not results[1] then return false, results[2] end
+    return table.unpack(results, 2, results.n)
 end
 local probeMemory = {}
 local function probeRemote(key, remote, shapes, verify, onDone, tripTo)
@@ -477,8 +487,17 @@ local function getGoalTitle(goal)
 end
 local function classify(title)
     local v = string.lower(title)
+    -- "Hatch a Legendary (or above) Pet", "Hatch 3 rare pets"
+    if v:find("legendary") or v:find("mythical") or (v:find("rare") and v:find("pet")) then return "hatch_rare" end
+    -- "Make 5 rainbow pets from best egg", "Make 50 golden pets from best egg"
+    if v:find("rainbow") then return "rainbow" end
+    if v:find("golden") or v:find("gold pet") then return "golden" end
     if v:find("hatch") then return "hatch" end
-    if v:find("golden") or v:find("rainbow") then return "convert" end
+    -- Quest items, whatever the verb ("Break 3 piñatas", "Trigger 3 lucky blocks").
+    if v:find("coin jar") then return "coinjar" end
+    if v:find("comet") then return "comet" end
+    if v:find("pinata") or v:find("piñata") then return "pinata" end
+    if v:find("lucky block") then return "luckyblock" end
     if v:find("fruit") and (v:find("use") or v:find("eat")) then return "fruit" end
     if v:find("potion") and v:find("use") then return "potion" end
     if v:find("flag") and (v:find("use") or v:find("place")) then return "flag" end
@@ -503,7 +522,8 @@ local function classify(title)
 end
 local scores = {
     farm = 98, diamond = 94, minichest = 62, safe = 60,
-    hatch = 104, fruit = 88, potion = 86, flag = 74,
+    hatch = 104, hatch_rare = 106, golden = 103, rainbow = 102,
+    fruit = 88, potion = 86, flag = 74,
     zone = 76, rebirth = 12, coinjar = 101, comet = 101,
     pinata = 100, luckyblock = 100, convert = 4,
     collect_potion = 67, collect_enchant = 67,
@@ -632,11 +652,16 @@ local questToggle = {
     pinata = "Spawn jars / comets", luckyblock = "Spawn jars / comets",
     collect_potion = "Vending or Upgrade", collect_enchant = "Vending or Upgrade",
     upgrade_potion = "Upgrade potions / enchants", upgrade_enchant = "Upgrade potions / enchants",
+    hatch_rare = "Hatch rank quests", golden = "Gold / rainbow machine quests",
+    rainbow = "Gold / rainbow machine quests",
 }
 local function eligible(goal)
     if (state.blocked[goal.identity] or 0) > now() then return false end
     local needed = {
         hatch = Config.AutoHatch, farm = Config.AutoFarm, diamond = Config.AutoFarm,
+        hatch_rare = Config.AutoHatch,
+        golden = Config.AutoGoldRainbow or (Config.AutoHatch and Config.GoldenEggsForGoldQuests),
+        rainbow = Config.AutoGoldRainbow or (Config.AutoHatch and Config.GoldenEggsForGoldQuests),
         collect_potion = Config.AutoVending or Config.AutoUpgrade,
         collect_enchant = Config.AutoVending or Config.AutoUpgrade,
         upgrade_potion = Config.AutoUpgrade, upgrade_enchant = Config.AutoUpgrade,
@@ -959,7 +984,67 @@ local function farm(goal, allowMove)
     state.lastSuccessfulAction = now() -- command accepted, NOT verified quest credit
     return true
 end
-local hatchAmount, disableEggAnimation, eggCurrency, currencyBalance
+local hatchAmount, disableEggAnimation, eggCurrency, currencyBalance, applyHatchSettings
+-- Hatch Settings: Charged (lucky, 20x cost) and Golden (only gold pets, 50x cost).
+-- State is read with HatchingCmds.IsEnabled(Hatching.Options.X) and changed with
+-- the ChargedHatch_Toggle / GoldenHatch_Toggle remotes. The remote is only fired
+-- when the state is wrong and the state is re-read afterwards, so this works
+-- whether the remote sets or flips the option.
+local hatchOptionRemotes = {CHARGED = "ChargedHatch_Toggle", GOLDEN = "GoldenHatch_Toggle"}
+local hatchOptionNames = {CHARGED = "Charged eggs", GOLDEN = "Golden eggs"}
+local function hatchOptionEnabled(option)
+    local types = state.clients.HatchingTypes
+    local key = types and type(types.Options) == "table" and types.Options[option]
+    if key == nil then return nil end
+    local ok, enabled = callMethod(state.clients.HatchingCmds, "IsEnabled", key)
+    if ok and type(enabled) == "boolean" then return enabled end
+    return nil
+end
+local function setHatchOption(option, want, reason, force)
+    local current = hatchOptionEnabled(option)
+    if current == nil or current == want then
+        state.hatchOptionTries[option] = 0
+        return current
+    end
+    if not force then
+        if now() < (state.hatchOptionPausedUntil[option] or 0) then return current end
+        if not cooldownReady("hatchOption:" .. option, 4) then return current end
+    end
+    local tries = (state.hatchOptionTries[option] or 0) + 1
+    state.hatchOptionTries[option] = tries
+    if tries > 3 then
+        -- The server keeps refusing (e.g. the option is not unlocked yet).
+        state.hatchOptionTries[option] = 0
+        state.hatchOptionPausedUntil[option] = now() + 300
+        log(hatchOptionNames[option] .. " could not be turned " .. (want and "on" or "off")
+            .. " (not unlocked yet?); retrying in 5 min", "WAIT")
+        return current
+    end
+    local ok, err = network(hatchOptionRemotes[option], {want}, false)
+    if not ok then failFeature("hatch-settings", err); return current end
+    state.commandCount = state.commandCount + 1
+    log(hatchOptionNames[option] .. (want and " ON" or " OFF") .. (reason and (" (" .. reason .. ")") or ""), "HATCH")
+    return want
+end
+-- Decides which option the active quests need: Charged for "hatch legendary"
+-- quests, Golden for golden/rainbow pet quests, otherwise both off.
+applyHatchSettings = function(force)
+    if not Config.SmartHatchSettings then return end
+    local wantCharged, wantGolden, why = false, false, nil
+    if state.running and Config.AutoRank then
+        for _, g in ipairs(state.activeGoals or {}) do
+            if g.kind == "hatch_rare" and Config.ChargedForRareQuests and Config.AutoHatch then
+                wantCharged, why = true, g.title
+                break
+            elseif (g.kind == "golden" or g.kind == "rainbow") and Config.GoldenEggsForGoldQuests and Config.AutoHatch then
+                wantGolden, why = true, g.title
+                break
+            end
+        end
+    end
+    setHatchOption("CHARGED", wantCharged, wantCharged and why or "not needed", force)
+    setHatchOption("GOLDEN", wantGolden, wantGolden and why or "not needed", force)
+end
 local function eggNameByNumber(number)
     local dir = state.clients.Directory
     if dir and type(dir.Eggs) == "table" then
@@ -1007,18 +1092,23 @@ end
 -- Max eggs per hatch: the game's own value when readable, otherwise found by
 -- trying a large batch and halving the range on each refusal.
 hatchAmount = function(egg)
+    -- EggCmds.GetMaxHatch() is the game's own per-hatch maximum (used by every
+    -- current script); only when it is unreadable is the maximum searched for.
     local cmds = state.clients.EggCmds
-    for _, method in ipairs({"GetMaxHatch", "GetMaxHatchCount", "GetHatchCount", "GetMaxEggHatch"}) do
+    for _, method in ipairs({"GetMaxHatch", "GetMaxHatchCount"}) do
         local ok, cap = callMethod(cmds, method)
-        if not (ok and tonumber(cap)) then ok, cap = callMethod(cmds, method, egg.name) end
+        if not (ok and tonumber(cap)) then
+            local dir = state.clients.Directory
+            local eggDir = dir and type(dir.Eggs) == "table" and dir.Eggs[egg.name]
+            if eggDir then ok, cap = callMethod(cmds, method, eggDir) end
+        end
         if ok and tonumber(cap) and tonumber(cap) >= 1 then
-            -- The game's value is known to work; the search may still find more.
-            state.hatchLo = math.max(state.hatchLo, math.floor(tonumber(cap)))
-            break
+            state.hatchKnown = true
+            return math.floor(tonumber(cap))
         end
     end
+    state.hatchKnown = false
     if state.hatchHi < 1 or now() > state.hatchResetAt then
-        -- Re-check upward every 10 minutes in case more egg slots were bought.
         state.hatchHi, state.hatchResetAt = Config.MaxHatchBatch, now() + 600
     end
     state.hatchHi = math.max(state.hatchHi, state.hatchLo)
@@ -1142,8 +1232,11 @@ currencyBalance = function(currency)
 end
 local function hatch()
     if now() < (state.hatchRefusedUntil or 0) then return false end
+    applyHatchSettings()
     if state.hatchBusy then return true end
     local interval = Config.FastMode and Config.FastHatchSeconds or Config.HatchActionSeconds
+    local okDebounce, debounce = callMethod(state.clients.EggCmds, "ComputeDebounce")
+    if okDebounce and tonumber(debounce) then interval = math.max(interval, tonumber(debounce)) end
     if now()-state.lastHatch < interval then return true end
     local egg=findEgg()
     if not egg then
@@ -1156,7 +1249,10 @@ local function hatch()
     -- Coins check: per-egg cost is learned from the balance change of earlier hatches.
     local currency = eggCurrency(egg)
     local balanceBefore = currency and currencyBalance(currency)
-    local perEgg = state.eggCost[egg.name]
+    -- Charged (20x) and Golden (50x) change the price, so costs are learned per mode.
+    local costKey = egg.name .. (hatchOptionEnabled("CHARGED") and ":charged" or "")
+        .. (hatchOptionEnabled("GOLDEN") and ":golden" or "")
+    local perEgg = state.eggCost[costKey]
     if balanceBefore and perEgg and perEgg > 0 then
         local affordable = math.floor(balanceBefore / perEgg)
         if affordable < 1 then
@@ -1179,39 +1275,46 @@ local function hatch()
             end
             return callMethod(state.clients.EggCmds,"RequestPurchase",egg.name,count)
         end
-        local success, result
+        local success, result, message
         if egg.capsuleCFrame then
-            success, result = quickTrip(egg.capsuleCFrame*CFrame.new(0,4,8), buy)
+            success, result, message = quickTrip(egg.capsuleCFrame*CFrame.new(0,4,8), buy)
         else
-            success, result = buy()
+            success, result, message = buy()
         end
         state.hatchBusy = false
         state.commandCount = state.commandCount + 1
         if result == "busy" then state.lastHatch = 0; return end
+        local reason = string.lower(tostring(message or (not success and result) or ""))
         if success and result ~= false then
             state.hatchFails = 0
             state.hatchLo = math.max(state.hatchLo, count)
             local balanceAfter = currency and currencyBalance(currency)
             if balanceBefore and balanceAfter and balanceAfter < balanceBefore then
-                state.eggCost[egg.name] = (balanceBefore - balanceAfter) / count
+                state.eggCost[costKey] = (balanceBefore - balanceAfter) / count
             end
             state.attempts.hatch=state.attempts.hatch+1
             if cooldownReady("hatchLog", 30) then log("Hatching "..egg.name.." x"..count, "HATCH") end
             state.lastSuccessfulAction=now()
             return
         end
-        -- One refusal can just be the hatch cooldown; act on two in a row.
+        -- The server says why: "too quickly" is only the hatch cooldown, and
+        -- "far away" means the trip did not get close enough.
+        if reason:find("quick", 1, true) or reason:find("fast", 1, true) then return end
+        if reason:find("far", 1, true) and cooldownReady("hatchFar", 30) then
+            log("Hatch refused: too far from " .. egg.name, "WAIT")
+        end
+        -- Otherwise act on two refusals in a row.
         state.hatchFails = state.hatchFails + 1
         if state.hatchFails < 2 then return end
         state.hatchFails = 0
-        if count > state.hatchLo then
+        if count > state.hatchLo and not state.hatchKnown then
             -- Too many at once: search downwards for the real maximum.
             state.hatchHi = count - 1
             state.lastHatch = 0
         else
             -- Usually not enough coins: farm for a minute first.
             state.hatchRefusedUntil = now() + 60
-            log("Hatch refused for "..egg.name.." x"..count.." ("..describe(result).."); farming 60s first","WAIT")
+            log("Hatch refused for "..egg.name.." x"..count.." ("..describe(message or result).."); farming 60s first","WAIT")
             returnToFarm("hatch refused")
         end
     end)
@@ -1237,6 +1340,10 @@ local function consume(goal)
         local flag = getInventoryEntry("Misc", "Flag")
         if not flag then return false end
         local ok, result = callMethod(state.clients.ZoneFlagCmds, "Consume", flag.id, flag.uid)
+        if not ok and findChild(findChild(ReplicatedStorage, "Network"), "FlexibleFlags_Consume") then
+            -- Current games place flags through FlexibleFlags_Consume(flagId, flagUid, amount).
+            ok, result = network("FlexibleFlags_Consume", {flag.id, flag.uid, 1}, true)
+        end
         if ok and result ~= false then state.lastSuccessfulAction = now(); return true end
         failFeature("flag", result)
     end
@@ -1379,9 +1486,12 @@ local function spawnQuestObject(goal, allowMove)
     -- outside it, e.g. next to the egg, is refused by the server.
     local root = currentRoot()
     local spawnSpot = nil
-    if root and state.farmHome and (root.Position - state.farmHome.Position).Magnitude > 30 then
+    local okBox, inBox = callMethod(state.clients.MapCmds, "IsInDottedBox")
+    local outside = (okBox and inBox == false)
+        or (root and state.farmHome and (root.Position - state.farmHome.Position).Magnitude > 30)
+    if outside and state.farmHome then
         spawnSpot = state.farmHome
-    elseif allowMove then
+    elseif outside and allowMove then
         placeInZone(getZoneInfo())
     end
     state.lastEventItem = now()
@@ -1747,7 +1857,7 @@ end
 -- Locates a machine on the map (e.g. the Super Computer / upgrade machines) by
 -- name. Zone folders keep machines under INTERACT.Machines; a full map search is
 -- only a fallback, and results are cached.
-local function findMachineSpot(key, words)
+local function findMachineSpot(key, words, machineNames)
     local cached = state.machineSpots[key]
     if cached and cached.node.Parent then return cached.cframe end
     if not cooldownReady("machineScan:" .. key, 60) then return nil end
@@ -1768,6 +1878,15 @@ local function findMachineSpot(key, words)
         end
         return nil
     end
+    -- MachineCmds.GetModels(name) returns the machine's models on the map.
+    for _, machineName in ipairs(machineNames or {}) do
+        local ok, models = callMethod(state.clients.MachineCmds, "GetModels", machineName)
+        if ok and type(models) == "table" then
+            for _, model in pairs(models) do
+                if typeof(model) == "Instance" and model.Parent then return remember(model) end
+            end
+        end
+    end
     for _, mapRoot in ipairs(mapRoots()) do
         for _, zone in ipairs(mapRoot:GetChildren()) do
             local machines = zone:FindFirstChild("INTERACT") and zone.INTERACT:FindFirstChild("Machines")
@@ -1783,13 +1902,32 @@ local function findMachineSpot(key, words)
     end
     return nil
 end
+-- Copies of tier N needed for one tier N+1: Balancing.CalcPotionsPerTierRequired /
+-- CalcEnchantsPerTierRequired (Mastery lowers them), with the known table as fallback.
+local function perTierRequired(isPotion, tier)
+    local bal = state.clients.Balancing
+    local name = isPotion and "CalcPotionsPerTierRequired" or "CalcEnchantsPerTierRequired"
+    local fn = type(bal) == "table" and bal[name]
+    if type(fn) == "function" then
+        local ok, n = pcall(fn, tier)
+        if ok and tonumber(n) and tonumber(n) >= 1 then return math.floor(tonumber(n)) end
+    end
+    local fallback = isPotion and {3, 3, 4, 5, 5, 5, 5, 5, 7, 7, 7} or {5, 5, 5, 7, 7, 7, 7, 7, 10, 10}
+    return fallback[tier]
+end
+local function allowMachine(name)
+    callMethod(state.clients.MachineCmds, "AllowOpen", name)
+end
 local function upgradeItems(goal)
     if not Config.AutoUpgrade or not healthy("upgrade") then return false end
+    if state.upgradeBusy then return true end
     local isPotion = goal.kind:find("potion", 1, true) ~= nil
     local word = isPotion and "potion" or "enchant"
     if not cooldownReady("upgrade:" .. word, Config.UpgradeSeconds) then return false end
     if now() < (state.upgradePausedUntil and state.upgradePausedUntil[word] or 0) then return false end
-    local remote = findUpgradeRemote(word)
+    local machineName = isPotion and "UpgradePotionsMachine" or "UpgradeEnchantsMachine"
+    local net = findChild(ReplicatedStorage, "Network")
+    local remote = findChild(net, machineName .. "_ActivateBulk") or findUpgradeRemote(word)
     if not remote then
         if cooldownReady("upgrade:missing:" .. word, 120) then
             log("No " .. word .. " upgrade remote found in this game version", "WAIT")
@@ -1799,71 +1937,162 @@ local function upgradeItems(goal)
     local data = saveData()
     local stock = data and data.Inventory and data.Inventory[isPotion and "Potion" or "Enchant"]
     if type(stock) ~= "table" then return false end
-    local best
+    -- "Upgrade to N Tier III potions" needs Tier II inputs; collect quests use the
+    -- cheapest upgrade (lowest tier).
+    local remaining = math.max(1, (goal.required or 0) - (goal.progress or 0))
+    local targetTier = goal.kind:find("upgrade", 1, true)
+        and tonumber(goal.raw and (isPotion and goal.raw.PotionTier or goal.raw.EnchantTier) or nil)
+        or (goal.kind:find("upgrade", 1, true) and numeralToNumber(goal.title)) or nil
+    local inputTier = targetTier and targetTier - 1 or nil
+    if not inputTier then
+        for _, item in pairs(stock) do
+            local tier = type(item) == "table" and tonumber(item.tn)
+            local per = tier and perTierRequired(isPotion, tier)
+            if per and (tonumber(item._am) or 1) >= per and (not inputTier or tier < inputTier) then inputTier = tier end
+        end
+    end
+    local per = inputTier and perTierRequired(isPotion, inputTier)
+    if not per then
+        if cooldownReady("upgrade:none:" .. word, 90) then
+            log("No " .. word .. " stack big enough to upgrade" .. (inputTier and (" (tier " .. inputTier .. ")") or ""), "WAIT")
+        end
+        return false
+    end
+    local batch, total = {}, 0
     for uid, item in pairs(stock) do
-        if type(item) == "table" then
-            local id = item.id or item.ID
-            local tier = tonumber(item.tn)
-            local amount = tonumber(item._am or item.Amount or 1) or 1
-            local key = tostring(id) .. ":" .. tostring(tier)
-            if id and tier and amount >= Config.UpgradeMinStack
-                and (state.upgradeSkip[key] or 0) < now()
-                and (not best or tier < best.tier or (tier == best.tier and amount > best.amount)) then
-                best = {uid = uid, id = id, tier = tier, amount = amount, key = key}
+        if total >= remaining then break end
+        if type(item) == "table" and tonumber(item.tn) == inputTier then
+            local make = math.min(math.floor((tonumber(item._am) or 1) / per), remaining - total)
+            if make > 0 then
+                batch[uid] = make
+                total = total + make
+            end
+        end
+    end
+    if total == 0 then
+        if cooldownReady("upgrade:none:" .. word, 90) then
+            log("Not enough tier " .. inputTier .. " " .. word .. "s (" .. per .. " per upgrade)", "WAIT")
+        end
+        return false
+    end
+    -- The server only accepts this at the machine: the upgrade machine itself or
+    -- the Supercomputer ("SuperMachine") in the World 2-4 spawns.
+    local machine = findMachineSpot("upgrade:" .. word, {squash(machineName), "supermachine"},
+        {machineName, "SuperMachine"})
+    state.upgradeBusy = true
+    task.spawn(function()
+        local function activate()
+            allowMachine("SuperMachine")
+            allowMachine(machineName)
+            return network(remote.Name, {batch}, true)
+        end
+        local ok, result, message
+        if machine then ok, result, message = quickTrip(machine, activate) else ok, result, message = activate() end
+        state.upgradeBusy = false
+        state.commandCount = state.commandCount + 1
+        if ok and result ~= false and result ~= "busy" then
+            state.upgradeFailStreak = 0
+            log("Upgraded " .. total .. "x tier " .. inputTier .. " " .. word .. "s", "UPGRADE")
+            state.lastSuccessfulAction = now()
+            return
+        end
+        state.upgradeFailStreak = (state.upgradeFailStreak or 0) + 1
+        log("Upgrade refused: " .. describe(message or result) .. (machine and "" or "; machine not found on map"), "WAIT")
+        if state.upgradeFailStreak >= 3 then
+            state.upgradePausedUntil = state.upgradePausedUntil or {}
+            state.upgradePausedUntil[word] = now() + 600
+            state.upgradeFailStreak = 0
+            log("Upgrades paused 10 min after repeated refusals", "SAFEGUARD")
+        end
+    end)
+    return true
+end
+
+-- Gold / Rainbow machine: 10 normal pets -> 1 golden, 10 golden -> 1 rainbow
+-- (Mastery lowers the 10). GoldMachine_Activate / RainbowMachine_Activate(uid, count).
+-- Only pets from the best egg are used, never equipped or shiny ones.
+local function bestEggPetIds()
+    local egg = findEgg()
+    local dir = state.clients.Directory
+    local eggDir = egg and dir and type(dir.Eggs) == "table" and dir.Eggs[egg.name]
+    if type(eggDir) ~= "table" or type(eggDir.pets) ~= "table" then return nil end
+    local ids = {}
+    for _, entry in pairs(eggDir.pets) do
+        local id = type(entry) == "table" and (entry[1] or entry.id) or entry
+        if type(id) == "string" then ids[id] = true end
+    end
+    return next(ids) and ids or nil
+end
+local function convertPets(goal)
+    if not Config.AutoGoldRainbow or not healthy("convert") then return false end
+    if state.convertBusy then return true end
+    local rainbow = goal.kind == "rainbow"
+    if not cooldownReady("convert:" .. goal.kind, 6) then return false end
+    local machineName = rainbow and "RainbowMachine" or "GoldMachine"
+    local remoteName = machineName .. "_Activate"
+    if not findChild(findChild(ReplicatedStorage, "Network"), remoteName) then
+        if cooldownReady("convert:missing:" .. remoteName, 300) then log(remoteName .. " not found", "WAIT") end
+        return false
+    end
+    local required = 10
+    local okPerk, hasPerk = callMethod(state.clients.MasteryCmds, "HasPerk", "Pets", rainbow and "RainbowReduction" or "GoldReduction")
+    if okPerk and hasPerk then
+        local okPower, power = callMethod(state.clients.MasteryCmds, "GetPerkPower", "Pets", rainbow and "RainbowReduction" or "GoldReduction")
+        if okPower and tonumber(power) then required = math.max(1, required - math.floor(tonumber(power))) end
+    end
+    local allowed = bestEggPetIds()
+    if not allowed then
+        if cooldownReady("convert:noegg", 120) then log("Best egg pet list unknown; cannot pick pets to convert", "WAIT") end
+        return false
+    end
+    local data = saveData()
+    local pets = data and data.Inventory and data.Inventory.Pet
+    if type(pets) ~= "table" then return false end
+    local equipped = {}
+    for k, v in pairs(type(data.EquippedPets) == "table" and data.EquippedPets or {}) do
+        equipped[tostring(k)] = true
+        if type(v) == "string" then equipped[v] = true end
+    end
+    local wantVariant = rainbow and 1 or 0
+    local best
+    for uid, pet in pairs(pets) do
+        if type(pet) == "table" and allowed[pet.id] and not pet.sh and not equipped[tostring(uid)]
+            and (tonumber(pet.pt) or 0) == wantVariant then
+            local amount = tonumber(pet._am) or 1
+            if amount >= required and (not best or amount > best.amount) then
+                best = {uid = uid, id = pet.id, amount = amount}
             end
         end
     end
     if not best then
-        if cooldownReady("upgrade:none:" .. word, 90) then
-            log("No " .. word .. " stack with " .. Config.UpgradeMinStack .. "+ copies to upgrade", "WAIT")
+        if cooldownReady("convert:none:" .. goal.kind, 60) then
+            log("Need " .. required .. " " .. (rainbow and "golden" or "normal") .. " best-egg pets of one kind to make a "
+                .. (rainbow and "rainbow" or "golden") .. " pet; hatching more", "WAIT")
         end
         return false
     end
-    local section = isPotion and "Potion" or "Enchant"
-    local function stackCount()
-        saveCache = nil
-        local fresh = saveData()
-        local items = fresh and fresh.Inventory and fresh.Inventory[section]
-        local total = 0
-        if type(items) == "table" then
-            for _, item in pairs(items) do
-                if type(item) == "table" and (item.id or item.ID) == best.id and tonumber(item.tn) == best.tier then
-                    total = total + (tonumber(item._am or item.Amount or 1) or 1)
-                end
-            end
+    local remaining = math.max(1, (goal.required or 0) - (goal.progress or 0))
+    local count = math.min(math.floor(best.amount / required), remaining)
+    local machine = findMachineSpot("machine:" .. machineName, {squash(machineName), "supermachine"},
+        {machineName, "SuperMachine"})
+    state.convertBusy = true
+    task.spawn(function()
+        local function activate()
+            allowMachine("SuperMachine")
+            allowMachine(machineName)
+            return network(remoteName, {best.uid, count}, true)
         end
-        return total
-    end
-    local before = stackCount()
-    -- Stand at the machine the remote belongs to ("UpgradePotionsMachine_Activate"
-    -- -> "UpgradePotionsMachine"), falling back to the Supercomputer.
-    local machineName = squash(remote.Name:match("^([^_:]+)") or remote.Name)
-    local machine = findMachineSpot("upgrade:" .. remote.Name,
-        {machineName, "upgrade" .. word, "supercomputer"})
-    probeRemote("upgrade", remote, {
-        {best.id, best.tier}, {best.uid}, {best.id, best.tier, 1}, {best.uid, 1},
-        {{id = best.id, tn = best.tier}},
-    }, function() return stackCount() < before end, function(worked, result)
-        if worked then
-            state.upgradeFailStreak = 0
-            log("Upgraded " .. tostring(best.id) .. " tier " .. best.tier .. " via " .. remote.Name, "UPGRADE")
+        local ok, result, message
+        if machine then ok, result, message = quickTrip(machine, activate) else ok, result, message = activate() end
+        state.convertBusy = false
+        state.commandCount = state.commandCount + 1
+        if ok and result ~= false and result ~= "busy" then
+            log("Made " .. count .. " " .. (rainbow and "rainbow" or "golden") .. " " .. tostring(best.id), "CONVERT")
             state.lastSuccessfulAction = now()
         else
-            -- Not enough copies, max tier, cost or proximity: leave this stack alone for a while.
-            state.upgradeSkip[best.key] = now() + 300
-            state.upgradeFailStreak = (state.upgradeFailStreak or 0) + 1
-            log("Upgrade refused: " .. tostring(best.id) .. " tier " .. best.tier .. " via " .. remote.Name
-                .. " (" .. describe(result) .. ")" .. (machine and "" or "; machine not found on map"), "WAIT")
-            if state.upgradeFailStreak >= 2 and not probeMemory[remote.Name] then
-                -- No argument format has ever worked: stop pulling the character to the
-                -- machine and farm instead. COPY REPORT lists the remotes to fix this.
-                state.upgradePausedUntil = state.upgradePausedUntil or {}
-                state.upgradePausedUntil[word] = now() + 900
-                state.upgradeFailStreak = 0
-                log("Upgrades paused 15 min: " .. remote.Name .. " does not accept any known format. Send COPY REPORT.", "SAFEGUARD")
-            end
+            log(machineName .. " refused: " .. describe(message or result) .. (machine and "" or "; machine not found on map"), "WAIT")
         end
-    end, machine)
+    end)
     return true
 end
 
@@ -1882,7 +2111,14 @@ local function performGoal(goal, allowMove)
     if allowMove == nil then allowMove = true end
     local feature = goalFeature[goal.kind] or (itemTypes[goal.kind] and "spawn-" .. goal.kind)
     if feature and not healthy(feature) then return false end
-    if goal.kind == "hatch" then return hatch() end
+    if goal.kind == "hatch" or goal.kind == "hatch_rare" then return hatch() end
+    if goal.kind == "golden" or goal.kind == "rainbow" then
+        -- Convert what we have, and keep hatching the best egg for more pets
+        -- (golden pets directly when "Golden eggs for gold/rainbow quests" is on).
+        local converted = convertPets(goal)
+        local hatched = Config.AutoHatch and hatch() or false
+        return converted or hatched
+    end
     if goal.kind == "fruit" or goal.kind == "potion" or goal.kind == "flag" then
         return consume(goal)
     end
@@ -1905,6 +2141,7 @@ end
 
 local function stop()
     state.running = false
+    pcall(applyHatchSettings, true)
     state.shutdown = true
     Config.Enabled = false
     state.status = "STOPPED"
@@ -1919,6 +2156,7 @@ end
 local function pause()
     Config.Enabled = false
     state.running = false
+    pcall(applyHatchSettings, true)
     state.status = "PAUSED"
     pcall(function() RunService:Set3dRenderingEnabled(true) end)
     persist()
@@ -2005,6 +2243,9 @@ local function getReport()
     table.insert(report, "Egg scripts: " .. (#eggScripts > 0 and table.concat(eggScripts, ", ") or "none"))
     table.insert(report, "Egg animation patched: " .. tostring(state.eggAnimPatched == true)
         .. " | hatch amount range " .. state.hatchLo .. "-" .. state.hatchHi)
+    table.insert(report, "Hatch settings: charged=" .. describe(hatchOptionEnabled("CHARGED"))
+        .. " golden=" .. describe(hatchOptionEnabled("GOLDEN")) .. " (HatchingCmds "
+        .. (type(c.HatchingCmds) == "table" and "present" or "missing") .. ")")
     local egg = findEgg()
     table.insert(report, "Best egg: " .. (egg and (tostring(egg.number) .. " " .. tostring(egg.name)) or "not found"))
     for _,k in ipairs(keys) do
@@ -2182,6 +2423,8 @@ local function mainLoop(generation)
                 autoUltimate()
                 if Config.AutoRank then
                     local ranked = rankGoals()
+                    state.activeGoals = ranked
+                    pcall(applyHatchSettings)
                     if #ranked > 0 then
                         -- One quest that needs the character somewhere (farm / hatch /
                         -- vending) plus every quest that can run from anywhere.
@@ -2214,6 +2457,8 @@ local function mainLoop(generation)
                         if Config.AutoFarm then farm(nil) end
                     end
                 else
+                    state.activeGoals = {}
+                    pcall(applyHatchSettings)
                     state.chosen="Quest planner disabled"
                     state.status="Farming"
                     if Config.AutoFarm then farm(nil) end
@@ -2290,7 +2535,7 @@ task.spawn(function()
 end)
 
 environment.RankPilot = {
-    Version="2.8-DZ-research",
+    Version="2.9-DZ-research",
     Config=Config,
     Status=state,
     Start=run,
