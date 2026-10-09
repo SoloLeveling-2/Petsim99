@@ -21,7 +21,7 @@ local HttpService = game:GetService("HttpService")
 local CoreGui = game:GetService("CoreGui")
 local LocalPlayer = Players.LocalPlayer
 if not LocalPlayer then return warn("[RankPilot] LocalPlayer not available") end
-print("[RankPilot] v2.3 loading...")
+print("[RankPilot] v2.4 loading...")
 
 local environment = (type(getgenv) == "function" and getgenv()) or _G
 if type(environment.RankPilot) == "table" and type(environment.RankPilot.Stop) == "function" then
@@ -35,12 +35,14 @@ local Config = {
     AutoFarm = true,
     AutoHatch = true,
     AutoConsumables = true,
-    AutoEventItems = false,     -- Explicit opt-in for consumable comets/jars/etc.
-    AutoVending = false,        -- Opt-in: up to 5% of available coins per purchase
-    AutoUpgrade = false,        -- Opt-in: upgrade low-tier potions/enchants at the upgrade machine
+    AutoEventItems = true,      -- Spawn coin jars / comets / pinatas / lucky blocks for quests
+    AutoVending = true,         -- Buy from potion/enchant vending machines for collect quests
+    AutoUpgrade = true,         -- Upgrade low-tier potions/enchants at the upgrade machine
     MultiQuest = true,          -- Work on several compatible quests in the same tick
     UpgradeMinStack = 3,        -- Only upgrade a potion/enchant stack with at least this many copies
     UpgradeSeconds = 2.5,
+    VendingSpendFraction = 0.20, -- Max share of current coins one vending purchase may cost
+    SettingsVersion = 4,
     AutoClaimRankRewards = true,
     AutoRebirth = false,        -- Intentional opt-in only
     AutoEggSlots = false,       -- Opt-in: check available diamonds and verified bundle price
@@ -57,7 +59,7 @@ local Config = {
     FastTickSeconds = 0.25,
     FastFarmSeconds = 0.1,
     FastPetAssignSeconds = 0.3,
-    MagnetSeconds = 0.5,
+    MagnetSeconds = 0.3,
     FarmRadius = 65,
     MaxCandidatesPerPass = 100,
     ScanLimit = 140,
@@ -273,6 +275,11 @@ local function loadSettings()
         return HttpService:JSONDecode(readfile(state.configFile))
     end)
     if ok and type(data) == "table" then
+        -- Defaults that changed in settings v4 are not overridden by older saved files.
+        if (tonumber(data.SettingsVersion) or 0) < 4 then
+            data.AutoEventItems, data.AutoVending, data.AutoUpgrade = nil, nil, nil
+        end
+        data.SettingsVersion = nil
         for key, value in pairs(data) do
             if Config[key] ~= nil and type(Config[key]) == type(value) then
                 Config[key] = value
@@ -419,9 +426,9 @@ local function classify(title)
 end
 local scores = {
     farm = 98, diamond = 94, minichest = 62, safe = 60,
-    hatch = 90, fruit = 88, potion = 86, flag = 74,
-    zone = 76, rebirth = 12, coinjar = 56, comet = 56,
-    pinata = 54, luckyblock = 54, convert = 4,
+    hatch = 104, fruit = 88, potion = 86, flag = 74,
+    zone = 76, rebirth = 12, coinjar = 101, comet = 101,
+    pinata = 100, luckyblock = 100, convert = 4,
     collect_potion = 67, collect_enchant = 67,
     upgrade_potion = 70, upgrade_enchant = 70, unhandled = -200,
 }
@@ -539,6 +546,16 @@ local function inspectState()
     end
     return true
 end
+local questToggle = {
+    hatch = "Hatch rank quests", farm = "Farm breakables", diamond = "Farm breakables",
+    minichest = "Farm breakables", safe = "Farm breakables",
+    fruit = "Fruit / potion / flags", potion = "Fruit / potion / flags", flag = "Fruit / potion / flags",
+    zone = "Advance areas", rebirth = "Allow rebirth",
+    coinjar = "Spawn jars / comets", comet = "Spawn jars / comets",
+    pinata = "Spawn jars / comets", luckyblock = "Spawn jars / comets",
+    collect_potion = "Vending or Upgrade", collect_enchant = "Vending or Upgrade",
+    upgrade_potion = "Upgrade potions / enchants", upgrade_enchant = "Upgrade potions / enchants",
+}
 local function eligible(goal)
     if (state.blocked[goal.identity] or 0) > now() then return false end
     local needed = {
@@ -553,7 +570,12 @@ local function eligible(goal)
         pinata = Config.AutoEventItems, luckyblock = Config.AutoEventItems,
         rebirth = Config.AutoRebirth,
     }
-    return needed[goal.kind] == true
+    if needed[goal.kind] == true then return true end
+    if cooldownReady("skipped:" .. goal.identity, 300) then
+        local toggle = questToggle[goal.kind]
+        log("Skipping '" .. goal.title .. "'" .. (toggle and (": turn on " .. toggle) or ": quest type not supported"), "PLANNER")
+    end
+    return false
 end
 local function rankGoals()
     local list = {}
@@ -799,17 +821,17 @@ local function keepInBestArea()
         end
     end
 end
-local function farm(goal)
+local function farm(goal, allowMove)
+    if allowMove == nil then allowMove = true end
     if not healthy("farm") then return false end
     local interval = Config.FastMode and Config.FastFarmSeconds or Config.FarmActionSeconds
     if now() - state.lastFarm < interval then return false end
     if not currentRoot() then return false end
-    keepInBestArea()
+    if allowMove then keepInBestArea() end
     local kind = goal and goal.kind or "farm"
     local targets = visibleTargetCandidates(kind)
     if #targets == 0 then
-        local area = getZoneInfo()
-        placeInZone(area)
+        if allowMove then placeInZone(getZoneInfo()) end
         if cooldownReady("noTargets:"..kind, 45) then
             log("No matching targets ("..kind..") in active zone via "..state.lastFarmInterface,"WAIT")
         end
@@ -834,107 +856,85 @@ local function farm(goal)
     state.lastSuccessfulAction = now() -- command accepted, NOT verified quest credit
     return true
 end
-local function findEgg()
+local function eggNameByNumber(number)
     local dir = state.clients.Directory
-    local data = saveData()
-    local ownedEggs = dir and dir.Eggs
-    -- DZ Hub derives the unlocked egg from this account's save, not a fixed egg number.
-    if type(ownedEggs) == "table" and type(data) == "table" then
-        local worldNo = tonumber(data.RecentWorld)
-        local maxEgg = tonumber(data.MaximumAvailableEgg)
-        if worldNo and maxEgg then
-            local chosen
-            for _, e in pairs(ownedEggs) do
-                if type(e) == "table" and type(e._id) == "string"
-                    and tonumber(e.worldNumber) == worldNo then
-                    local num = tonumber(e.eggNumber)
-                    if num and num <= maxEgg and (not chosen or num > chosen.number) then
-                        chosen = {number=num, name=e._id, point=nil, fromDirectory=true}
-                    end
-                end
-            end
-            if chosen then
-                -- A loaded capsule provides a real position when proximity is required.
-                local things=findChild(Workspace,"__THINGS")
-                local eggs=findChild(things,"Eggs")
-                if eggs then
-                    for _,capsule in ipairs(eggs:GetDescendants()) do
-                        local number=tonumber(capsule.Name:match("^(%d+)%s*%-%s*Egg Capsule"))
-                        if number==chosen.number and (capsule:IsA("Model") or capsule:IsA("BasePart")) then
-                            local okP,pivot=pcall(capsule.GetPivot,capsule)
-                            if okP and typeof(pivot)=="CFrame" then
-                                chosen.capsuleCFrame=pivot
-                                break
-                            end
-                        end
-                    end
-                end
-                return chosen
+    if dir and type(dir.Eggs) == "table" then
+        for key, e in pairs(dir.Eggs) do
+            if type(e) == "table" and tonumber(e.eggNumber) == number then
+                return type(e._id) == "string" and e._id or (type(key) == "string" and key or nil)
             end
         end
     end
-    -- Old capsule method remains as a fallback for client builds without the directory.
-    local things = findChild(Workspace, "__THINGS")
-    local eggs = findChild(things, "Eggs")
-    local main = findChild(eggs, "Main")
-    if not main then return nil end
-    local available = {}
-    for _, obj in ipairs(main:GetChildren()) do
-        local number = tonumber(obj.Name:match("(%d+)"))
-        local hud = obj:FindFirstChild("PriceHUD")
-        local unlocked = hud and hud:FindFirstChild("PriceHUDAvailable")
-        local point = hud and hud:IsA("BasePart") and hud or obj:FindFirstChildWhichIsA("BasePart", true)
-        if number and unlocked and point then
-            available[#available+1]={number=number,point=point}
-        end
-    end
-    table.sort(available,function(a,b) return a.number>b.number end)
-    local chosen = available[1]
-    if not chosen then return nil end
-    local util=tryModule(findChild(findChild(findChild(ReplicatedStorage,"Library"),"Util"),"EggsUtil"))
-    local ok, name=callMethod(util,"GetIdByNumber",chosen.number)
-    if not ok or type(name)~="string" then return nil end
-    chosen.name=name
-    return chosen
+    local util = tryModule(findChild(findChild(findChild(ReplicatedStorage, "Library"), "Util"), "EggsUtil"))
+    local ok, name = callMethod(util, "GetIdByNumber", number)
+    if ok and type(name) == "string" then return name end
+    return nil
 end
-local function hatch()
-    if now()-state.lastHatch < Config.HatchActionSeconds then return false end
-    state.lastHatch=now()
+-- Best egg = highest-numbered egg capsule loaded on the map that this account
+-- has unlocked (save.MaximumAvailableEgg). Falls back to the egg directory.
+local function findEgg()
+    local data = saveData()
+    local maxEgg = data and tonumber(data.MaximumAvailableEgg or data.MaxAvailableEgg)
+    local eggs = findChild(findChild(Workspace, "__THINGS"), "Eggs")
+    local best
+    if eggs then
+        for _, capsule in ipairs(eggs:GetDescendants()) do
+            if capsule:IsA("Model") or capsule:IsA("BasePart") then
+                local number = tonumber(capsule.Name:match("^(%d+)%s*%-%s*Egg"))
+                if number and (not maxEgg or number <= maxEgg) and (not best or number > best.number) then
+                    local okP, pivot = pcall(capsule.GetPivot, capsule)
+                    if okP and typeof(pivot) == "CFrame" then
+                        best = {number = number, capsuleCFrame = pivot}
+                    end
+                end
+            end
+        end
+    end
+    if best then
+        best.name = eggNameByNumber(best.number)
+        if best.name then return best end
+    end
+    if maxEgg then
+        local name = eggNameByNumber(maxEgg)
+        if name then return {number = maxEgg, name = name} end
+    end
+    return nil
+end
+local function hatch(allowMove)
+    if allowMove == nil then allowMove = true end
+    if now() < (state.hatchRefusedUntil or 0) then return false end
+    if now()-state.lastHatch < Config.HatchActionSeconds then return false, "waiting" end
     local egg=findEgg()
     if not egg then
-        if cooldownReady("noEgg",40) then log("No egg confirmed as unlocked", "WAIT") end
+        if cooldownReady("noEgg",40) then log("No unlocked egg found on the map (go near your best egg once)", "WAIT") end
+        state.hatchRefusedUntil = now() + 15
         return false
     end
     local root=currentRoot()
     if not root then return false end
-    if egg.point and (root.Position-egg.point.Position).Magnitude>17 then
-        root.CFrame=egg.point.CFrame*CFrame.new(0,0,-5)
+    if egg.capsuleCFrame and (root.Position-egg.capsuleCFrame.Position).Magnitude>20 then
+        if not allowMove then return false end
+        root.CFrame=egg.capsuleCFrame*CFrame.new(0,4,8)
         return false, "moving"
     end
-    if egg.capsuleCFrame and (root.Position-egg.capsuleCFrame.Position).Magnitude>35 then
-        root.CFrame=egg.capsuleCFrame+Vector3.new(0,4,0)
-        return false, "moving"
-    end
+    state.lastHatch=now()
     local ok, cap=callMethod(state.clients.EggCmds,"GetMaxHatch")
     if not ok or not tonumber(cap) then ok,cap=callMethod(state.clients.EggCmds,"GetMaxHatch",egg.name) end
-    if not ok or not tonumber(cap) then
-        if cooldownReady("hatch:noCap",55) then log("No verified egg hatch cap", "WAIT") end
-        return false
-    end
-    local count=math.max(1,math.min(math.floor(tonumber(cap)),Config.MaxHatchBatch))
+    local count=math.max(1,math.min(math.floor(tonumber(cap) or 1),Config.MaxHatchBatch))
     local success,result
-    if state.clients.EggCmds and type(state.clients.EggCmds.RequestPurchase)=="function" then
-        success,result=callMethod(state.clients.EggCmds,"RequestPurchase",egg.name,count)
-    else
+    if findChild(findChild(ReplicatedStorage,"Network"),"Eggs_RequestPurchase") then
         success,result=network("Eggs_RequestPurchase",{egg.name,count},true)
+    else
+        success,result=callMethod(state.clients.EggCmds,"RequestPurchase",egg.name,count)
     end
     if not success or result==false then
-        if cooldownReady("hatchRejected",25) then
-            log("Hatching refused (currency, proximity or interface); egg="..egg.name,"WAIT")
-        end
+        -- Usually not enough coins: stop teleporting to the egg for a minute and farm instead.
+        state.hatchRefusedUntil = now() + 60
+        log("Hatch refused for "..egg.name.." x"..count.." ("..describe(result).."); farming 60s first","WAIT")
         return false
     end
     state.attempts.hatch=state.attempts.hatch+1
+    if cooldownReady("hatchLog", 30) then log("Hatching "..egg.name.." x"..count, "HATCH") end
     state.lastSuccessfulAction=now()
     return true
 end
@@ -966,82 +966,152 @@ end
 -- Vending collection automation is enabled only if the historical machine
 -- method, its price directory and the player's balance are all readable.
 -- This avoids charging an unknown amount for unverified stock.
-local function vendingForGoal(goal)
-    if not Config.AutoVending then return false end
-    if not cooldownReady("vending:scan", 8) then return false end
-    local data = saveData()
-    if not data or type(data.VendingStocks) ~= "table" then return false end
-    local machineCmds = state.clients.MachineCmds
-    if not machineCmds then return false end
-    local lib = findChild(ReplicatedStorage, "Library")
-    local directory = findChild(lib, "Directory")
-    local prices = tryModule(findChild(directory, "VendingMachines"))
-    local ok, coinBalance = callMethod(state.clients.CurrencyCmds, "Get", "Coins")
-    if not ok or type(coinBalance) ~= "number" or coinBalance <= 0 or not prices then
-        if cooldownReady("vending:unknown", 60) then
-            log("Vending deferred: price or coin balance unavailable", "WAIT")
-        end
+local function vendingWait(reason)
+    if cooldownReady("vending:why", 45) then log("Vending: " .. reason, "WAIT") end
+    return false
+end
+local function vendingForGoal(goal, allowMove)
+    if not Config.AutoVending or not healthy("vending") then return false end
+    if not cooldownReady("vending:scan", 4) then
+        -- Keep the character at the machine only while a trip is in progress.
+        if now() < (state.vendingBusyUntil or 0) then return false, "waiting" end
         return false
     end
+    local data = saveData()
+    local stocks = data and (data.VendingStocks or data.VendingMachineStocks)
+    if type(stocks) ~= "table" then return vendingWait("no vending stock in save data") end
+    local prices = tryModule(findChild(findChild(findChild(ReplicatedStorage, "Library"), "Directory"), "VendingMachines"))
+    local okCoins, coinBalance = callMethod(state.clients.CurrencyCmds, "Get", "Coins")
+    coinBalance = okCoins and tonumber(coinBalance) or nil
+    local machineCmds = state.clients.MachineCmds
     local itemKind = goal.kind == "collect_potion" and "potion" or "enchant"
-    for machineName, stock in pairs(data.VendingStocks) do
+    local reason = "no " .. itemKind .. " machine with stock"
+    for machineName, stock in pairs(stocks) do
         if type(machineName)=="string" and machineName:lower():find(itemKind, 1, true)
-            and type(stock)=="number" and stock > 0 then
-            local priceData = prices[machineName]
+            and tonumber(stock) and tonumber(stock) > 0 then
+            local amount = math.min(3, math.floor(tonumber(stock)))
+            local priceData = prices and prices[machineName]
             local price = priceData and tonumber(priceData.CurrencyCost)
-            local canOwn, owned = callMethod(machineCmds,"Owns",machineName)
-            local canUse, allowed = callMethod(machineCmds,"IsAllowedToOpen",machineName)
-            local amount = math.min(3,math.floor(stock))
-            if price and price > 0 and price*amount <= coinBalance*.05
-                and canOwn and owned and canUse and allowed then
-                local node = nil
-                for _,root in ipairs(mapRoots()) do
-                    if root then node = root:FindFirstChild(machineName,true) end
+            -- Unknown ownership / access is left for the server to decide.
+            local okOwn, owned = callMethod(machineCmds, "Owns", machineName)
+            local okUse, allowed = callMethod(machineCmds, "IsAllowedToOpen", machineName)
+            if (okOwn and owned == false) or (okUse and allowed == false) then
+                reason = machineName .. " is not unlocked"
+            elseif price and coinBalance and price * amount > coinBalance * Config.VendingSpendFraction then
+                reason = machineName .. " costs " .. tostring(price * amount) .. " coins (over spend limit)"
+            else
+                local node
+                for _, mapRoot in ipairs(mapRoots()) do
+                    node = mapRoot:FindFirstChild(machineName, true)
                     if node then break end
                 end
-                local indicator = node and (node:FindFirstChild("Arrow",true) or node:FindFirstChild("arrowPivot",true))
-                if indicator and indicator:IsA("BasePart") then
-                    local root = currentRoot()
-                    if not root then return false end
-                    if (root.Position-indicator.Position).Magnitude > 12 then
-                        root.CFrame=indicator.CFrame+Vector3.new(0,4,0)
-                        return false, "moving"
+                local spot = node and (node:FindFirstChild("Arrow", true) or node:FindFirstChild("arrowPivot", true)
+                    or node:FindFirstChildWhichIsA("BasePart", true))
+                local root = currentRoot()
+                if spot and spot:IsA("BasePart") and root and (root.Position - spot.Position).Magnitude > 12 then
+                    if not allowMove then return false end
+                    root.CFrame = spot.CFrame + Vector3.new(0, 4, 0)
+                    state.vendingBusyUntil = now() + 6
+                    return false, "moving"
+                end
+                local okBuy, result = network("VendingMachines_Purchase", {machineName, amount}, true)
+                state.commandCount = state.commandCount + 1
+                if okBuy and result ~= false then
+                    state.vendingBusyUntil = now() + 6
+                    log("Bought " .. amount .. "x from " .. machineName, "VENDING")
+                    state.lastSuccessfulAction = now()
+                    return true
+                end
+                reason = machineName .. " purchase refused (" .. describe(result) .. ")"
+            end
+        end
+    end
+    return vendingWait(reason)
+end
+
+local itemTypes = {
+    coinjar = {match = "coin jar", word = "coinjar"},
+    comet = {match = "comet", word = "comet"},
+    pinata = {match = "pinata", word = "pinata"},
+    luckyblock = {match = "lucky block", word = "luckyblock"},
+}
+local function squash(text) return (tostring(text):lower():gsub("[^%w]", "")) end
+-- Finds e.g. "CoinJar_Spawn" / "Comet_Spawn" / "MiniPinata_Consume" by name.
+local function findItemRemote(word)
+    local net = findChild(ReplicatedStorage, "Network")
+    if not net then return nil end
+    local found, foundRank
+    for _, remote in ipairs(net:GetChildren()) do
+        local name = squash(remote.Name)
+        if name:find(word, 1, true) and (remote:IsA("RemoteFunction") or remote:IsA("BaseRemoteEvent")) then
+            local rank = name:find("spawn", 1, true) and 3 or name:find("consume", 1, true) and 2
+                or (name:find("use", 1, true) or name:find("place", 1, true)) and 1 or nil
+            if rank and (not found or rank > foundRank) then found, foundRank = remote, rank end
+        end
+    end
+    return found
+end
+-- Picks the inventory item for the quest, preferring the variant the quest names
+-- (e.g. "Basic Coin Jar" for a basic coin jar quest).
+local function findQuestItem(spec, title)
+    local data = saveData()
+    local inventory = data and data.Inventory
+    if type(inventory) ~= "table" then return nil end
+    local lowerTitle = title:lower()
+    local best, bestScore
+    for _, section in pairs(inventory) do
+        if type(section) == "table" then
+            for uid, item in pairs(section) do
+                if type(item) == "table" then
+                    local id = tostring(item.id or item.ID or "")
+                    local amount = tonumber(item._am or item.Amount or 1) or 1
+                    if amount > 0 and id:lower():find(spec.match, 1, true) then
+                        local score = 0
+                        for word in id:lower():gmatch("%a+") do
+                            if lowerTitle:find(word, 1, true) then score = score + 1 end
+                        end
+                        if not best or score > bestScore then best, bestScore = {uid = uid, id = id}, score end
                     end
-                    return attemptNetwork("vending", "VendingMachines_Purchase",
-                        {machineName,amount},true,9)
                 end
             end
         end
     end
-    return false
+    return best
 end
-
-local itemTypes = {
-    coinjar = {match = "Coin Jar", remote = "CoinJar_Spawn"},
-    comet = {match = "Comet", remote = "Comet_Spawn"},
-    pinata = {match = "Pinata", remote = nil}, -- unverified: do not guess a remote
-    luckyblock = {match = "Lucky Block", remote = nil}, -- unverified: do not guess a remote
-}
-local function spawnQuestObject(goal)
-    if now() - state.lastEventItem < Config.SpawnItemSeconds then return false end
-    state.lastEventItem = now()
+local function spawnQuestObject(goal, allowMove)
     local spec = itemTypes[goal.kind]
     if not spec then return false end
-    local objects = visibleTargetCandidates(goal.kind)
-    if #objects > 0 then return farm(goal) end
-    if not spec.remote then
-        if cooldownReady("unverified:" .. goal.kind, 90) then
-            log("No verified spawn interface for " .. goal.kind .. "; will attack existing objects only", "WAIT")
-        end
-        return false
-    end
-    if not placeInZone(getZoneInfo()) then return false end
-    local item = getInventoryEntry("Misc", spec.match)
+    -- Attack anything already spawned first; this is not throttled.
+    if #visibleTargetCandidates(goal.kind) > 0 then return farm(goal, allowMove) end
+    if now() - state.lastEventItem < Config.SpawnItemSeconds then return false, "waiting" end
+    local item = findQuestItem(spec, goal.title)
     if not item then
-        if cooldownReady("missing:" .. goal.kind, 60) then log("Missing " .. spec.match .. " inventory item", "WAIT") end
+        if cooldownReady("missing:" .. goal.kind, 60) then log("No " .. spec.match .. " in inventory for '" .. goal.title .. "'", "WAIT") end
         return false
     end
-    return attemptNetwork("spawn-" .. goal.kind, spec.remote, {item.uid}, true, Config.SpawnItemSeconds)
+    local remote = findItemRemote(spec.word)
+    if not remote then
+        if cooldownReady("noremote:" .. goal.kind, 120) then log("No spawn remote found for " .. spec.match, "WAIT") end
+        return false
+    end
+    if allowMove then
+        keepInBestArea()
+        placeInZone(getZoneInfo())
+    end
+    state.lastEventItem = now()
+    local ok, result = pcall(function()
+        if remote:IsA("RemoteFunction") then return remote:InvokeServer(item.uid) end
+        remote:FireServer(item.uid)
+        return true
+    end)
+    state.commandCount = state.commandCount + 1
+    if not ok then failFeature("spawn-" .. goal.kind, result); return false end
+    if result == false then
+        log("Spawn refused: " .. item.id .. " via " .. remote.Name, "WAIT")
+        return false
+    end
+    log("Spawned " .. item.id .. " via " .. remote.Name, "ITEM")
+    return true, "waiting"
 end
 local function tryAdvanceWorld()
     if now()-state.lastWorldCheck<Config.WorldCheckSeconds then return false end
@@ -1195,33 +1265,80 @@ local function extraProgression()
     end
 end
 
--- Collects loaded orbs (coins / diamonds dropped by breakables) and lootbags
--- in one request each, wherever they are on the map.
-local function magnetCollect(feature, folderName, remote, toId)
-    if not healthy(feature) then return end
-    local folder = findChild(findChild(Workspace, "__THINGS"), folderName)
-    if not folder then return end
-    local ids, nodes = {}, {}
-    for _, node in ipairs(folder:GetChildren()) do
-        local id = toId(node.Name)
-        if id ~= nil then
-            ids[#ids+1] = id
-            nodes[#nodes+1] = node
-            if #ids >= 250 then break end
+-- Super magnet: orbs (coins / diamonds dropped by breakables) and lootbags are
+-- queued the moment they appear, claimed in one request per type, then removed
+-- locally. Removing them is what cuts the lag from hundreds of drops piling up.
+local magnetSpecs = {
+    {feature = "magnet-orbs", folder = "Orbs", exact = "Orbs: Collect",
+        words = {"orb"}, verbs = {"collect", "claim"}, toId = tonumber},
+    {feature = "magnet-lootbags", folder = "Lootbags", exact = "Lootbags_Claim",
+        words = {"lootbag"}, verbs = {"claim", "collect"}, toId = function(name) return name end},
+}
+local function findMagnetRemote(spec)
+    local net = findChild(ReplicatedStorage, "Network")
+    if not net then return nil end
+    local exact = net:FindFirstChild(spec.exact)
+    if exact then return exact end
+    for _, remote in ipairs(net:GetChildren()) do
+        if remote:IsA("BaseRemoteEvent") or remote:IsA("RemoteFunction") then
+            local name = squash(remote.Name)
+            local hasWord, hasVerb = true, false
+            for _, w in ipairs(spec.words) do if not name:find(w, 1, true) then hasWord = false end end
+            for _, v in ipairs(spec.verbs) do if name:find(v, 1, true) then hasVerb = true end end
+            if hasWord and hasVerb then return remote end
+        end
+    end
+    return nil
+end
+local function queueMagnet(spec, node)
+    local id = spec.toId(node.Name)
+    if id ~= nil and not spec.seen[node] then
+        spec.seen[node] = true
+        spec.queue[#spec.queue+1] = {id = id, node = node}
+    end
+end
+local function hookMagnet(spec)
+    local folder = findChild(findChild(Workspace, "__THINGS"), spec.folder)
+    if not folder or spec.hooked == folder then return folder end
+    spec.hooked, spec.queue, spec.seen = folder, {}, setmetatable({}, {__mode = "k"})
+    for _, node in ipairs(folder:GetChildren()) do queueMagnet(spec, node) end
+    table.insert(state.connections, folder.ChildAdded:Connect(function(node)
+        if Config.SuperMagnet then queueMagnet(spec, node) end
+    end))
+    return folder
+end
+local function flushMagnet(spec)
+    if not healthy(spec.feature) or not hookMagnet(spec) or #spec.queue == 0 then return end
+    if not spec.remote or not spec.remote.Parent then
+        spec.remote = findMagnetRemote(spec)
+        if not spec.remote then
+            if cooldownReady("magnet:none:" .. spec.folder, 120) then
+                log("Super magnet: no collect remote found for " .. spec.folder, "WAIT")
+            end
+            return
+        end
+    end
+    local batch, ids = {}, {}
+    while #spec.queue > 0 and #ids < 250 do
+        local entry = table.remove(spec.queue, 1)
+        if entry.node.Parent then
+            batch[#batch+1] = entry
+            ids[#ids+1] = entry.id
         end
     end
     if #ids == 0 then return end
-    local ok, err = network(remote, {ids}, false)
-    if not ok then failFeature(feature, err); return end
+    local ok, err = pcall(function()
+        if spec.remote:IsA("RemoteFunction") then return spec.remote:InvokeServer(ids) end
+        spec.remote:FireServer(ids)
+    end)
+    if not ok then failFeature(spec.feature, err); return end
     state.commandCount = state.commandCount + 1
-    -- Hide what was claimed so it is not sent again next pass.
-    for _, node in ipairs(nodes) do pcall(node.Destroy, node) end
+    for _, entry in ipairs(batch) do pcall(entry.node.Destroy, entry.node) end
 end
 local function superMagnet()
     if not Config.SuperMagnet or now() - state.lastMagnet < Config.MagnetSeconds then return end
     state.lastMagnet = now()
-    magnetCollect("magnet-orbs", "Orbs", "Orbs: Collect", tonumber)
-    magnetCollect("magnet-lootbags", "Lootbags", "Lootbags_Claim", function(name) return name end)
+    for _, spec in ipairs(magnetSpecs) do flushMagnet(spec) end
 end
 local function claimFreeGift()
     if not Config.AutoFreeGifts or not healthy("freegifts")
@@ -1336,15 +1453,14 @@ local locationKinds = {
 local function needsLocation(goal)
     if locationKinds[goal.kind] then return true end
     -- Vending teleports to the machine; upgrades do not move the character.
-    return (goal.kind == "collect_potion" or goal.kind == "collect_enchant")
-        and Config.AutoVending and not Config.AutoUpgrade
+    return (goal.kind == "collect_potion" or goal.kind == "collect_enchant") and Config.AutoVending
 end
 local function performGoal(goal, allowMove)
     if not goal then return false end
     if allowMove == nil then allowMove = true end
     local feature = goalFeature[goal.kind] or (itemTypes[goal.kind] and "spawn-" .. goal.kind)
     if feature and not healthy(feature) then return false end
-    if goal.kind == "hatch" then return hatch() end
+    if goal.kind == "hatch" then return hatch(allowMove) end
     if goal.kind == "fruit" or goal.kind == "potion" or goal.kind == "flag" then
         return consume(goal)
     end
@@ -1354,13 +1470,13 @@ local function performGoal(goal, allowMove)
     if goal.kind == "collect_potion" or goal.kind == "collect_enchant" then
         local upgraded = upgradeItems(goal)
         if upgraded or not allowMove or not healthy("vending") then return upgraded end
-        return vendingForGoal(goal)
+        return vendingForGoal(goal, allowMove)
     end
     if goal.kind == "zone" then tryAdvanceWorld(); return true end
     if goal.kind == "rebirth" then tryAdvanceWorld(); return true end
-    if itemTypes[goal.kind] then return spawnQuestObject(goal) end
+    if itemTypes[goal.kind] then return spawnQuestObject(goal, allowMove) end
     if goal.kind == "farm" or goal.kind == "diamond" or goal.kind == "minichest" or goal.kind == "safe" then
-        return farm(goal)
+        return farm(goal, allowMove)
     end
     return false
 end
@@ -1428,6 +1544,16 @@ local function getReport()
         "Breakable interface: " .. state.lastFarmInterface,
         "Goals: " .. #state.goals, "Controllers: " .. describe(state.chosen),
         "Upgrade remotes: " .. (#upgradeRemotes > 0 and table.concat(upgradeRemotes, ", ") or "none")}
+    for kind, spec in pairs(itemTypes) do
+        local remote = findItemRemote(spec.word)
+        table.insert(report, "Item remote " .. kind .. ": " .. (remote and remote.Name or "none"))
+    end
+    for _, spec in ipairs(magnetSpecs) do
+        local remote = findMagnetRemote(spec)
+        table.insert(report, "Magnet remote " .. spec.folder .. ": " .. (remote and remote.Name or "none"))
+    end
+    local egg = findEgg()
+    table.insert(report, "Best egg: " .. (egg and (tostring(egg.number) .. " " .. tostring(egg.name)) or "not found"))
     for _,k in ipairs(keys) do
         table.insert(report, k .. ": " .. (type(c[k]) == "table" and "present" or "missing"))
     end
@@ -1608,11 +1734,13 @@ local function mainLoop(generation)
                         for i = 1, limit do
                             local g = ranked[i]
                             local moves = needsLocation(g)
-                            if not (moves and moverUsed) then
+                            do
+                                -- Quests after the one that owns the character still act
+                                -- where it stands (farm nearby, upgrade, consume).
                                 local performed, why = performGoal(g, not moverUsed)
                                 -- A location quest that could not act (no targets, no egg)
                                 -- hands the character to the next one.
-                                if moves and (performed or why == "moving") then moverUsed = true end
+                                if moves and (performed or why == "moving" or why == "waiting") then moverUsed = true end
                                 active[#active+1] = g.title .. " [" .. g.kind .. "]"
                                 local watch = state.questWatch[g.identity]
                                 if watch and now()-watch.changedAt > Config.StallSeconds then
@@ -1621,7 +1749,7 @@ local function mainLoop(generation)
                                 end
                             end
                         end
-                        if not moverUsed and Config.AutoFarm then farm(nil) end
+                        if Config.AutoFarm then farm(nil, not moverUsed) end
                         state.chosen = table.concat(active, "; ")
                         state.status = "Running " .. #active .. " quest(s)"
                     else
@@ -1696,7 +1824,7 @@ local threadGeneration=state.generations
 task.spawn(function() mainLoop(threadGeneration) end)
 
 environment.RankPilot = {
-    Version="2.3-DZ-research",
+    Version="2.4-DZ-research",
     Config=Config,
     Status=state,
     Start=run,
