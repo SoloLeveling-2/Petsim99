@@ -21,7 +21,7 @@ local HttpService = game:GetService("HttpService")
 local CoreGui = game:GetService("CoreGui")
 local LocalPlayer = Players.LocalPlayer
 if not LocalPlayer then return warn("[RankPilot] LocalPlayer not available") end
-print("[RankPilot] v2.2 loading...")
+print("[RankPilot] v2.3 loading...")
 
 local environment = (type(getgenv) == "function" and getgenv()) or _G
 if type(environment.RankPilot) == "table" and type(environment.RankPilot.Stop) == "function" then
@@ -37,6 +37,10 @@ local Config = {
     AutoConsumables = true,
     AutoEventItems = false,     -- Explicit opt-in for consumable comets/jars/etc.
     AutoVending = false,        -- Opt-in: up to 5% of available coins per purchase
+    AutoUpgrade = false,        -- Opt-in: upgrade low-tier potions/enchants at the upgrade machine
+    MultiQuest = true,          -- Work on several compatible quests in the same tick
+    UpgradeMinStack = 3,        -- Only upgrade a potion/enchant stack with at least this many copies
+    UpgradeSeconds = 2.5,
     AutoClaimRankRewards = true,
     AutoRebirth = false,        -- Intentional opt-in only
     AutoEggSlots = false,       -- Opt-in: check available diamonds and verified bundle price
@@ -86,6 +90,8 @@ local optionOrder = {
     {"AutoConsumables", "Fruit / potion / flags"},
     {"AutoEventItems", "Spawn jars / comets"},
     {"AutoVending", "Vending for collection quests"},
+    {"AutoUpgrade", "Upgrade potions / enchants"},
+    {"MultiQuest", "Do multiple quests at once"},
     {"AutoClaimRankRewards", "Claim rank rewards"},
     {"AutoRebirth", "Allow rebirth"},
     {"AutoEquipBest", "Keep best pets equipped"},
@@ -110,7 +116,7 @@ local state = {
     lastWorldCheck = 0, lastRewardCheck = 0, lastRefresh = 0,
     lastFarm = 0, lastHatch = 0, lastConsumable = 0, lastEventItem = 0,
     lastPetAssign = 0, lastAssignedTarget = nil, lastEquip = 0, lastMagnet = 0,
-    bulkUnsupported = false,
+    bulkUnsupported = false, upgradeSkip = {},
     lastSlots = 0, lastGifts = 0, lastFarmInterface = "none",
     attempts = {farm = 0, hatch = 0, zone = 0, consumable = 0},
     lastPosition = nil, generations = 0, connections = {}, gui = nil,
@@ -417,7 +423,7 @@ local scores = {
     zone = 76, rebirth = 12, coinjar = 56, comet = 56,
     pinata = 54, luckyblock = 54, convert = 4,
     collect_potion = 67, collect_enchant = 67,
-    upgrade_potion = 2, upgrade_enchant = 2, unhandled = -200,
+    upgrade_potion = 70, upgrade_enchant = 70, unhandled = -200,
 }
 local function normalizeGoal(key, entry)
     if type(entry) ~= "table" then return nil end
@@ -537,7 +543,9 @@ local function eligible(goal)
     if (state.blocked[goal.identity] or 0) > now() then return false end
     local needed = {
         hatch = Config.AutoHatch, farm = Config.AutoFarm, diamond = Config.AutoFarm,
-        collect_potion = Config.AutoVending, collect_enchant = Config.AutoVending,
+        collect_potion = Config.AutoVending or Config.AutoUpgrade,
+        collect_enchant = Config.AutoVending or Config.AutoUpgrade,
+        upgrade_potion = Config.AutoUpgrade, upgrade_enchant = Config.AutoUpgrade,
         minichest = Config.AutoFarm, safe = Config.AutoFarm,
         fruit = Config.AutoConsumables, potion = Config.AutoConsumables,
         flag = Config.AutoConsumables, zone = Config.AutoWorld,
@@ -547,7 +555,7 @@ local function eligible(goal)
     }
     return needed[goal.kind] == true
 end
-local function chooseGoal()
+local function rankGoals()
     local list = {}
     for _,g in ipairs(state.goals) do
         if eligible(g) then
@@ -574,7 +582,9 @@ local function chooseGoal()
         if a.score ~= b.score then return a.score > b.score end
         return a.g.key < b.g.key
     end)
-    return list[1] and list[1].g or nil
+    local ordered = {}
+    for i, row in ipairs(list) do ordered[i] = row.g end
+    return ordered
 end
 
 local function matchesQuestBreakable(goalKind, b)
@@ -793,7 +803,6 @@ local function farm(goal)
     if not healthy("farm") then return false end
     local interval = Config.FastMode and Config.FastFarmSeconds or Config.FarmActionSeconds
     if now() - state.lastFarm < interval then return false end
-    state.lastFarm = now()
     if not currentRoot() then return false end
     keepInBestArea()
     local kind = goal and goal.kind or "farm"
@@ -806,6 +815,9 @@ local function farm(goal)
         end
         return false
     end
+    -- Only a pass that found targets uses up the interval, so another quest's
+    -- farm pass can still run this tick when this one had nothing to hit.
+    state.lastFarm = now()
     local batch = {}
     for i = 1, math.min(#targets, math.max(1, Config.TargetsPerTick)) do batch[i] = targets[i] end
     aimPetsAt(batch)
@@ -897,11 +909,11 @@ local function hatch()
     if not root then return false end
     if egg.point and (root.Position-egg.point.Position).Magnitude>17 then
         root.CFrame=egg.point.CFrame*CFrame.new(0,0,-5)
-        return false
+        return false, "moving"
     end
     if egg.capsuleCFrame and (root.Position-egg.capsuleCFrame.Position).Magnitude>35 then
         root.CFrame=egg.capsuleCFrame+Vector3.new(0,4,0)
-        return false
+        return false, "moving"
     end
     local ok, cap=callMethod(state.clients.EggCmds,"GetMaxHatch")
     if not ok or not tonumber(cap) then ok,cap=callMethod(state.clients.EggCmds,"GetMaxHatch",egg.name) end
@@ -993,7 +1005,7 @@ local function vendingForGoal(goal)
                     if not root then return false end
                     if (root.Position-indicator.Position).Magnitude > 12 then
                         root.CFrame=indicator.CFrame+Vector3.new(0,4,0)
-                        return false
+                        return false, "moving"
                     end
                     return attemptNetwork("vending", "VendingMachines_Purchase",
                         {machineName,amount},true,9)
@@ -1246,18 +1258,102 @@ end
 local goalFeature = {
     farm = "farm", diamond = "farm", minichest = "farm", safe = "farm",
     fruit = "fruit", potion = "potion", flag = "flag",
-    collect_potion = "vending", collect_enchant = "vending",
     zone = "zone", rebirth = "rebirth",
 }
-local function performGoal(goal)
+-- Upgrade machine: turns a stack of low-tier potions/enchants into a higher tier.
+-- The remote is discovered by name because it differs between game versions.
+local function findUpgradeRemote(word)
+    local net = findChild(ReplicatedStorage, "Network")
+    if not net then return nil end
+    local found
+    for _, remote in ipairs(net:GetChildren()) do
+        local name = remote.Name:lower()
+        if name:find("upgrade", 1, true) and name:find(word, 1, true)
+            and (remote:IsA("RemoteFunction") or remote:IsA("BaseRemoteEvent")) then
+            if not found or name:find("machine", 1, true) then found = remote end
+        end
+    end
+    return found
+end
+local function upgradeItems(goal)
+    if not Config.AutoUpgrade or not healthy("upgrade") then return false end
+    local isPotion = goal.kind:find("potion", 1, true) ~= nil
+    local word = isPotion and "potion" or "enchant"
+    if not cooldownReady("upgrade:" .. word, Config.UpgradeSeconds) then return false end
+    local remote = findUpgradeRemote(word)
+    if not remote then
+        if cooldownReady("upgrade:missing:" .. word, 120) then
+            log("No " .. word .. " upgrade remote found in this game version", "WAIT")
+        end
+        return false
+    end
+    local data = saveData()
+    local stock = data and data.Inventory and data.Inventory[isPotion and "Potion" or "Enchant"]
+    if type(stock) ~= "table" then return false end
+    local best
+    for uid, item in pairs(stock) do
+        if type(item) == "table" then
+            local id = item.id or item.ID
+            local tier = tonumber(item.tn)
+            local amount = tonumber(item._am or item.Amount or 1) or 1
+            local key = tostring(id) .. ":" .. tostring(tier)
+            if id and tier and amount >= Config.UpgradeMinStack
+                and (state.upgradeSkip[key] or 0) < now()
+                and (not best or tier < best.tier or (tier == best.tier and amount > best.amount)) then
+                best = {uid = uid, id = id, tier = tier, amount = amount, key = key}
+            end
+        end
+    end
+    if not best then
+        if cooldownReady("upgrade:none:" .. word, 90) then
+            log("No " .. word .. " stack with " .. Config.UpgradeMinStack .. "+ copies to upgrade", "WAIT")
+        end
+        return false
+    end
+    local ok, result = pcall(function()
+        if remote:IsA("RemoteFunction") then return remote:InvokeServer(best.id, best.tier) end
+        remote:FireServer(best.id, best.tier)
+        return true
+    end)
+    if not ok then failFeature("upgrade", result); return false end
+    state.commandCount = state.commandCount + 1
+    if result == false or result == nil then
+        -- Refused (cost, max tier, proximity or arguments): leave this stack alone for a while.
+        state.upgradeSkip[best.key] = now() + 300
+        log("Upgrade refused: " .. tostring(best.id) .. " tier " .. best.tier .. " via " .. remote.Name, "WAIT")
+        return false
+    end
+    log("Upgraded " .. tostring(best.id) .. " tier " .. best.tier .. " via " .. remote.Name, "UPGRADE")
+    state.lastSuccessfulAction = now()
+    return true
+end
+
+-- Quests that need the character in a particular place; only one runs per tick.
+local locationKinds = {
+    hatch = true, farm = true, diamond = true, minichest = true, safe = true,
+    coinjar = true, comet = true, pinata = true, luckyblock = true,
+}
+local function needsLocation(goal)
+    if locationKinds[goal.kind] then return true end
+    -- Vending teleports to the machine; upgrades do not move the character.
+    return (goal.kind == "collect_potion" or goal.kind == "collect_enchant")
+        and Config.AutoVending and not Config.AutoUpgrade
+end
+local function performGoal(goal, allowMove)
     if not goal then return false end
+    if allowMove == nil then allowMove = true end
     local feature = goalFeature[goal.kind] or (itemTypes[goal.kind] and "spawn-" .. goal.kind)
     if feature and not healthy(feature) then return false end
     if goal.kind == "hatch" then return hatch() end
     if goal.kind == "fruit" or goal.kind == "potion" or goal.kind == "flag" then
         return consume(goal)
     end
+    if goal.kind == "upgrade_potion" or goal.kind == "upgrade_enchant" then
+        return upgradeItems(goal)
+    end
     if goal.kind == "collect_potion" or goal.kind == "collect_enchant" then
+        local upgraded = upgradeItems(goal)
+        if upgraded or not allowMove or not healthy("vending") then return upgraded end
         return vendingForGoal(goal)
     end
     if goal.kind == "zone" then tryAdvanceWorld(); return true end
@@ -1319,11 +1415,19 @@ local function getReport()
     local c = state.clients
     local keys = {"Save", "QuestCmds", "ZoneCmds", "RankCmds", "PetCmds", "EggCmds", "PlayerPet", "BreakableFrontend", "ZonesUtil", "RanksUtil", "Directory", "Balancing",
         "PotionCmds", "FruitCmds", "ZoneFlagCmds", "RebirthCmds", "InventoryCmds"}
+    local net = findChild(ReplicatedStorage, "Network")
+    local upgradeRemotes = {}
+    if net then
+        for _, remote in ipairs(net:GetChildren()) do
+            if remote.Name:lower():find("upgrade", 1, true) then upgradeRemotes[#upgradeRemotes+1] = remote.Name end
+        end
+    end
     local report = {"RankPilot DZ-enhanced capability report", "Rank: " .. describe(state.rank),
         "RankCmds.GetMaxRank value (diagnostic): " .. describe(state.maxRank), "Area: " .. state.area,
         "Status: " .. state.status, "PlaceId: " .. describe(game.PlaceId),
         "Breakable interface: " .. state.lastFarmInterface,
-        "Goals: " .. #state.goals, "Controllers: " .. describe(state.chosen)}
+        "Goals: " .. #state.goals, "Controllers: " .. describe(state.chosen),
+        "Upgrade remotes: " .. (#upgradeRemotes > 0 and table.concat(upgradeRemotes, ", ") or "none")}
     for _,k in ipairs(keys) do
         table.insert(report, k .. ": " .. (type(c[k]) == "table" and "present" or "missing"))
     end
@@ -1495,22 +1599,31 @@ local function mainLoop(generation)
                 claimFreeGift()
                 superMagnet()
                 if Config.AutoRank then
-                    local selected=chooseGoal()
-                    if selected then
-                        state.chosen=selected.title.."  ["..selected.kind.."]"
-                        state.status="Running "..selected.kind
-                        local performed = performGoal(selected)
-                        if not performed and selected.kind=="hatch" then
-                            -- Hatch tasks often require coins or an unlocked egg.
-                            -- Spend a bounded part of each cycle collecting coins.
-                            if Config.AutoFarm then farm(nil) end
+                    local ranked = rankGoals()
+                    if #ranked > 0 then
+                        -- One quest that needs the character somewhere (farm / hatch /
+                        -- vending) plus every quest that can run from anywhere.
+                        local moverUsed, active = false, {}
+                        local limit = Config.MultiQuest and #ranked or 1
+                        for i = 1, limit do
+                            local g = ranked[i]
+                            local moves = needsLocation(g)
+                            if not (moves and moverUsed) then
+                                local performed, why = performGoal(g, not moverUsed)
+                                -- A location quest that could not act (no targets, no egg)
+                                -- hands the character to the next one.
+                                if moves and (performed or why == "moving") then moverUsed = true end
+                                active[#active+1] = g.title .. " [" .. g.kind .. "]"
+                                local watch = state.questWatch[g.identity]
+                                if watch and now()-watch.changedAt > Config.StallSeconds then
+                                    blockGoal(g, Config.BlockedQuestSeconds, "quest made no observed progress")
+                                    watch.changedAt = now()
+                                end
+                            end
                         end
-                        local watch = state.questWatch[selected.identity]
-                        if watch and now()-watch.changedAt > Config.StallSeconds then
-                            blockGoal(selected, Config.BlockedQuestSeconds,
-                                "selected quest made no observed progress")
-                            watch.changedAt=now()
-                        end
+                        if not moverUsed and Config.AutoFarm then farm(nil) end
+                        state.chosen = table.concat(active, "; ")
+                        state.status = "Running " .. #active .. " quest(s)"
                     else
                         state.chosen="No supported quest ready"
                         state.status="Waiting / fallback farming"
@@ -1583,7 +1696,7 @@ local threadGeneration=state.generations
 task.spawn(function() mainLoop(threadGeneration) end)
 
 environment.RankPilot = {
-    Version="2.2-DZ-research",
+    Version="2.3-DZ-research",
     Config=Config,
     Status=state,
     Start=run,
