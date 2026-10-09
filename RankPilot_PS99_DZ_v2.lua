@@ -21,7 +21,7 @@ local HttpService = game:GetService("HttpService")
 local CoreGui = game:GetService("CoreGui")
 local LocalPlayer = Players.LocalPlayer
 if not LocalPlayer then return warn("[RankPilot] LocalPlayer not available") end
-print("[RankPilot] v2.1 loading...")
+print("[RankPilot] v2.2 loading...")
 
 local environment = (type(getgenv) == "function" and getgenv()) or _G
 if type(environment.RankPilot) == "table" and type(environment.RankPilot.Stop) == "function" then
@@ -44,6 +44,16 @@ local Config = {
     AutoEquipBest = true,       -- From DZ Hub PetCmds.EquipBest
     AutoFreeGifts = false,      -- Opt-in: verified free-gift timestamps, no blind claiming
     RenderOff = false,
+    FastMode = true,            -- Shorter tick / farm / pet-assign intervals
+    InstantPets = true,         -- Bulk-join pets straight onto breakables (skips walking)
+    SuperMagnet = true,         -- Collect every loaded orb and lootbag
+    StayInBestArea = true,      -- Keep the player (and so the pets) in the best owned area
+    AntiAFK = true,             -- Prevent the 20-minute idle kick
+    TargetsPerTick = 6,         -- Breakables damaged / pets spread across per farm pass
+    FastTickSeconds = 0.25,
+    FastFarmSeconds = 0.1,
+    FastPetAssignSeconds = 0.3,
+    MagnetSeconds = 0.5,
     FarmRadius = 65,
     MaxCandidatesPerPass = 100,
     ScanLimit = 140,
@@ -82,6 +92,11 @@ local optionOrder = {
     {"AutoEggSlots", "Buy affordable egg slots"},
     {"AutoPetSlots", "Buy affordable pet slots"},
     {"AutoFreeGifts", "Claim ready free gifts"},
+    {"FastMode", "Fast mode (shorter delays)"},
+    {"InstantPets", "Instant pets (bulk join breakables)"},
+    {"SuperMagnet", "Super magnet (orbs + lootbags)"},
+    {"StayInBestArea", "Stay in best area"},
+    {"AntiAFK", "Anti-AFK"},
     {"RenderOff", "Disable 3D rendering"},
 }
 
@@ -94,7 +109,8 @@ local state = {
     lastProgressAt = os.clock(), lastSuccessfulAction = os.clock(),
     lastWorldCheck = 0, lastRewardCheck = 0, lastRefresh = 0,
     lastFarm = 0, lastHatch = 0, lastConsumable = 0, lastEventItem = 0,
-    lastPetAssign = 0, lastAssignedTarget = nil, lastEquip = 0,
+    lastPetAssign = 0, lastAssignedTarget = nil, lastEquip = 0, lastMagnet = 0,
+    bulkUnsupported = false,
     lastSlots = 0, lastGifts = 0, lastFarmInterface = "none",
     attempts = {farm = 0, hatch = 0, zone = 0, consumable = 0},
     lastPosition = nil, generations = 0, connections = {}, gui = nil,
@@ -221,7 +237,7 @@ local function network(name, args, invoke)
     local remote = findChild(container, name)
     if remote and invoke and remote:IsA("RemoteFunction") then
         return pcall(function() return remote:InvokeServer(unpack(args)) end)
-    elseif remote and not invoke and remote:IsA("RemoteEvent") then
+    elseif remote and not invoke and remote:IsA("BaseRemoteEvent") then
         return pcall(function() remote:FireServer(unpack(args)); return true end)
     end
     local c = state.clients.Network
@@ -672,39 +688,82 @@ local function visibleTargetCandidates(kind)
     return legacyBreakables(kind)
 end
 
-local function aimPetsAt(target)
-    if now()-state.lastPetAssign < Config.PetAssignSeconds
-        and state.lastAssignedTarget == tostring(target.uid) then return false end
+local function equippedPetIds()
+    local ids = {}
+    local ok, equipped = callMethod(state.clients.PetCmds, "GetEquipped")
+    if ok and type(equipped) == "table" then
+        for key, value in pairs(equipped) do
+            local id = type(value) == "table" and (value.euid or value.uid or value.UID) or nil
+            if id == nil and type(key) == "string" then id = key end
+            if id ~= nil then ids[#ids+1] = id end
+        end
+    end
+    return ids
+end
+-- Sends every equipped pet straight onto a breakable in one request, so pets
+-- start dealing damage without walking there. Pets are spread across targets.
+local function bulkJoinPets(targets)
+    if not Config.InstantPets or state.bulkUnsupported then return false end
+    if not findChild(findChild(ReplicatedStorage, "Network"), "Breakables_JoinPetBulk") then
+        state.bulkUnsupported = true
+        log("Instant pets: Breakables_JoinPetBulk not in this game version; using normal pet targeting", "WAIT")
+        return false
+    end
+    local ids = equippedPetIds()
+    if #ids == 0 then return false end
+    local assignment = {}
+    for i, petId in ipairs(ids) do
+        assignment[petId] = targets[((i - 1) % #targets) + 1].uid
+    end
+    local ok, err = network("Breakables_JoinPetBulk", {assignment}, false)
+    if not ok then
+        state.bulkUnsupported = true
+        log("Instant pets unavailable (" .. describe(err) .. "); using normal pet targeting", "WAIT")
+        return false
+    end
+    return true
+end
+local function aimPetsAt(targets)
+    local first = tostring(targets[1].uid)
+    local interval = Config.FastMode and Config.FastPetAssignSeconds or Config.PetAssignSeconds
+    if now()-state.lastPetAssign < interval and state.lastAssignedTarget == first then return false end
+    if bulkJoinPets(targets) then
+        state.lastPetAssign = now()
+        state.lastAssignedTarget = first
+        return true
+    end
     local pp = state.clients.PlayerPet
-    if type(pp) == "table" and type(pp.GetByPlayer) == "function" and target.model then
+    if type(pp) == "table" and type(pp.GetByPlayer) == "function" then
         local ok, pets = callMethod(pp, "GetByPlayer", LocalPlayer)
         if ok and type(pets) == "table" then
             local count = 0
             for _, pet in pairs(pets) do
                 if type(pet) == "table" and type(pet.SetTarget) == "function" then
-                    pcall(pet.SetTarget, pet, target.model)
+                    local target = targets[(count % #targets) + 1]
+                    if target.model then pcall(pet.SetTarget, pet, target.model) end
                     count = count + 1
                     if count >= Config.MaxPetsPerTick then break end
                 end
             end
             if count > 0 then
                 state.lastPetAssign = now()
-                state.lastAssignedTarget = tostring(target.uid)
+                state.lastAssignedTarget = first
                 return true
             end
         end
     end
-    local ok, equipped = callMethod(state.clients.PetCmds, "GetEquipped")
-    if ok and type(equipped) == "table" then
+    local ids = equippedPetIds()
+    if #ids > 0 then
         local count = 0
-        for petId in pairs(equipped) do
+        for i, petId in ipairs(ids) do
+            local target = targets[((i - 1) % #targets) + 1]
             if network("Breakables_JoinPet", {target.uid, petId}, false) then
                 count = count + 1
             end
             if count >= Config.MaxPetsPerTick then break end
         end
         state.lastPetAssign = now()
-        state.lastAssignedTarget = tostring(target.uid)
+        state.lastAssignedTarget = first
         return count > 0
     end
     return false
@@ -719,11 +778,24 @@ local function damageBreakable(target)
     local ok, result = network("Breakables_PlayerDealDamage", {target.uid}, false)
     return ok and result ~= false
 end
+local function keepInBestArea()
+    if not Config.StayInBestArea or not cooldownReady("bestArea", 4) then return end
+    local best = getZoneInfo()
+    local ok, current = callMethod(state.clients.MapCmds, "GetCurrentZone")
+    if best and ok and type(current) == "string" and current ~= best.name then
+        local moved = placeInZone(best)
+        if moved and cooldownReady("bestAreaLog", 60) then
+            log("Moved back to best area: " .. best.name, "WORLD")
+        end
+    end
+end
 local function farm(goal)
     if not healthy("farm") then return false end
-    if now() - state.lastFarm < Config.FarmActionSeconds then return false end
+    local interval = Config.FastMode and Config.FastFarmSeconds or Config.FarmActionSeconds
+    if now() - state.lastFarm < interval then return false end
     state.lastFarm = now()
     if not currentRoot() then return false end
+    keepInBestArea()
     local kind = goal and goal.kind or "farm"
     local targets = visibleTargetCandidates(kind)
     if #targets == 0 then
@@ -734,10 +806,14 @@ local function farm(goal)
         end
         return false
     end
-    local target = targets[1]
-    aimPetsAt(target)
-    local ok = damageBreakable(target)
-    state.currentTarget = tostring(target.uid)
+    local batch = {}
+    for i = 1, math.min(#targets, math.max(1, Config.TargetsPerTick)) do batch[i] = targets[i] end
+    aimPetsAt(batch)
+    local ok = false
+    for _, target in ipairs(batch) do
+        if damageBreakable(target) then ok = true end
+    end
+    state.currentTarget = tostring(batch[1].uid)
     if not ok then
         failFeature("farm", "No compatible breakables interface for "..state.lastFarmInterface)
         return false
@@ -1107,6 +1183,34 @@ local function extraProgression()
     end
 end
 
+-- Collects loaded orbs (coins / diamonds dropped by breakables) and lootbags
+-- in one request each, wherever they are on the map.
+local function magnetCollect(feature, folderName, remote, toId)
+    if not healthy(feature) then return end
+    local folder = findChild(findChild(Workspace, "__THINGS"), folderName)
+    if not folder then return end
+    local ids, nodes = {}, {}
+    for _, node in ipairs(folder:GetChildren()) do
+        local id = toId(node.Name)
+        if id ~= nil then
+            ids[#ids+1] = id
+            nodes[#nodes+1] = node
+            if #ids >= 250 then break end
+        end
+    end
+    if #ids == 0 then return end
+    local ok, err = network(remote, {ids}, false)
+    if not ok then failFeature(feature, err); return end
+    state.commandCount = state.commandCount + 1
+    -- Hide what was claimed so it is not sent again next pass.
+    for _, node in ipairs(nodes) do pcall(node.Destroy, node) end
+end
+local function superMagnet()
+    if not Config.SuperMagnet or now() - state.lastMagnet < Config.MagnetSeconds then return end
+    state.lastMagnet = now()
+    magnetCollect("magnet-orbs", "Orbs", "Orbs: Collect", tonumber)
+    magnetCollect("magnet-lootbags", "Lootbags", "Lootbags_Claim", function(name) return name end)
+end
 local function claimFreeGift()
     if not Config.AutoFreeGifts or not healthy("freegifts")
         or now()-state.lastGifts<Config.GiftCheckSeconds then return end
@@ -1191,6 +1295,7 @@ local function recheck()
     state.blocked = {}
     state.questWatch = {}
     saveCache = nil
+    state.bulkUnsupported = false
     local found = refreshClients()
     local okInspect, readable = pcall(inspectState)
     if found and okInspect and readable and not state.running then state.status = "PAUSED: press START" end
@@ -1388,6 +1493,7 @@ local function mainLoop(generation)
                 if Config.AutoWorld and healthy("zone") then tryAdvanceWorld() end
                 extraProgression()
                 claimFreeGift()
+                superMagnet()
                 if Config.AutoRank then
                     local selected=chooseGoal()
                     if selected then
@@ -1423,7 +1529,7 @@ local function mainLoop(generation)
             pcall(inspectState)
         end
         pcall(renderUI)
-        task.wait(Config.TickSeconds)
+        task.wait(Config.FastMode and Config.FastTickSeconds or Config.TickSeconds)
     end
 end
 
@@ -1447,6 +1553,16 @@ loadSettings()
 -- Draw the panel first so something is always visible, even if loading the game modules stalls.
 local uiOK, uiErr = pcall(buildUI)
 if not uiOK then warn("[RankPilot] UI build error: " .. describe(uiErr)) end
+pcall(function()
+    local VirtualUser = game:GetService("VirtualUser")
+    table.insert(state.connections, LocalPlayer.Idled:Connect(function()
+        if not Config.AntiAFK or state.shutdown then return end
+        pcall(function()
+            VirtualUser:CaptureController()
+            VirtualUser:ClickButton2(Vector2.new())
+        end)
+    end))
+end)
 state.status = "Loading game modules..."
 pcall(renderUI)
 task.spawn(function()
@@ -1467,7 +1583,7 @@ local threadGeneration=state.generations
 task.spawn(function() mainLoop(threadGeneration) end)
 
 environment.RankPilot = {
-    Version="2.1-DZ-research",
+    Version="2.2-DZ-research",
     Config=Config,
     Status=state,
     Start=run,
