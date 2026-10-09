@@ -21,7 +21,7 @@ local HttpService = game:GetService("HttpService")
 local CoreGui = game:GetService("CoreGui")
 local LocalPlayer = Players.LocalPlayer
 if not LocalPlayer then return warn("[RankPilot] LocalPlayer not available") end
-print("[RankPilot] v2.6 loading...")
+print("[RankPilot] v2.7 loading...")
 
 local environment = (type(getgenv) == "function" and getgenv()) or _G
 if type(environment.RankPilot) == "table" and type(environment.RankPilot.Stop) == "function" then
@@ -129,7 +129,7 @@ local state = {
     lastFarm = 0, lastHatch = 0, lastConsumable = 0, lastEventItem = 0,
     lastPetAssign = 0, lastAssignedTarget = nil, lastEquip = 0, lastMagnet = 0,
     bulkUnsupported = false, upgradeSkip = {}, probing = {}, lastTargets = {}, lastTargetsAt = 0,
-    hatchLo = 1, hatchHi = 0, hatchResetAt = 0, hatchFails = 0, machineSpots = {},
+    hatchLo = 1, hatchHi = 0, hatchResetAt = 0, hatchFails = 0, machineSpots = {}, eggCost = {}, farmHome = nil,
     lastSlots = 0, lastGifts = 0, lastFarmInterface = "none",
     attempts = {farm = 0, hatch = 0, zone = 0, consumable = 0},
     lastPosition = nil, generations = 0, connections = {}, gui = nil,
@@ -891,6 +891,19 @@ local function keepInBestArea()
         end
     end
 end
+-- Goes back to the last spot where farming found targets (inside the best
+-- area), or into the area's breakable zone if no spot is known yet.
+local function returnToFarm(reason)
+    if state.tripActive then return false end
+    local root = currentRoot()
+    if not root then return false end
+    if state.farmHome and (root.Position - state.farmHome.Position).Magnitude > 30 then
+        root.CFrame = state.farmHome
+        if cooldownReady("returnLog", 20) then log("Back to farm spot" .. (reason and (": " .. reason) or ""), "WORLD") end
+        return true
+    end
+    return placeInZone(getZoneInfo())
+end
 local function farm(goal, allowMove)
     if allowMove == nil then allowMove = true end
     if not healthy("farm") then return false end
@@ -901,7 +914,11 @@ local function farm(goal, allowMove)
     local kind = goal and goal.kind or "farm"
     local targets = visibleTargetCandidates(kind)
     if #targets == 0 then
-        if allowMove and not state.tripActive then placeInZone(getZoneInfo()) end
+        -- Nothing of this kind nearby. Only leave if there is nothing at all to farm
+        -- here (e.g. standing at the egg), not just because no mini-chest is around.
+        if allowMove and (kind == "farm" or #visibleTargetCandidates("farm") == 0) then
+            returnToFarm("nothing to farm here")
+        end
         if cooldownReady("noTargets:"..kind, 45) then
             log("No matching targets ("..kind..") in active zone via "..state.lastFarmInterface,"WAIT")
         end
@@ -911,6 +928,10 @@ local function farm(goal, allowMove)
     -- farm pass can still run this tick when this one had nothing to hit.
     state.lastFarm = now()
     state.lastTargets, state.lastTargetsAt = targets, now()
+    if not state.tripActive then
+        local root = currentRoot()
+        if root then state.farmHome = root.CFrame end
+    end
     local batch = {}
     for i = 1, math.min(#targets, math.max(1, Config.TargetsPerTick)) do batch[i] = targets[i] end
     aimPetsAt(batch)
@@ -927,7 +948,7 @@ local function farm(goal, allowMove)
     state.lastSuccessfulAction = now() -- command accepted, NOT verified quest credit
     return true
 end
-local hatchAmount, disableEggAnimation
+local hatchAmount, disableEggAnimation, eggCurrency, currencyBalance
 local function eggNameByNumber(number)
     local dir = state.clients.Directory
     if dir and type(dir.Eggs) == "table" then
@@ -1092,6 +1113,22 @@ local function clickThroughEggPrompt()
         end)
     end
 end
+eggCurrency = function(egg)
+    local dir = state.clients.Directory
+    local entry = dir and type(dir.Eggs) == "table" and dir.Eggs[egg.name]
+    if type(entry) == "table" then
+        local value = entry.currency or entry.Currency or entry.currencyId
+        if type(value) == "string" then return value end
+    end
+    local zone = getZoneInfo()
+    local zoneData = zone and dir and type(dir.Zones) == "table" and dir.Zones[zone.name]
+    if type(zoneData) == "table" and type(zoneData.Currency) == "string" then return zoneData.Currency end
+    return nil
+end
+currencyBalance = function(currency)
+    local ok, amount = callMethod(state.clients.CurrencyCmds, "Get", currency)
+    return ok and tonumber(amount) or nil
+end
 local function hatch()
     if now() < (state.hatchRefusedUntil or 0) then return false end
     if state.hatchBusy then return true end
@@ -1104,10 +1141,26 @@ local function hatch()
         return false
     end
     if not currentRoot() then return false end
+    local count = hatchAmount(egg)
+    -- Coins check: per-egg cost is learned from the balance change of earlier hatches.
+    local currency = eggCurrency(egg)
+    local balanceBefore = currency and currencyBalance(currency)
+    local perEgg = state.eggCost[egg.name]
+    if balanceBefore and perEgg and perEgg > 0 then
+        local affordable = math.floor(balanceBefore / perEgg)
+        if affordable < 1 then
+            state.hatchRefusedUntil = now() + 45
+            if cooldownReady("hatchNoCoins", 45) then
+                log("Not enough " .. currency .. " to hatch " .. egg.name .. "; farming first", "WAIT")
+            end
+            returnToFarm("out of coins")
+            return false
+        end
+        count = math.min(count, affordable)
+    end
     state.lastHatch=now()
     state.hatchBusy = true
     disableEggAnimation()
-    local count = hatchAmount(egg)
     task.spawn(function()
         local function buy()
             if findChild(findChild(ReplicatedStorage,"Network"),"Eggs_RequestPurchase") then
@@ -1127,6 +1180,10 @@ local function hatch()
         if success and result ~= false then
             state.hatchFails = 0
             state.hatchLo = math.max(state.hatchLo, count)
+            local balanceAfter = currency and currencyBalance(currency)
+            if balanceBefore and balanceAfter and balanceAfter < balanceBefore then
+                state.eggCost[egg.name] = (balanceBefore - balanceAfter) / count
+            end
             state.attempts.hatch=state.attempts.hatch+1
             if cooldownReady("hatchLog", 30) then log("Hatching "..egg.name.." x"..count, "HATCH") end
             state.lastSuccessfulAction=now()
@@ -1144,6 +1201,7 @@ local function hatch()
             -- Usually not enough coins: farm for a minute first.
             state.hatchRefusedUntil = now() + 60
             log("Hatch refused for "..egg.name.." x"..count.." ("..describe(result).."); farming 60s first","WAIT")
+            returnToFarm("hatch refused")
         end
     end)
     return true
@@ -1294,7 +1352,8 @@ local function spawnQuestObject(goal, allowMove)
     if not spec then return false end
     -- Attack anything already spawned first; this is not throttled.
     if #visibleTargetCandidates(goal.kind) > 0 then return farm(goal, allowMove) end
-    if now() - state.lastEventItem < Config.SpawnItemSeconds then return false, "waiting" end
+    -- Waiting between spawn attempts must not hold the character in place.
+    if now() - state.lastEventItem < Config.SpawnItemSeconds then return false end
     local item = findQuestItem(spec, goal.title)
     if not item then
         if cooldownReady("missing:" .. goal.kind, 60) then log("No " .. spec.match .. " in inventory for '" .. goal.title .. "'", "WAIT") end
@@ -1305,8 +1364,13 @@ local function spawnQuestObject(goal, allowMove)
         if cooldownReady("noremote:" .. goal.kind, 120) then log("No spawn remote found for " .. spec.match, "WAIT") end
         return false
     end
-    if allowMove then
-        keepInBestArea()
+    -- Spawn where farming happens (inside the breakable area); a spawn from
+    -- outside it, e.g. next to the egg, is refused by the server.
+    local root = currentRoot()
+    local spawnSpot = nil
+    if root and state.farmHome and (root.Position - state.farmHome.Position).Magnitude > 30 then
+        spawnSpot = state.farmHome
+    elseif allowMove then
         placeInZone(getZoneInfo())
     end
     state.lastEventItem = now()
@@ -1320,8 +1384,7 @@ local function spawnQuestObject(goal, allowMove)
         return 0
     end
     local before = itemAmount()
-    local root = currentRoot()
-    local position = root and root.Position
+    local position = spawnSpot and spawnSpot.Position or (currentRoot() and currentRoot().Position)
     probeRemote("spawn-" .. goal.kind, remote, {
         {item.uid}, {item.id}, {item.uid, position}, {item.uid, 1},
     }, function()
@@ -1333,7 +1396,7 @@ local function spawnQuestObject(goal, allowMove)
             state.lastEventItem = now() + 45
             log("Spawn refused: " .. item.id .. " via " .. remote.Name .. " (" .. describe(result) .. ")", "WAIT")
         end
-    end)
+    end, spawnSpot)
     return true, "waiting"
 end
 local function tryAdvanceWorld()
@@ -2043,7 +2106,9 @@ local function renderUI()
         questText = #lines > 0 and table.concat(lines, "; ") or "None detected"
     end
     ui.goal.Text="Quest: "..questText
-    ui.logs.Text=table.concat({state.logs[1] or "",state.logs[2] or "",state.logs[3] or ""},"\n")
+    local recent = {}
+    for i = 1, math.min(#state.logs, 7) do recent[i] = state.logs[i] end
+    ui.logs.Text=table.concat(recent,"\n")
     ui.fps.Text="Requests: "..state.commandCount.." | Deferred: "..state.blockedCount
     ui.start.Text=state.running and "PAUSE" or "START"
 end
@@ -2176,7 +2241,7 @@ task.spawn(function()
 end)
 
 environment.RankPilot = {
-    Version="2.6-DZ-research",
+    Version="2.7-DZ-research",
     Config=Config,
     Status=state,
     Start=run,
