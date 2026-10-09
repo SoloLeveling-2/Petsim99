@@ -21,7 +21,7 @@ local HttpService = game:GetService("HttpService")
 local CoreGui = game:GetService("CoreGui")
 local LocalPlayer = Players.LocalPlayer
 if not LocalPlayer then return warn("[RankPilot] LocalPlayer not available") end
-print("[RankPilot] v2.7 loading...")
+print("[RankPilot] v2.8 loading...")
 
 local environment = (type(getgenv) == "function" and getgenv()) or _G
 if type(environment.RankPilot) == "table" and type(environment.RankPilot.Stop) == "function" then
@@ -280,7 +280,14 @@ end
 local function quickTrip(cframe, fn)
     local root = currentRoot()
     if not root then return false, "character not ready" end
+    local waited = 0
+    while state.tripActive and waited < 8 do
+        task.wait(0.2)
+        waited = waited + 0.2
+    end
     if state.tripActive then return false, "busy" end
+    root = currentRoot()
+    if not root then return false, "character not ready" end
     state.tripActive = true
     local home = root.CFrame
     local far = typeof(cframe) == "CFrame" and (root.Position - cframe.Position).Magnitude > 15
@@ -782,10 +789,12 @@ local function legacyBreakables(kind)
 end
 local function visibleTargetCandidates(kind)
     local modern = dzBreakables(kind)
-    if modern ~= nil then
+    if modern ~= nil and #modern > 0 then
         state.lastFarmInterface = "DZ BreakableFrontend"
         return modern
     end
+    -- BreakableFrontend can report nothing (e.g. zone name mismatch right after a
+    -- teleport) while breakables are right there; scan the workspace as well.
     state.lastFarmInterface = "Legacy Workspace"
     return legacyBreakables(kind)
 end
@@ -906,6 +915,8 @@ local function returnToFarm(reason)
 end
 local function farm(goal, allowMove)
     if allowMove == nil then allowMove = true end
+    -- Away at the egg / a machine: nothing to farm there, and no reason to log it.
+    if state.tripActive then return false end
     if not healthy("farm") then return false end
     local interval = Config.FastMode and Config.FastFarmSeconds or Config.FarmActionSeconds
     if now() - state.lastFarm < interval then return false end
@@ -1720,12 +1731,15 @@ local goalFeature = {
 local function findUpgradeRemote(word)
     local net = findChild(ReplicatedStorage, "Network")
     if not net then return nil end
-    local found
+    local found, foundRank = nil, 0
     for _, remote in ipairs(net:GetChildren()) do
-        local name = remote.Name:lower()
-        if name:find("upgrade", 1, true) and name:find(word, 1, true)
-            and (remote:IsA("RemoteFunction") or remote:IsA("BaseRemoteEvent")) then
-            if not found or name:find("machine", 1, true) then found = remote end
+        local name = squash(remote.Name)
+        if (remote:IsA("RemoteFunction") or remote:IsA("BaseRemoteEvent")) and name:find(word, 1, true) then
+            -- The Supercomputer replaced the separate upgrade machines.
+            local rank = (name:find("computer", 1, true) and 3)
+                or (name:find("upgrade", 1, true) and name:find("machine", 1, true) and 2)
+                or (name:find("upgrade", 1, true) and 1) or 0
+            if rank > foundRank then found, foundRank = remote, rank end
         end
     end
     return found
@@ -1774,6 +1788,7 @@ local function upgradeItems(goal)
     local isPotion = goal.kind:find("potion", 1, true) ~= nil
     local word = isPotion and "potion" or "enchant"
     if not cooldownReady("upgrade:" .. word, Config.UpgradeSeconds) then return false end
+    if now() < (state.upgradePausedUntil and state.upgradePausedUntil[word] or 0) then return false end
     local remote = findUpgradeRemote(word)
     if not remote then
         if cooldownReady("upgrade:missing:" .. word, 120) then
@@ -1820,20 +1835,33 @@ local function upgradeItems(goal)
         return total
     end
     local before = stackCount()
-    local machine = findMachineSpot("upgrade:" .. word,
-        {"supercomputer", "upgrade" .. word, word .. "upgrade", "upgrade" .. word .. "s"})
+    -- Stand at the machine the remote belongs to ("UpgradePotionsMachine_Activate"
+    -- -> "UpgradePotionsMachine"), falling back to the Supercomputer.
+    local machineName = squash(remote.Name:match("^([^_:]+)") or remote.Name)
+    local machine = findMachineSpot("upgrade:" .. remote.Name,
+        {machineName, "upgrade" .. word, "supercomputer"})
     probeRemote("upgrade", remote, {
         {best.id, best.tier}, {best.uid}, {best.id, best.tier, 1}, {best.uid, 1},
         {{id = best.id, tn = best.tier}},
     }, function() return stackCount() < before end, function(worked, result)
         if worked then
+            state.upgradeFailStreak = 0
             log("Upgraded " .. tostring(best.id) .. " tier " .. best.tier .. " via " .. remote.Name, "UPGRADE")
             state.lastSuccessfulAction = now()
         else
             -- Not enough copies, max tier, cost or proximity: leave this stack alone for a while.
             state.upgradeSkip[best.key] = now() + 300
-            log("Upgrade refused: " .. tostring(best.id) .. " tier " .. best.tier .. " (" .. describe(result) .. ")"
-                .. (machine and "" or "; machine not found on map"), "WAIT")
+            state.upgradeFailStreak = (state.upgradeFailStreak or 0) + 1
+            log("Upgrade refused: " .. tostring(best.id) .. " tier " .. best.tier .. " via " .. remote.Name
+                .. " (" .. describe(result) .. ")" .. (machine and "" or "; machine not found on map"), "WAIT")
+            if state.upgradeFailStreak >= 2 and not probeMemory[remote.Name] then
+                -- No argument format has ever worked: stop pulling the character to the
+                -- machine and farm instead. COPY REPORT lists the remotes to fix this.
+                state.upgradePausedUntil = state.upgradePausedUntil or {}
+                state.upgradePausedUntil[word] = now() + 900
+                state.upgradeFailStreak = 0
+                log("Upgrades paused 15 min: " .. remote.Name .. " does not accept any known format. Send COPY REPORT.", "SAFEGUARD")
+            end
         end
     end, machine)
     return true
@@ -1929,7 +1957,27 @@ local function getReport()
     local upgradeRemotes = {}
     if net then
         for _, remote in ipairs(net:GetChildren()) do
-            if remote.Name:lower():find("upgrade", 1, true) then upgradeRemotes[#upgradeRemotes+1] = remote.Name end
+            local name = squash(remote.Name)
+            for _, word in ipairs({"upgrade", "computer", "potion", "enchant", "coinjar", "comet"}) do
+                if name:find(word, 1, true) then
+                    upgradeRemotes[#upgradeRemotes+1] = remote.Name .. "(" .. remote.ClassName:gsub("Remote", "") .. ")"
+                    break
+                end
+            end
+        end
+    end
+    -- Client modules for the Supercomputer / upgrades, with their function names.
+    local clientModules = {}
+    local clientFolder = findChild(findChild(ReplicatedStorage, "Library"), "Client")
+    for _, node in ipairs(clientFolder and clientFolder:GetChildren() or {}) do
+        local name = squash(node.Name)
+        if node:IsA("ModuleScript") and (name:find("computer", 1, true) or name:find("upgrade", 1, true)) then
+            local fns = {}
+            for key, value in pairs(tryModule(node) or {}) do
+                if type(value) == "function" then fns[#fns+1] = tostring(key) end
+            end
+            table.sort(fns)
+            clientModules[#clientModules+1] = node.Name .. "{" .. table.concat(fns, ",") .. "}"
         end
     end
     local report = {"RankPilot DZ-enhanced capability report", "Rank: " .. describe(state.rank),
@@ -1937,7 +1985,8 @@ local function getReport()
         "Status: " .. state.status, "PlaceId: " .. describe(game.PlaceId),
         "Breakable interface: " .. state.lastFarmInterface,
         "Goals: " .. #state.goals, "Controllers: " .. describe(state.chosen),
-        "Upgrade remotes: " .. (#upgradeRemotes > 0 and table.concat(upgradeRemotes, ", ") or "none")}
+        "Upgrade remotes: " .. (#upgradeRemotes > 0 and table.concat(upgradeRemotes, ", ") or "none"),
+        "Upgrade modules: " .. (#clientModules > 0 and table.concat(clientModules, " ") or "none")}
     for kind, spec in pairs(itemTypes) do
         local remote = findItemRemote(spec.word)
         table.insert(report, "Item remote " .. kind .. ": " .. (remote and remote.Name or "none"))
@@ -2241,7 +2290,7 @@ task.spawn(function()
 end)
 
 environment.RankPilot = {
-    Version="2.7-DZ-research",
+    Version="2.8-DZ-research",
     Config=Config,
     Status=state,
     Start=run,
