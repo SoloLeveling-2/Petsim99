@@ -20,6 +20,7 @@ local HttpService = game:GetService("HttpService")
 local CoreGui = game:GetService("CoreGui")
 local LocalPlayer = Players.LocalPlayer
 if not LocalPlayer then return warn("[RankPilot] LocalPlayer not available") end
+print("[RankPilot] v2.1 loading...")
 
 local environment = (type(getgenv) == "function" and getgenv()) or _G
 if type(environment.RankPilot) == "table" and type(environment.RankPilot.Stop) == "function" then
@@ -1425,23 +1426,47 @@ local function mainLoop(generation)
     end
 end
 
-loadSettings()
-local ok = refreshClients()
-if ok then
-    pcall(inspectState)
-    log("Readable PS99 save module detected")
-else
-    log("PS99 save module unavailable. Hub will remain safely paused.","WAIT")
+-- Remove panels left behind by earlier (possibly crashed) runs.
+local guiContainers = {CoreGui, LocalPlayer:FindFirstChildOfClass("PlayerGui")}
+if type(gethui) == "function" then
+    local okHui, hui = pcall(gethui)
+    if okHui then table.insert(guiContainers, hui) end
 end
+for _, container in pairs(guiContainers) do
+    if typeof(container) == "Instance" then
+        pcall(function()
+            for _, old in ipairs(container:GetChildren()) do
+                if old.Name == "RankPilotUI" then old:Destroy() end
+            end
+        end)
+    end
+end
+
+loadSettings()
+-- Draw the panel first so something is always visible, even if loading the game modules stalls.
 local uiOK, uiErr = pcall(buildUI)
-if not uiOK then log("UI build error: " .. describe(uiErr), "ERROR") end
-state.status = ok and "PAUSED: press START" or "Save module not found: press RECHECK"
+if not uiOK then warn("[RankPilot] UI build error: " .. describe(uiErr)) end
+state.status = "Loading game modules..."
+pcall(renderUI)
+task.spawn(function()
+    local loaded, ok = pcall(refreshClients)
+    ok = loaded and ok
+    if ok then
+        pcall(inspectState)
+        log("Readable PS99 save module detected")
+    else
+        log("PS99 save module unavailable. Hub will remain safely paused.","WAIT")
+    end
+    if not state.running then
+        state.status = ok and "PAUSED: press START" or "Save module not found: press RECHECK"
+    end
+end)
 state.generations=state.generations+1
 local threadGeneration=state.generations
 task.spawn(function() mainLoop(threadGeneration) end)
 
 environment.RankPilot = {
-    Version="2.0-DZ-research",
+    Version="2.1-DZ-research",
     Config=Config,
     Status=state,
     Start=run,
