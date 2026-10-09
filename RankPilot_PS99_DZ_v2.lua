@@ -1,3 +1,4 @@
+--!nocheck
 --[[
  RankPilot / PS99 rank-focused, single-account Luau hub
  DZ-informed research build: 2026-10-09
