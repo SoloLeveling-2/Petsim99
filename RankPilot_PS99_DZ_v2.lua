@@ -21,7 +21,7 @@ local HttpService = game:GetService("HttpService")
 local CoreGui = game:GetService("CoreGui")
 local LocalPlayer = Players.LocalPlayer
 if not LocalPlayer then return warn("[RankPilot] LocalPlayer not available") end
-print("[RankPilot] v2.5 loading...")
+print("[RankPilot] v2.6 loading...")
 
 local environment = (type(getgenv) == "function" and getgenv()) or _G
 if type(environment.RankPilot) == "table" and type(environment.RankPilot.Stop) == "function" then
@@ -80,6 +80,8 @@ local Config = {
     SlotCheckSeconds = 28,
     GiftCheckSeconds = 65,
     HatchActionSeconds = 3.5,
+    FastHatchSeconds = 1.5,
+    TripSettleSeconds = 0.3,   -- Wait after teleporting before acting, so the server sees the new position
     ConsumableSeconds = 6,
     SpawnItemSeconds = 14,
     StallSeconds = 150,
@@ -127,7 +129,7 @@ local state = {
     lastFarm = 0, lastHatch = 0, lastConsumable = 0, lastEventItem = 0,
     lastPetAssign = 0, lastAssignedTarget = nil, lastEquip = 0, lastMagnet = 0,
     bulkUnsupported = false, upgradeSkip = {}, probing = {}, lastTargets = {}, lastTargetsAt = 0,
-    hatchLo = 1, hatchHi = 0, hatchResetAt = 0,
+    hatchLo = 1, hatchHi = 0, hatchResetAt = 0, hatchFails = 0, machineSpots = {},
     lastSlots = 0, lastGifts = 0, lastFarmInterface = "none",
     attempts = {farm = 0, hatch = 0, zone = 0, consumable = 0},
     lastPosition = nil, generations = 0, connections = {}, gui = nil,
@@ -271,11 +273,36 @@ end
 -- values are unreliable. probeRemote tries each argument shape in the background
 -- and checks the save data to see whether it actually worked; the shape that
 -- worked is remembered for next time.
+-- Quick trip: teleport to a spot, run fn there, then return to where the
+-- character was. Farming in the best area carries on between trips, so hatching,
+-- vending and upgrading no longer pull the character away for long.
+-- Must be called from a spawned thread (it waits).
+local function quickTrip(cframe, fn)
+    local root = currentRoot()
+    if not root then return false, "character not ready" end
+    if state.tripActive then return false, "busy" end
+    state.tripActive = true
+    local home = root.CFrame
+    local far = typeof(cframe) == "CFrame" and (root.Position - cframe.Position).Magnitude > 15
+    if far then
+        root.CFrame = cframe
+        task.wait(Config.TripSettleSeconds)
+    end
+    local ok, a, b = pcall(fn)
+    if far then
+        local back = currentRoot()
+        if back then back.CFrame = home end
+    end
+    state.tripActive = false
+    if not ok then return false, a end
+    return a, b
+end
 local probeMemory = {}
-local function probeRemote(key, remote, shapes, verify, onDone)
+local function probeRemote(key, remote, shapes, verify, onDone, tripTo)
     if state.probing[key] then return false end
     state.probing[key] = true
     task.spawn(function()
+      local function runProbe()
         local order, known = {}, probeMemory[remote.Name]
         if known and shapes[known] then order[1] = known end
         for i = 1, #shapes do if i ~= known then order[#order+1] = i end end
@@ -298,6 +325,10 @@ local function probeRemote(key, remote, shapes, verify, onDone)
             end
             if state.shutdown or not state.running then break end
         end
+        return worked, lastResult
+      end
+        local worked, lastResult
+        if tripTo then worked, lastResult = quickTrip(tripTo, runProbe) else worked, lastResult = runProbe() end
         state.probing[key] = nil
         pcall(onDone, worked, lastResult)
     end)
@@ -315,8 +346,10 @@ local function loadSettings()
             data.AutoEventItems, data.AutoVending, data.AutoUpgrade = nil, nil, nil
         end
         data.SettingsVersion = nil
+        -- Only on/off toggles are restored. Numbers such as MaxHatchBatch always
+        -- come from this file, so an old saved value cannot hold a new version back.
         for key, value in pairs(data) do
-            if Config[key] ~= nil and type(Config[key]) == type(value) then
+            if type(Config[key]) == "boolean" and type(value) == "boolean" then
                 Config[key] = value
             end
         end
@@ -328,8 +361,10 @@ end
 local function persist()
     if type(writefile) ~= "function" then return end
     pcall(function()
-        local copy = {}
-        for k, v in pairs(Config) do copy[k] = v end
+        local copy = {SettingsVersion = Config.SettingsVersion}
+        for k, v in pairs(Config) do
+            if type(v) == "boolean" then copy[k] = v end
+        end
         copy.Enabled = false
         writefile(state.configFile, HttpService:JSONEncode(copy))
     end)
@@ -846,7 +881,7 @@ local function damageBreakable(target)
     return ok and result ~= false
 end
 local function keepInBestArea()
-    if not Config.StayInBestArea or not cooldownReady("bestArea", 4) then return end
+    if state.tripActive or not Config.StayInBestArea or not cooldownReady("bestArea", 4) then return end
     local best = getZoneInfo()
     local ok, current = callMethod(state.clients.MapCmds, "GetCurrentZone")
     if best and ok and type(current) == "string" and current ~= best.name then
@@ -866,7 +901,7 @@ local function farm(goal, allowMove)
     local kind = goal and goal.kind or "farm"
     local targets = visibleTargetCandidates(kind)
     if #targets == 0 then
-        if allowMove then placeInZone(getZoneInfo()) end
+        if allowMove and not state.tripActive then placeInZone(getZoneInfo()) end
         if cooldownReady("noTargets:"..kind, 45) then
             log("No matching targets ("..kind..") in active zone via "..state.lastFarmInterface,"WAIT")
         end
@@ -945,11 +980,11 @@ hatchAmount = function(egg)
         local ok, cap = callMethod(cmds, method)
         if not (ok and tonumber(cap)) then ok, cap = callMethod(cmds, method, egg.name) end
         if ok and tonumber(cap) and tonumber(cap) >= 1 then
-            state.hatchKnown = true
-            return math.floor(tonumber(cap))
+            -- The game's value is known to work; the search may still find more.
+            state.hatchLo = math.max(state.hatchLo, math.floor(tonumber(cap)))
+            break
         end
     end
-    state.hatchKnown = false
     if state.hatchHi < 1 or now() > state.hatchResetAt then
         -- Re-check upward every 10 minutes in case more egg slots were bought.
         state.hatchHi, state.hatchResetAt = Config.MaxHatchBatch, now() + 600
@@ -961,7 +996,30 @@ end
 -- and clicks through "Click to open!" if the animation still appears.
 disableEggAnimation = function()
     if not Config.SkipEggAnimation then return end
-    if not state.eggAnimPatched and type(getsenv) == "function" and cooldownReady("eggAnimPatch", 30) then
+    if not state.eggAnimPatched and cooldownReady("eggAnimPatch", 30) then
+        -- Shared modules can be patched without getsenv.
+        local places = {LocalPlayer:FindFirstChild("PlayerScripts"), findChild(ReplicatedStorage, "Library")}
+        for _, place in ipairs(places) do
+            for _, node in ipairs(place and place:GetDescendants() or {}) do
+                local name = node.Name:lower()
+                if node:IsA("ModuleScript") and name:find("egg", 1, true)
+                    and (name:find("anim", 1, true) or name:find("open", 1, true)) then
+                    local module = tryModule(node)
+                    for key, value in pairs(module or {}) do
+                        if type(value) == "function" and type(key) == "string" and key:lower():find("anim", 1, true) then
+                            module[key] = function() return end
+                            state.eggAnimPatched = true
+                            log("Egg animation disabled (" .. node.Name .. "." .. key .. ")", "HATCH")
+                        end
+                    end
+                end
+            end
+        end
+        if not state.eggAnimPatched and type(getsenv) ~= "function" and cooldownReady("noGetsenv", 600) then
+            log("Executor has no getsenv: using auto-click on 'Click to open!' instead", "HATCH")
+        end
+    end
+    if not state.eggAnimPatched and type(getsenv) == "function" and cooldownReady("eggAnimPatchEnv", 30) then
         local scripts = LocalPlayer:FindFirstChild("PlayerScripts")
         for _, node in ipairs(scripts and scripts:GetDescendants() or {}) do
             local name = node.Name:lower()
@@ -983,10 +1041,33 @@ disableEggAnimation = function()
         end
     end
 end
+local function guiShown(node, gui)
+    if not (node and node.Parent and node.Visible and node.AbsoluteSize.X > 0) then return false end
+    local parent = node.Parent
+    while parent and parent ~= gui do
+        if parent:IsA("GuiObject") and not parent.Visible then return false end
+        if parent:IsA("ScreenGui") and not parent.Enabled then return false end
+        parent = parent.Parent
+    end
+    return true
+end
+local function findGuiText(gui, text)
+    for _, node in ipairs(gui:GetDescendants()) do
+        if (node:IsA("TextLabel") or node:IsA("TextButton")) and node.Text:lower():find(text, 1, true) then
+            return node
+        end
+    end
+    return nil
+end
 local function clickThroughEggPrompt()
     if not Config.SkipEggAnimation then return end
     local gui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
     if not gui then return end
+    -- Never click while a purchase dialog is open: a stray click could buy something.
+    if cooldownReady("buyDialogScan", 1) then
+        state.buyDialogLabel = findGuiText(gui, "would you like to buy")
+    end
+    if guiShown(state.buyDialogLabel, gui) then return end
     local label = state.eggPromptLabel
     if not (label and label.Parent) then
         label = nil
@@ -999,67 +1080,72 @@ local function clickThroughEggPrompt()
         end
         state.eggPromptLabel = label
     end
-    if label and label.Visible and label.AbsoluteSize.X > 0 then
-        local okVis = true
-        local parent = label.Parent
-        while parent and parent ~= gui do
-            if parent:IsA("GuiObject") and not parent.Visible then okVis = false break end
-            if parent:IsA("ScreenGui") and not parent.Enabled then okVis = false break end
-            parent = parent.Parent
-        end
-        if okVis then
-            pcall(function()
-                local vim = game:GetService("VirtualInputManager")
-                local camera = Workspace.CurrentCamera
-                local center = camera and camera.ViewportSize / 2 or Vector2.new(400, 300)
-                vim:SendMouseButtonEvent(center.X, center.Y, 0, true, game, 1)
-                vim:SendMouseButtonEvent(center.X, center.Y, 0, false, game, 1)
-            end)
-        end
+    if guiShown(label, gui) then
+        -- Click on the "Click to open!" text itself rather than the middle of the
+        -- screen, where an egg or a button could be.
+        pcall(function()
+            local vim = game:GetService("VirtualInputManager")
+            local inset = game:GetService("GuiService"):GetGuiInset()
+            local point = label.AbsolutePosition + label.AbsoluteSize / 2 + inset
+            vim:SendMouseButtonEvent(point.X, point.Y, 0, true, game, 1)
+            vim:SendMouseButtonEvent(point.X, point.Y, 0, false, game, 1)
+        end)
     end
 end
-local function hatch(allowMove)
-    if allowMove == nil then allowMove = true end
+local function hatch()
     if now() < (state.hatchRefusedUntil or 0) then return false end
-    if now()-state.lastHatch < Config.HatchActionSeconds then return false, "waiting" end
+    if state.hatchBusy then return true end
+    local interval = Config.FastMode and Config.FastHatchSeconds or Config.HatchActionSeconds
+    if now()-state.lastHatch < interval then return true end
     local egg=findEgg()
     if not egg then
         if cooldownReady("noEgg",40) then log("No unlocked egg found on the map (go near your best egg once)", "WAIT") end
         state.hatchRefusedUntil = now() + 15
         return false
     end
-    local root=currentRoot()
-    if not root then return false end
-    if egg.capsuleCFrame and (root.Position-egg.capsuleCFrame.Position).Magnitude>20 then
-        if not allowMove then return false end
-        root.CFrame=egg.capsuleCFrame*CFrame.new(0,4,8)
-        return false, "moving"
-    end
+    if not currentRoot() then return false end
     state.lastHatch=now()
+    state.hatchBusy = true
     disableEggAnimation()
     local count = hatchAmount(egg)
-    local success,result
-    if findChild(findChild(ReplicatedStorage,"Network"),"Eggs_RequestPurchase") then
-        success,result=network("Eggs_RequestPurchase",{egg.name,count},true)
-    else
-        success,result=callMethod(state.clients.EggCmds,"RequestPurchase",egg.name,count)
-    end
-    if not success or result==false then
-        if count > 1 and not state.hatchKnown then
+    task.spawn(function()
+        local function buy()
+            if findChild(findChild(ReplicatedStorage,"Network"),"Eggs_RequestPurchase") then
+                return network("Eggs_RequestPurchase",{egg.name,count},true)
+            end
+            return callMethod(state.clients.EggCmds,"RequestPurchase",egg.name,count)
+        end
+        local success, result
+        if egg.capsuleCFrame then
+            success, result = quickTrip(egg.capsuleCFrame*CFrame.new(0,4,8), buy)
+        else
+            success, result = buy()
+        end
+        state.hatchBusy = false
+        state.commandCount = state.commandCount + 1
+        if result == "busy" then state.lastHatch = 0; return end
+        if success and result ~= false then
+            state.hatchFails = 0
+            state.hatchLo = math.max(state.hatchLo, count)
+            state.attempts.hatch=state.attempts.hatch+1
+            if cooldownReady("hatchLog", 30) then log("Hatching "..egg.name.." x"..count, "HATCH") end
+            state.lastSuccessfulAction=now()
+            return
+        end
+        -- One refusal can just be the hatch cooldown; act on two in a row.
+        state.hatchFails = state.hatchFails + 1
+        if state.hatchFails < 2 then return end
+        state.hatchFails = 0
+        if count > state.hatchLo then
             -- Too many at once: search downwards for the real maximum.
             state.hatchHi = count - 1
-            state.lastHatch = now() - Config.HatchActionSeconds
-            return false, "waiting"
+            state.lastHatch = 0
+        else
+            -- Usually not enough coins: farm for a minute first.
+            state.hatchRefusedUntil = now() + 60
+            log("Hatch refused for "..egg.name.." x"..count.." ("..describe(result).."); farming 60s first","WAIT")
         end
-        -- Usually not enough coins: stop teleporting to the egg for a minute and farm instead.
-        state.hatchRefusedUntil = now() + 60
-        log("Hatch refused for "..egg.name.." x"..count.." ("..describe(result).."); farming 60s first","WAIT")
-        return false
-    end
-    if not state.hatchKnown then state.hatchLo = math.max(state.hatchLo, count) end
-    state.attempts.hatch=state.attempts.hatch+1
-    if cooldownReady("hatchLog", 30) then log("Hatching "..egg.name.." x"..count, "HATCH") end
-    state.lastSuccessfulAction=now()
+    end)
     return true
 end
 local function consume(goal)
@@ -1096,11 +1182,8 @@ local function vendingWait(reason)
 end
 local function vendingForGoal(goal, allowMove)
     if not Config.AutoVending or not healthy("vending") then return false end
-    if not cooldownReady("vending:scan", 4) then
-        -- Keep the character at the machine only while a trip is in progress.
-        if now() < (state.vendingBusyUntil or 0) then return false, "waiting" end
-        return false
-    end
+    if state.vendingBusy then return true end
+    if not cooldownReady("vending:scan", 4) then return false end
     local data = saveData()
     local stocks = data and (data.VendingStocks or data.VendingMachineStocks)
     if type(stocks) ~= "table" then return vendingWait("no vending stock in save data") end
@@ -1131,22 +1214,22 @@ local function vendingForGoal(goal, allowMove)
                 end
                 local spot = node and (node:FindFirstChild("Arrow", true) or node:FindFirstChild("arrowPivot", true)
                     or node:FindFirstChildWhichIsA("BasePart", true))
-                local root = currentRoot()
-                if spot and spot:IsA("BasePart") and root and (root.Position - spot.Position).Magnitude > 12 then
-                    if not allowMove then return false end
-                    root.CFrame = spot.CFrame + Vector3.new(0, 4, 0)
-                    state.vendingBusyUntil = now() + 6
-                    return false, "moving"
-                end
-                local okBuy, result = network("VendingMachines_Purchase", {machineName, amount}, true)
-                state.commandCount = state.commandCount + 1
-                if okBuy and result ~= false then
-                    state.vendingBusyUntil = now() + 6
-                    log("Bought " .. amount .. "x from " .. machineName, "VENDING")
-                    state.lastSuccessfulAction = now()
-                    return true
-                end
-                reason = machineName .. " purchase refused (" .. describe(result) .. ")"
+                local spotCF = spot and spot:IsA("BasePart") and (spot.CFrame + Vector3.new(0, 4, 0)) or nil
+                state.vendingBusy = true
+                task.spawn(function()
+                    local function buy() return network("VendingMachines_Purchase", {machineName, amount}, true) end
+                    local okBuy, result
+                    if spotCF then okBuy, result = quickTrip(spotCF, buy) else okBuy, result = buy() end
+                    state.vendingBusy = false
+                    state.commandCount = state.commandCount + 1
+                    if okBuy and result ~= false then
+                        log("Bought " .. amount .. "x from " .. machineName, "VENDING")
+                        state.lastSuccessfulAction = now()
+                    elseif result ~= "busy" then
+                        vendingWait(machineName .. " purchase refused (" .. describe(result) .. ")")
+                    end
+                end)
+                return true
             end
         end
     end
@@ -1584,6 +1667,45 @@ local function findUpgradeRemote(word)
     end
     return found
 end
+-- Locates a machine on the map (e.g. the Super Computer / upgrade machines) by
+-- name. Zone folders keep machines under INTERACT.Machines; a full map search is
+-- only a fallback, and results are cached.
+local function findMachineSpot(key, words)
+    local cached = state.machineSpots[key]
+    if cached and cached.node.Parent then return cached.cframe end
+    if not cooldownReady("machineScan:" .. key, 60) then return nil end
+    local function matches(node)
+        local name = squash(node.Name)
+        for _, word in ipairs(words) do
+            if name:find(word, 1, true) then return true end
+        end
+        return false
+    end
+    local function remember(node)
+        local okPivot, pivot = pcall(function()
+            return node:IsA("BasePart") and node.CFrame or node:GetPivot()
+        end)
+        if okPivot and typeof(pivot) == "CFrame" then
+            state.machineSpots[key] = {node = node, cframe = pivot * CFrame.new(0, 4, 6)}
+            return state.machineSpots[key].cframe
+        end
+        return nil
+    end
+    for _, mapRoot in ipairs(mapRoots()) do
+        for _, zone in ipairs(mapRoot:GetChildren()) do
+            local machines = zone:FindFirstChild("INTERACT") and zone.INTERACT:FindFirstChild("Machines")
+            for _, node in ipairs(machines and machines:GetChildren() or {}) do
+                if matches(node) then return remember(node) end
+            end
+        end
+    end
+    for _, mapRoot in ipairs(mapRoots()) do
+        for _, node in ipairs(mapRoot:GetDescendants()) do
+            if (node:IsA("Model") or node:IsA("BasePart")) and matches(node) then return remember(node) end
+        end
+    end
+    return nil
+end
 local function upgradeItems(goal)
     if not Config.AutoUpgrade or not healthy("upgrade") then return false end
     local isPotion = goal.kind:find("potion", 1, true) ~= nil
@@ -1635,6 +1757,8 @@ local function upgradeItems(goal)
         return total
     end
     local before = stackCount()
+    local machine = findMachineSpot("upgrade:" .. word,
+        {"supercomputer", "upgrade" .. word, word .. "upgrade", "upgrade" .. word .. "s"})
     probeRemote("upgrade", remote, {
         {best.id, best.tier}, {best.uid}, {best.id, best.tier, 1}, {best.uid, 1},
         {{id = best.id, tn = best.tier}},
@@ -1645,28 +1769,29 @@ local function upgradeItems(goal)
         else
             -- Not enough copies, max tier, cost or proximity: leave this stack alone for a while.
             state.upgradeSkip[best.key] = now() + 300
-            log("Upgrade refused: " .. tostring(best.id) .. " tier " .. best.tier .. " (" .. describe(result) .. ")", "WAIT")
+            log("Upgrade refused: " .. tostring(best.id) .. " tier " .. best.tier .. " (" .. describe(result) .. ")"
+                .. (machine and "" or "; machine not found on map"), "WAIT")
         end
-    end)
+    end, machine)
     return true
 end
 
 -- Quests that need the character in a particular place; only one runs per tick.
 local locationKinds = {
-    hatch = true, farm = true, diamond = true, minichest = true, safe = true,
+    farm = true, diamond = true, minichest = true, safe = true,
     coinjar = true, comet = true, pinata = true, luckyblock = true,
 }
 local function needsLocation(goal)
     if locationKinds[goal.kind] then return true end
     -- Vending teleports to the machine; upgrades do not move the character.
-    return (goal.kind == "collect_potion" or goal.kind == "collect_enchant") and Config.AutoVending
+    return false
 end
 local function performGoal(goal, allowMove)
     if not goal then return false end
     if allowMove == nil then allowMove = true end
     local feature = goalFeature[goal.kind] or (itemTypes[goal.kind] and "spawn-" .. goal.kind)
     if feature and not healthy(feature) then return false end
-    if goal.kind == "hatch" then return hatch(allowMove) end
+    if goal.kind == "hatch" then return hatch() end
     if goal.kind == "fruit" or goal.kind == "potion" or goal.kind == "flag" then
         return consume(goal)
     end
@@ -1758,6 +1883,16 @@ local function getReport()
         local remote = findMagnetRemote(spec)
         table.insert(report, "Magnet remote " .. spec.folder .. ": " .. (remote and remote.Name or "none"))
     end
+    local eggScripts = {}
+    local scriptsRoot = LocalPlayer:FindFirstChild("PlayerScripts")
+    for _, node in ipairs(scriptsRoot and scriptsRoot:GetDescendants() or {}) do
+        if (node:IsA("LocalScript") or node:IsA("ModuleScript")) and node.Name:lower():find("egg", 1, true) then
+            eggScripts[#eggScripts+1] = node.Name
+        end
+    end
+    table.insert(report, "Egg scripts: " .. (#eggScripts > 0 and table.concat(eggScripts, ", ") or "none"))
+    table.insert(report, "Egg animation patched: " .. tostring(state.eggAnimPatched == true)
+        .. " | hatch amount range " .. state.hatchLo .. "-" .. state.hatchHi)
     local egg = findEgg()
     table.insert(report, "Best egg: " .. (egg and (tostring(egg.number) .. " " .. tostring(egg.name)) or "not found"))
     for _,k in ipairs(keys) do
@@ -2041,7 +2176,7 @@ task.spawn(function()
 end)
 
 environment.RankPilot = {
-    Version="2.5-DZ-research",
+    Version="2.6-DZ-research",
     Config=Config,
     Status=state,
     Start=run,
