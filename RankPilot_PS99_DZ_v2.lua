@@ -21,7 +21,7 @@ local HttpService = game:GetService("HttpService")
 local CoreGui = game:GetService("CoreGui")
 local LocalPlayer = Players.LocalPlayer
 if not LocalPlayer then return warn("[RankPilot] LocalPlayer not available") end
-print("[RankPilot] v2.4 loading...")
+print("[RankPilot] v2.5 loading...")
 
 local environment = (type(getgenv) == "function" and getgenv()) or _G
 if type(environment.RankPilot) == "table" and type(environment.RankPilot.Stop) == "function" then
@@ -55,6 +55,11 @@ local Config = {
     SuperMagnet = true,         -- Collect every loaded orb and lootbag
     StayInBestArea = true,      -- Keep the player (and so the pets) in the best owned area
     AntiAFK = true,             -- Prevent the 20-minute idle kick
+    AutoTap = true,             -- Tap the nearest breakable continuously
+    TapSeconds = 0.1,
+    AutoUltimate = true,        -- Fire the equipped ultimate whenever it is charged
+    UltimateSeconds = 3,
+    SkipEggAnimation = true,    -- Patch out the egg-opening animation / auto-click "Click to open"
     TargetsPerTick = 6,         -- Breakables damaged / pets spread across per farm pass
     FastTickSeconds = 0.25,
     FastFarmSeconds = 0.1,
@@ -80,7 +85,7 @@ local Config = {
     StallSeconds = 150,
     BlockedQuestSeconds = 75,
     MaxErrorsPerFeature = 5,
-    MaxHatchBatch = 30,
+    MaxHatchBatch = 100,        -- Upper bound when the game's own max-hatch value is unreadable
     TargetRank = 0,             -- 0 = no artificial stopping point; game cap may change
     PreferHighStars = true,
     RepositionDistance = 35,
@@ -105,6 +110,9 @@ local optionOrder = {
     {"SuperMagnet", "Super magnet (orbs + lootbags)"},
     {"StayInBestArea", "Stay in best area"},
     {"AntiAFK", "Anti-AFK"},
+    {"AutoTap", "Auto tap"},
+    {"AutoUltimate", "Auto ultimate"},
+    {"SkipEggAnimation", "Skip egg animation"},
     {"RenderOff", "Disable 3D rendering"},
 }
 
@@ -118,7 +126,8 @@ local state = {
     lastWorldCheck = 0, lastRewardCheck = 0, lastRefresh = 0,
     lastFarm = 0, lastHatch = 0, lastConsumable = 0, lastEventItem = 0,
     lastPetAssign = 0, lastAssignedTarget = nil, lastEquip = 0, lastMagnet = 0,
-    bulkUnsupported = false, upgradeSkip = {},
+    bulkUnsupported = false, upgradeSkip = {}, probing = {}, lastTargets = {}, lastTargetsAt = 0,
+    hatchLo = 1, hatchHi = 0, hatchResetAt = 0,
     lastSlots = 0, lastGifts = 0, lastFarmInterface = "none",
     attempts = {farm = 0, hatch = 0, zone = 0, consumable = 0},
     lastPosition = nil, generations = 0, connections = {}, gui = nil,
@@ -128,10 +137,6 @@ local state = {
 }
 
 local function now() return os.clock() end
-local function safe(fn, ...)
-    if type(fn) ~= "function" then return false, "function unavailable" end
-    return pcall(fn, ...)
-end
 local function describe(value)
     if type(value) == "string" then return value end
     local success, result = pcall(tostring, value)
@@ -166,12 +171,6 @@ local function healthy(feature)
     local row = state.failures[feature]
     return not (row and row.disabled)
 end
-local function guarded(feature, fn)
-    if not healthy(feature) then return false end
-    local ok, value = pcall(fn)
-    if not ok then failFeature(feature, value); return false end
-    return true, value
-end
 local function findChild(parent, name)
     return parent and parent:FindFirstChild(name)
 end
@@ -199,7 +198,7 @@ local function refreshClients()
     if type(c) ~= "table" then c = {} end
     for _,name in ipairs({"Save", "QuestCmds", "ZoneCmds", "RankCmds", "PetCmds", "EggCmds",
         "FruitCmds", "PotionCmds", "ZoneFlagCmds", "InventoryCmds", "RebirthCmds",
-        "MapCmds", "CurrencyCmds", "MachineCmds", "PlayerPet", "BreakableFrontend"}) do
+        "MapCmds", "CurrencyCmds", "MachineCmds", "PlayerPet", "BreakableFrontend", "UltimateCmds"}) do
         if not c[name] then c[name] = tryModule(findChild(clientFolder, name)) end
     end
     c.Network = c.Network or tryModule(findChild(clientFolder, "Network"))
@@ -268,6 +267,42 @@ local function attemptNetwork(feature, name, args, invoke, interval)
     return result ~= false
 end
 
+-- Some remotes' argument formats differ between game versions and their return
+-- values are unreliable. probeRemote tries each argument shape in the background
+-- and checks the save data to see whether it actually worked; the shape that
+-- worked is remembered for next time.
+local probeMemory = {}
+local function probeRemote(key, remote, shapes, verify, onDone)
+    if state.probing[key] then return false end
+    state.probing[key] = true
+    task.spawn(function()
+        local order, known = {}, probeMemory[remote.Name]
+        if known and shapes[known] then order[1] = known end
+        for i = 1, #shapes do if i ~= known then order[#order+1] = i end end
+        local worked, lastResult = false, nil
+        for _, index in ipairs(order) do
+            local args = shapes[index]
+            local ok, result = pcall(function()
+                if remote:IsA("RemoteFunction") then return remote:InvokeServer(unpack(args)) end
+                remote:FireServer(unpack(args))
+                return true
+            end)
+            state.commandCount = state.commandCount + 1
+            lastResult = ok and result or ("error: " .. describe(result))
+            task.wait(0.9)
+            local okVerify, verified = pcall(verify)
+            if ok and okVerify and verified then
+                probeMemory[remote.Name] = index
+                worked = true
+                break
+            end
+            if state.shutdown or not state.running then break end
+        end
+        state.probing[key] = nil
+        pcall(onDone, worked, lastResult)
+    end)
+    return true
+end
 local function loadSettings()
     if not (type(isfile) == "function" and type(readfile) == "function") then return end
     local ok, data = pcall(function()
@@ -840,12 +875,13 @@ local function farm(goal, allowMove)
     -- Only a pass that found targets uses up the interval, so another quest's
     -- farm pass can still run this tick when this one had nothing to hit.
     state.lastFarm = now()
+    state.lastTargets, state.lastTargetsAt = targets, now()
     local batch = {}
     for i = 1, math.min(#targets, math.max(1, Config.TargetsPerTick)) do batch[i] = targets[i] end
     aimPetsAt(batch)
     local ok = false
     for _, target in ipairs(batch) do
-        if damageBreakable(target) then ok = true end
+        if not Config.AutoTap or damageBreakable(target) then ok = true end
     end
     state.currentTarget = tostring(batch[1].uid)
     if not ok then
@@ -856,6 +892,7 @@ local function farm(goal, allowMove)
     state.lastSuccessfulAction = now() -- command accepted, NOT verified quest credit
     return true
 end
+local hatchAmount, disableEggAnimation
 local function eggNameByNumber(number)
     local dir = state.clients.Directory
     if dir and type(dir.Eggs) == "table" then
@@ -900,6 +937,87 @@ local function findEgg()
     end
     return nil
 end
+-- Max eggs per hatch: the game's own value when readable, otherwise found by
+-- trying a large batch and halving the range on each refusal.
+hatchAmount = function(egg)
+    local cmds = state.clients.EggCmds
+    for _, method in ipairs({"GetMaxHatch", "GetMaxHatchCount", "GetHatchCount", "GetMaxEggHatch"}) do
+        local ok, cap = callMethod(cmds, method)
+        if not (ok and tonumber(cap)) then ok, cap = callMethod(cmds, method, egg.name) end
+        if ok and tonumber(cap) and tonumber(cap) >= 1 then
+            state.hatchKnown = true
+            return math.floor(tonumber(cap))
+        end
+    end
+    state.hatchKnown = false
+    if state.hatchHi < 1 or now() > state.hatchResetAt then
+        -- Re-check upward every 10 minutes in case more egg slots were bought.
+        state.hatchHi, state.hatchResetAt = Config.MaxHatchBatch, now() + 600
+    end
+    state.hatchHi = math.max(state.hatchHi, state.hatchLo)
+    return math.max(1, math.ceil((state.hatchLo + state.hatchHi) / 2))
+end
+-- Removes the egg-opening cut-scene by replacing the game's animation function,
+-- and clicks through "Click to open!" if the animation still appears.
+disableEggAnimation = function()
+    if not Config.SkipEggAnimation then return end
+    if not state.eggAnimPatched and type(getsenv) == "function" and cooldownReady("eggAnimPatch", 30) then
+        local scripts = LocalPlayer:FindFirstChild("PlayerScripts")
+        for _, node in ipairs(scripts and scripts:GetDescendants() or {}) do
+            local name = node.Name:lower()
+            if node:IsA("LocalScript") and name:find("egg", 1, true)
+                and (name:find("open", 1, true) or name:find("hatch", 1, true)) then
+                local okEnv, env = pcall(getsenv, node)
+                if okEnv and type(env) == "table" then
+                    for key, value in pairs(env) do
+                        local lowerKey = type(key) == "string" and key:lower() or ""
+                        if type(value) == "function" and lowerKey:find("anim", 1, true)
+                            and (lowerKey:find("egg", 1, true) or lowerKey:find("hatch", 1, true) or lowerKey:find("open", 1, true)) then
+                            env[key] = function() return end
+                            state.eggAnimPatched = true
+                            log("Egg animation disabled (" .. node.Name .. "." .. key .. ")", "HATCH")
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+local function clickThroughEggPrompt()
+    if not Config.SkipEggAnimation then return end
+    local gui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    if not gui then return end
+    local label = state.eggPromptLabel
+    if not (label and label.Parent) then
+        label = nil
+        if not cooldownReady("eggPromptScan", 2) then return end
+        for _, node in ipairs(gui:GetDescendants()) do
+            if (node:IsA("TextLabel") or node:IsA("TextButton")) and node.Text:lower():find("click to open", 1, true) then
+                label = node
+                break
+            end
+        end
+        state.eggPromptLabel = label
+    end
+    if label and label.Visible and label.AbsoluteSize.X > 0 then
+        local okVis = true
+        local parent = label.Parent
+        while parent and parent ~= gui do
+            if parent:IsA("GuiObject") and not parent.Visible then okVis = false break end
+            if parent:IsA("ScreenGui") and not parent.Enabled then okVis = false break end
+            parent = parent.Parent
+        end
+        if okVis then
+            pcall(function()
+                local vim = game:GetService("VirtualInputManager")
+                local camera = Workspace.CurrentCamera
+                local center = camera and camera.ViewportSize / 2 or Vector2.new(400, 300)
+                vim:SendMouseButtonEvent(center.X, center.Y, 0, true, game, 1)
+                vim:SendMouseButtonEvent(center.X, center.Y, 0, false, game, 1)
+            end)
+        end
+    end
+end
 local function hatch(allowMove)
     if allowMove == nil then allowMove = true end
     if now() < (state.hatchRefusedUntil or 0) then return false end
@@ -918,9 +1036,8 @@ local function hatch(allowMove)
         return false, "moving"
     end
     state.lastHatch=now()
-    local ok, cap=callMethod(state.clients.EggCmds,"GetMaxHatch")
-    if not ok or not tonumber(cap) then ok,cap=callMethod(state.clients.EggCmds,"GetMaxHatch",egg.name) end
-    local count=math.max(1,math.min(math.floor(tonumber(cap) or 1),Config.MaxHatchBatch))
+    disableEggAnimation()
+    local count = hatchAmount(egg)
     local success,result
     if findChild(findChild(ReplicatedStorage,"Network"),"Eggs_RequestPurchase") then
         success,result=network("Eggs_RequestPurchase",{egg.name,count},true)
@@ -928,11 +1045,18 @@ local function hatch(allowMove)
         success,result=callMethod(state.clients.EggCmds,"RequestPurchase",egg.name,count)
     end
     if not success or result==false then
+        if count > 1 and not state.hatchKnown then
+            -- Too many at once: search downwards for the real maximum.
+            state.hatchHi = count - 1
+            state.lastHatch = now() - Config.HatchActionSeconds
+            return false, "waiting"
+        end
         -- Usually not enough coins: stop teleporting to the egg for a minute and farm instead.
         state.hatchRefusedUntil = now() + 60
         log("Hatch refused for "..egg.name.." x"..count.." ("..describe(result).."); farming 60s first","WAIT")
         return false
     end
+    if not state.hatchKnown then state.hatchLo = math.max(state.hatchLo, count) end
     state.attempts.hatch=state.attempts.hatch+1
     if cooldownReady("hatchLog", 30) then log("Hatching "..egg.name.." x"..count, "HATCH") end
     state.lastSuccessfulAction=now()
@@ -1068,7 +1192,11 @@ local function findQuestItem(spec, title)
                     if amount > 0 and id:lower():find(spec.match, 1, true) then
                         local score = 0
                         for word in id:lower():gmatch("%a+") do
-                            if lowerTitle:find(word, 1, true) then score = score + 1 end
+                            score = score + (lowerTitle:find(word, 1, true) and 2 or -1)
+                        end
+                        -- A quest that names no variant is satisfied by the cheapest one.
+                        if id:lower():find("basic", 1, true) or id:lower():find("mini", 1, true) then
+                            score = score + 1
                         end
                         if not best or score > bestScore then best, bestScore = {uid = uid, id = id}, score end
                     end
@@ -1099,18 +1227,30 @@ local function spawnQuestObject(goal, allowMove)
         placeInZone(getZoneInfo())
     end
     state.lastEventItem = now()
-    local ok, result = pcall(function()
-        if remote:IsA("RemoteFunction") then return remote:InvokeServer(item.uid) end
-        remote:FireServer(item.uid)
-        return true
-    end)
-    state.commandCount = state.commandCount + 1
-    if not ok then failFeature("spawn-" .. goal.kind, result); return false end
-    if result == false then
-        log("Spawn refused: " .. item.id .. " via " .. remote.Name, "WAIT")
-        return false
+    local function itemAmount()
+        saveCache = nil
+        local fresh = saveData()
+        for _, section in pairs(fresh and fresh.Inventory or {}) do
+            local entry = type(section) == "table" and section[item.uid]
+            if type(entry) == "table" then return tonumber(entry._am or entry.Amount or 1) or 1 end
+        end
+        return 0
     end
-    log("Spawned " .. item.id .. " via " .. remote.Name, "ITEM")
+    local before = itemAmount()
+    local root = currentRoot()
+    local position = root and root.Position
+    probeRemote("spawn-" .. goal.kind, remote, {
+        {item.uid}, {item.id}, {item.uid, position}, {item.uid, 1},
+    }, function()
+        return itemAmount() < before or #visibleTargetCandidates(goal.kind) > 0
+    end, function(worked, result)
+        if worked then
+            log("Spawned " .. item.id .. " via " .. remote.Name, "ITEM")
+        else
+            state.lastEventItem = now() + 45
+            log("Spawn refused: " .. item.id .. " via " .. remote.Name .. " (" .. describe(result) .. ")", "WAIT")
+        end
+    end)
     return true, "waiting"
 end
 local function tryAdvanceWorld()
@@ -1249,7 +1389,7 @@ end
 local function equipBest()
     if now()-state.lastEquip<Config.EquipCheckSeconds then return end
     state.lastEquip=now()
-    local ok,result=callMethod(state.clients.PetCmds,"EquipBest")
+    local ok=callMethod(state.clients.PetCmds,"EquipBest")
     if not ok and cooldownReady("equipMissing",90) then
         log("PetCmds.EquipBest unavailable (source DZ Hub)","WAIT")
     end
@@ -1330,10 +1470,62 @@ local function flushMagnet(spec)
     local ok, err = pcall(function()
         if spec.remote:IsA("RemoteFunction") then return spec.remote:InvokeServer(ids) end
         spec.remote:FireServer(ids)
+        return true
     end)
     if not ok then failFeature(spec.feature, err); return end
     state.commandCount = state.commandCount + 1
     for _, entry in ipairs(batch) do pcall(entry.node.Destroy, entry.node) end
+end
+local function autoTap()
+    if not Config.AutoTap or not healthy("farm") or not cooldownReady("tap", Config.TapSeconds) then return end
+    if now() - state.lastTargetsAt > 1.5 then
+        state.lastTargets, state.lastTargetsAt = visibleTargetCandidates("farm"), now()
+    end
+    for _, target in ipairs(state.lastTargets) do
+        if target.model and target.model.Parent then
+            damageBreakable(target)
+            return
+        end
+    end
+end
+local function ultimateName(cmds)
+    for _, getter in ipairs({"GetEquippedItem", "GetEquipped", "GetEquippedUltimate", "GetCurrent"}) do
+        local ok, item = callMethod(cmds, getter)
+        if ok and type(item) == "string" then return item end
+        if ok and type(item) == "table" then
+            local okId, id = pcall(function()
+                if type(item.GetId) == "function" then return item:GetId() end
+                return item._id or item.id or item.Id or (type(item._data) == "table" and item._data.id)
+            end)
+            if okId and id then return id end
+        end
+    end
+    return nil
+end
+local function autoUltimate()
+    if not Config.AutoUltimate or not healthy("ultimate") or not cooldownReady("ultimate", Config.UltimateSeconds) then return end
+    local cmds = state.clients.UltimateCmds
+    local name = ultimateName(cmds)
+    if cmds then
+        for _, method in ipairs({"Activate", "Use", "Fire"}) do
+            if type(cmds[method]) == "function" then
+                local ok = callMethod(cmds, method, name)
+                if ok then return end
+            end
+        end
+    end
+    local net = findChild(ReplicatedStorage, "Network")
+    for _, remote in ipairs(net and net:GetChildren() or {}) do
+        local lower = squash(remote.Name)
+        if lower:find("ultimate", 1, true) and (lower:find("activate", 1, true) or lower:find("use", 1, true)) then
+            pcall(function()
+                if remote:IsA("RemoteFunction") then remote:InvokeServer(name) else remote:FireServer(name) end
+            end)
+            state.commandCount = state.commandCount + 1
+            return
+        end
+    end
+    if cooldownReady("ultimate:none", 300) then log("Auto ultimate: no ultimate interface found", "WAIT") end
 end
 local function superMagnet()
     if not Config.SuperMagnet or now() - state.lastMagnet < Config.MagnetSeconds then return end
@@ -1427,21 +1619,35 @@ local function upgradeItems(goal)
         end
         return false
     end
-    local ok, result = pcall(function()
-        if remote:IsA("RemoteFunction") then return remote:InvokeServer(best.id, best.tier) end
-        remote:FireServer(best.id, best.tier)
-        return true
-    end)
-    if not ok then failFeature("upgrade", result); return false end
-    state.commandCount = state.commandCount + 1
-    if result == false or result == nil then
-        -- Refused (cost, max tier, proximity or arguments): leave this stack alone for a while.
-        state.upgradeSkip[best.key] = now() + 300
-        log("Upgrade refused: " .. tostring(best.id) .. " tier " .. best.tier .. " via " .. remote.Name, "WAIT")
-        return false
+    local section = isPotion and "Potion" or "Enchant"
+    local function stackCount()
+        saveCache = nil
+        local fresh = saveData()
+        local items = fresh and fresh.Inventory and fresh.Inventory[section]
+        local total = 0
+        if type(items) == "table" then
+            for _, item in pairs(items) do
+                if type(item) == "table" and (item.id or item.ID) == best.id and tonumber(item.tn) == best.tier then
+                    total = total + (tonumber(item._am or item.Amount or 1) or 1)
+                end
+            end
+        end
+        return total
     end
-    log("Upgraded " .. tostring(best.id) .. " tier " .. best.tier .. " via " .. remote.Name, "UPGRADE")
-    state.lastSuccessfulAction = now()
+    local before = stackCount()
+    probeRemote("upgrade", remote, {
+        {best.id, best.tier}, {best.uid}, {best.id, best.tier, 1}, {best.uid, 1},
+        {{id = best.id, tn = best.tier}},
+    }, function() return stackCount() < before end, function(worked, result)
+        if worked then
+            log("Upgraded " .. tostring(best.id) .. " tier " .. best.tier .. " via " .. remote.Name, "UPGRADE")
+            state.lastSuccessfulAction = now()
+        else
+            -- Not enough copies, max tier, cost or proximity: leave this stack alone for a while.
+            state.upgradeSkip[best.key] = now() + 300
+            log("Upgrade refused: " .. tostring(best.id) .. " tier " .. best.tier .. " (" .. describe(result) .. ")", "WAIT")
+        end
+    end)
     return true
 end
 
@@ -1724,6 +1930,7 @@ local function mainLoop(generation)
                 extraProgression()
                 claimFreeGift()
                 superMagnet()
+                autoUltimate()
                 if Config.AutoRank then
                     local ranked = rankGoals()
                     if #ranked > 0 then
@@ -1822,9 +2029,19 @@ end)
 state.generations=state.generations+1
 local threadGeneration=state.generations
 task.spawn(function() mainLoop(threadGeneration) end)
+-- Fast loop: tapping and clicking through the egg prompt need more than 4 ticks a second.
+task.spawn(function()
+    while not state.shutdown and threadGeneration == state.generations do
+        if state.running then
+            pcall(autoTap)
+            pcall(clickThroughEggPrompt)
+        end
+        task.wait(math.max(0.05, Config.TapSeconds))
+    end
+end)
 
 environment.RankPilot = {
-    Version="2.4-DZ-research",
+    Version="2.5-DZ-research",
     Config=Config,
     Status=state,
     Start=run,
