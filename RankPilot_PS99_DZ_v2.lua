@@ -21,7 +21,7 @@ local HttpService = game:GetService("HttpService")
 local CoreGui = game:GetService("CoreGui")
 local LocalPlayer = Players.LocalPlayer
 if not LocalPlayer then return warn("[RankPilot] LocalPlayer not available") end
-print("[RankPilot] v2.10 loading...")
+print("[RankPilot] v2.11 loading...")
 
 local environment = (type(getgenv) == "function" and getgenv()) or _G
 if type(environment.RankPilot) == "table" and type(environment.RankPilot.Stop) == "function" then
@@ -139,7 +139,7 @@ local state = {
     bulkUnsupported = false, upgradeSkip = {}, probing = {}, lastTargets = {}, lastTargetsAt = 0,
     hatchLo = 1, hatchHi = 0, hatchResetAt = 0, hatchFails = 0, machineSpots = {}, eggCost = {}, farmHome = nil, hatchOptionTries = {}, hatchOptionPausedUntil = {}, activeGoals = {},
     hatchOptionSetByUs = {}, hatchOptionFiredAt = {}, wantOption = {}, hatchCap = {},
-    convertSkip = {}, convertFailStreak = 0, spendWatch = {},
+    convertSkip = {}, convertFailStreak = {}, spendWatch = {}, hatchOptionLastFired = {},
     lastSlots = 0, lastGifts = 0, lastFarmInterface = "none",
     attempts = {farm = 0, hatch = 0, zone = 0, consumable = 0},
     lastPosition = nil, generations = 0, connections = {}, gui = nil,
@@ -618,6 +618,7 @@ local function inspectState()
             state.lastProgressAt = now()
             state.blocked = {}
             state.questWatch = {}
+            state.spendWatch = {}
         end
     end
     state.starCount = data.RankStars or data.Stars or "?"
@@ -1012,7 +1013,7 @@ local function setHatchOption(option, want, reason, force)
     local current = hatchOptionEnabled(option)
     -- A forced OFF (pause/stop) also fires when the script switched the option ON
     -- moments ago and the change may not be visible yet.
-    local recentlyOn = force and not want and state.hatchOptionSetByUs[option]
+    local recentlyOn = force and not want and state.hatchOptionLastFired[option] == true
         and now() - (state.hatchOptionFiredAt[option] or 0) < 6
     if current == nil or (current == want and not recentlyOn) then
         state.hatchOptionTries[option] = 0
@@ -1037,7 +1038,8 @@ local function setHatchOption(option, want, reason, force)
     if not ok then failFeature("hatch-settings", err); return current end
     state.commandCount = state.commandCount + 1
     state.hatchOptionFiredAt[option] = now()
-    if want then state.hatchOptionSetByUs[option] = true end
+    state.hatchOptionLastFired[option] = want
+    if want then state.hatchOptionSetByUs[option] = true else state.hatchOptionSetByUs[option] = nil end
     log(hatchOptionNames[option] .. (want and " ON" or " OFF") .. (reason and (" (" .. reason .. ")") or ""), "HATCH")
     return want
 end
@@ -1054,13 +1056,18 @@ applyHatchSettings = function(force)
     end
     -- Only the quests actually being worked on count (state.activeGoals).
     local wantCharged, wantGolden, why = false, false, nil
+    -- Golden eggs are account-wide: never make a plain hatch quest pay 50x.
+    local plainHatchActive = false
+    for _, g in ipairs(state.activeGoals or {}) do
+        if g.kind == "hatch" then plainHatchActive = true end
+    end
     if state.running and Config.AutoRank and Config.AutoHatch then
         for _, g in ipairs(state.activeGoals or {}) do
             if g.kind == "hatch_rare" and Config.ChargedForRareQuests then
                 wantCharged, why = true, g.title
                 break
             elseif (g.kind == "golden" or g.kind == "rainbow") and Config.GoldenEggsForGoldQuests
-                and now() < (state.goldMachineFailedUntil or 0) then
+                and now() < (state.goldMachineFailedUntil or 0) and not plainHatchActive then
                 -- Golden eggs (50x) only when the Gold Machine route is not working:
                 -- they also stop normal pets from piling up for the machine.
                 wantGolden, why = true, g.title .. "; gold machine unavailable"
@@ -1299,7 +1306,7 @@ local function hatch()
         local base = state.eggCost[egg.name]
         if base and base > 0 then
             perEgg = base * (costKey:find(":charged", 1, true) and 20 or 1) * (costKey:find(":golden", 1, true) and 50 or 1)
-        else
+        elseif balanceBefore then
             count = 1
         end
     end
@@ -1322,6 +1329,10 @@ local function hatch()
     state.hatchBusy = true
     task.spawn(function()
         local function buy()
+            -- The mode may have changed while waiting for the trip: buy nothing then.
+            local modeNow = egg.name .. (hatchOptionEnabled("CHARGED") and ":charged" or "")
+                .. (hatchOptionEnabled("GOLDEN") and ":golden" or "")
+            if modeNow ~= costKey or hatchModePending() then return false, "busy" end
             if findChild(findChild(ReplicatedStorage,"Network"),"Eggs_RequestPurchase") then
                 return network("Eggs_RequestPurchase",{egg.name,count},true)
             end
@@ -1336,6 +1347,7 @@ local function hatch()
         state.hatchBusy = false
         state.commandCount = state.commandCount + 1
         if result == "busy" then state.lastHatch = 0; return end
+        if result == "stopped" then return end
         local reason = string.lower(tostring(message or (not success and result) or ""))
         if success and result ~= false then
             state.hatchFails = 0
@@ -1968,7 +1980,11 @@ end
 -- spends with no progress the quest is deferred for 10 minutes.
 local function spendAllowed(goal)
     local watch = state.spendWatch[goal.identity]
-    return not (watch and watch.spends >= 3 and watch.progress == goal.progress)
+    if watch and watch.spends >= 3 and watch.progress == goal.progress then
+        if now() < (watch.pausedUntil or 0) then return false end
+        watch.spends = 0 -- pause over: try again
+    end
+    return true
 end
 local function recordSpend(goal)
     local watch = state.spendWatch[goal.identity]
@@ -1978,6 +1994,7 @@ local function recordSpend(goal)
     end
     watch.spends = watch.spends + 1
     if watch.spends >= 3 then
+        watch.pausedUntil = now() + 600
         state.blocked[goal.identity] = now() + 600
         state.blockedCount = state.blockedCount + 1
         log("Deferred '" .. goal.title .. "' 10 min: spending made no quest progress", "SAFEGUARD")
@@ -2031,7 +2048,8 @@ local function upgradeItems(goal)
         for _, item in pairs(stock) do
             local tier = type(item) == "table" and tonumber(item.tn)
             local per = tier and perTierRequired(isPotion, tier)
-            if per and (tonumber(item._am) or 1) >= per and (not inputTier or tier < inputTier) then inputTier = tier end
+            if per and (tonumber(item._am) or 1) >= math.max(per, Config.UpgradeMinStack)
+                and (not inputTier or tier < inputTier) then inputTier = tier end
         end
     end
     local per = inputTier and perTierRequired(isPotion, inputTier)
@@ -2135,6 +2153,12 @@ local function convertPets(goal)
         if type(v) == "string" then equipped[v] = true end
     end
     local okEq, eqPets = callMethod(state.clients.PetCmds, "GetEquipped")
+    if not (okEq and type(eqPets) == "table") and type(data.EquippedPets) ~= "table" then
+        if cooldownReady("convert:noequipped", 300) then
+            log("Cannot read equipped pets; not converting any pets to be safe", "SAFEGUARD")
+        end
+        return false
+    end
     if okEq and type(eqPets) == "table" then
         for k, v in pairs(eqPets) do
             equipped[tostring(k)] = true
@@ -2178,9 +2202,21 @@ local function convertPets(goal)
         if stack then
             step, count = "rainbow", math.min(math.floor(stack.amount / needRainbow), remaining)
         else
-            -- Gold stage first: normal best-egg pets -> golden, enough for the rainbows still needed.
-            stack = biggestStack(0, needGold)
-            if stack then step, count = "gold", math.min(math.floor(stack.amount / needGold), remaining * needRainbow) end
+            -- Gold stage first, but only for golden pets still missing. Golden stacks that
+            -- exist but are skipped after a Rainbow Machine refusal count as owned, so
+            -- normal pets are not converted endlessly.
+            local ownedGolden = 0
+            for uid, pet in pairs(pets) do
+                if type(pet) == "table" and allowed[pet.id] and not pet.sh and not pet._lk
+                    and not equipped[tostring(uid)] and (tonumber(pet.pt) or 0) == 1 then
+                    ownedGolden = math.max(ownedGolden, tonumber(pet._am) or 1)
+                end
+            end
+            local missing = remaining * needRainbow - ownedGolden
+            if ownedGolden < needRainbow and missing > 0 then
+                stack = biggestStack(0, needGold)
+                if stack then step, count = "gold", math.min(math.floor(stack.amount / needGold), missing) end
+            end
         end
     else
         stack = biggestStack(0, needGold)
@@ -2195,13 +2231,21 @@ local function convertPets(goal)
     local machineName = step == "rainbow" and "RainbowMachine" or "GoldMachine"
     local remoteName = machineName .. "_Activate"
     local function machineFailed(reason)
-        state.convertFailStreak = state.convertFailStreak + 1
-        log(machineName .. ": " .. reason, "WAIT")
-        if state.convertFailStreak >= 3 then
-            -- Machine route not working: allow the Golden-eggs fallback for 10 minutes.
-            state.convertFailStreak = 0
-            state.goldMachineFailedUntil = now() + 600
-            log("Gold/rainbow machine not working; golden eggs may be used for 10 min", "SAFEGUARD")
+        local streak = (state.convertFailStreak[machineName] or 0) + 1
+        state.convertFailStreak[machineName] = streak
+        if cooldownReady("convert:fail:" .. machineName, 20) then log(machineName .. ": " .. reason, "WAIT") end
+        if streak >= 3 then
+            state.convertFailStreak[machineName] = 0
+            if step == "gold" then
+                -- Gold Machine route not working: the Golden-eggs fallback may be used.
+                state.goldMachineFailedUntil = now() + 600
+                log("Gold Machine not working; golden eggs may be used for 10 min", "SAFEGUARD")
+            else
+                -- Golden eggs cannot replace the Rainbow Machine: defer the quest instead.
+                state.blocked[goal.identity] = now() + 600
+                state.blockedCount = state.blockedCount + 1
+                log("Rainbow Machine not working; deferred '" .. goal.title .. "' 10 min", "SAFEGUARD")
+            end
         end
         return false
     end
@@ -2229,7 +2273,8 @@ local function convertPets(goal)
         state.commandCount = state.commandCount + 1
         if result == "stopped" or result == "busy" then return end
         if ok and result ~= false then
-            state.convertFailStreak = 0
+            state.convertFailStreak[machineName] = 0
+            if step == "gold" then state.goldMachineFailedUntil = 0 end
             -- The gold stage of a rainbow quest does not move that quest yet.
             if not (rainbow and step == "gold") then recordSpend(goal) end
             log("Made " .. count .. " " .. (step == "rainbow" and "rainbow" or "golden") .. " " .. tostring(stack.id), "CONVERT")
@@ -2312,6 +2357,9 @@ local function recheck()
     state.failures = {}
     state.blocked = {}
     state.questWatch = {}
+    state.spendWatch = {}
+    state.convertFailStreak = {}
+    state.goldMachineFailedUntil = 0
     saveCache = nil
     state.bulkUnsupported = false
     local found = refreshClients()
@@ -2685,7 +2733,7 @@ task.spawn(function()
 end)
 
 environment.RankPilot = {
-    Version="2.10-DZ-research",
+    Version="2.11-DZ-research",
     Config=Config,
     Status=state,
     Start=run,
