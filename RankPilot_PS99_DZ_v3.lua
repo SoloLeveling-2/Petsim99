@@ -698,6 +698,34 @@ local function matchZoneFolder(zone)
     end
     return nil
 end
+-- VIP-only breakables (e.g. "VIP Diamond Pile") are skipped by the normal
+-- target scanners, so they must not count as normal targets or spots either.
+local function isVipBreakable(obj, id)
+    if type(id)=="string" and id:lower():find("vip",1,true) then return true end
+    if typeof(obj)=="Instance" then
+        local ok,vip=pcall(obj.GetAttribute,obj,"VIPBreakable")
+        if ok and vip==true then return true end
+    end
+    return false
+end
+-- True / false when the game's breakable-zone parts for the area are loaded,
+-- nil when that cannot be told.
+local function insideZoneBox(zoneName, position)
+    local util=state.clients.ZonesUtil
+    if type(util)~="table" or type(util.GetBreakableZones)~="function" then return nil end
+    local ok,zones=pcall(util.GetBreakableZones,zoneName)
+    if not ok or typeof(zones)~="Instance" then return nil end
+    local any=false
+    for _,part in ipairs(zones:GetChildren()) do
+        if part:IsA("BasePart") then
+            any=true
+            local rel=part.CFrame:PointToObjectSpace(position)
+            if math.abs(rel.X)<=part.Size.X/2-2 and math.abs(rel.Z)<=part.Size.Z/2-2 then return true end
+        end
+    end
+    if any then return false end
+    return nil
+end
 -- A point inside a zone's farming box: the position of one of its loaded
 -- breakables (Workspace attributes or BreakableFrontend records).
 local function breakableSpotInZone(zoneName, near)
@@ -715,7 +743,8 @@ local function breakableSpotInZone(zoneName, near)
             local obj = children[i]
             if obj:IsA("Model") or obj:IsA("BasePart") then
                 local ok, parent = pcall(obj.GetAttribute, obj, "ParentID")
-                if ok and parent == zoneName then
+                local okID, id = pcall(obj.GetAttribute, obj, "BreakableID")
+                if ok and parent == zoneName and not isVipBreakable(obj, okID and id or nil) then
                     local okPos, pos = pcall(function()
                         if obj:IsA("BasePart") then return obj.Position end
                         return obj:GetPivot().Position
@@ -732,7 +761,9 @@ local function breakableSpotInZone(zoneName, near)
                 local ok, group = pcall(module.AllByZoneAndClass, zoneName, class)
                 if ok and type(group) == "table" then
                     for _, entry in pairs(group) do
-                        if type(entry) == "table" then consider(entry.position) end
+                        if type(entry) == "table" and not isVipBreakable(entry.model, tostring(entry.id or "")) then
+                            consider(entry.position)
+                        end
                     end
                 end
                 if best then break end
@@ -741,7 +772,7 @@ local function breakableSpotInZone(zoneName, near)
     end
     return best
 end
-local function placeInZone(zone)
+local function placeInZone(zone, mustEnter)
     if not zone or not zone.name then return false,"unknown owned zone" end
     local active=state.world and state.world.number
     local requested=zone.world or zoneWorld(zone.name)
@@ -751,14 +782,23 @@ local function placeInZone(zone)
     end
     local root = currentRoot()
     if not root then return false, "character not ready" end
+    -- Already inside this area's farming box: nothing to do (no scan, no teleport).
+    local inside = insideZoneBox(zone.name, root.Position)
+    if inside == nil then
+        local okZone, current = callMethod(state.clients.MapCmds, "GetCurrentZone")
+        local okBox, inBox = callMethod(state.clients.MapCmds, "IsInDottedBox")
+        if okZone and current == zone.name and okBox and inBox == true then inside = true end
+    end
+    if inside == true and not mustEnter then return true end
     -- 1) Stand next to a breakable that belongs to this area: that is always
     --    inside the dotted farming box (a zone's teleport pad usually is not).
     local spot = breakableSpotInZone(zone.name, root.Position)
     if spot then
-        if (root.Position-spot).Magnitude > Config.RepositionDistance then
+        -- Known to be outside (or asked to enter): move however close it is.
+        if inside == false or mustEnter or (root.Position-spot).Magnitude > Config.RepositionDistance then
             root.CFrame = CFrame.new(spot + Vector3.new(0, 5, 0))
+            state.boxCheckAt = now() + 2
         end
-        state.boxCheckAt = now() + 2
         return true
     end
     local util = state.clients.ZonesUtil
@@ -1353,7 +1393,8 @@ local function diamondLoadedTargetCounts(force)
                 local zone=model:GetAttribute("ParentID")
                 local id=model:GetAttribute("BreakableID")
                 if type(zone)=="string" and counts[zone]~=nil
-                    and type(id)=="string" and id:lower():find("diamond",1,true) then
+                    and type(id)=="string" and id:lower():find("diamond",1,true)
+                    and not isVipBreakable(model,id) then
                     counts[zone]=counts[zone]+1
                     remember(zone,partPosition(model))
                 end
@@ -1382,7 +1423,10 @@ local function diamondLoadedTargetCounts(force)
                                 end
                                 pos=typeof(b.position)=="Vector3" and b.position or partPosition(b.model)
                             end
-                            if id:lower():find("diamond",1,true) then
+                            local vipRecord=isVipBreakable(typeof(b)=="Instance" and b or (type(b)=="table" and b.model) or nil,id)
+                            local dead=type(b)=="table" and ((type(b.health)=="number" and b.health<=0)
+                                or b.disableDamage or (b.dir and b.dir.NoTapping))
+                            if id:lower():find("diamond",1,true) and not vipRecord and not dead then
                                 counts[zone.name]=counts[zone.name]+1
                                 remember(zone.name,pos)
                             end
@@ -1409,8 +1453,9 @@ local function jumpToDiamond(zoneName)
     if best and bestDistance>12 then
         root.CFrame=CFrame.new(best+Vector3.new(4,5,4))
         state.diamondJumps=state.diamondJumps+1
+        return true
     end
-    return best~=nil
+    return false
 end
 local function nextDiamondArea()
     state.diamondVisits=state.diamondVisits or {}
@@ -1432,8 +1477,10 @@ local function nextDiamondArea()
         if zone.name~=previous then
             local last=state.diamondVisits[zone.name] or -math.huge
             local age=timestamp-last
-            -- An area with a loaded diamond is always worth going back to.
-            if age>=revisit or (counts[zone.name] or 0)>0 then
+            -- An area with a loaded diamond is worth going back to, unless it was
+            -- just left because its diamonds gave no quest credit.
+            local stalledUntil=(state.diamondStalledZones or {})[zone.name] or 0
+            if age>=revisit or ((counts[zone.name] or 0)>0 and timestamp>=stalledUntil) then
                 local count=counts[zone.name] or 0
                 local travel=math.abs((zone.number or 0)-previousNumber)
                 local signal=count>0 and (160+math.min(30,count)*8) or 0
@@ -1655,6 +1702,7 @@ local function updateSuperMagnet(enable)
     state.originalOrbPickup=nil;state.originalOrbCollect=nil
     return true
 end
+local hideLootbagModel
 local function collectDrops()
     if now()-state.lastCollector<Config.CollectionSeconds then return end
     state.lastCollector=now()
@@ -1693,9 +1741,13 @@ local function collectDrops()
                             state.lootClaims=state.lootClaims+collected
                             -- Claimed bags are removed from the screen (the claim is
                             -- already sent; the model is only the local picture).
-                            if Config.HideLootbagVisuals then
+                            -- Only the bags claimed in this pass are hidden, not destroyed,
+                            -- so a rejected claim can still be retried.
+                            if Config.HideLootbagVisuals and hideLootbagModel then
+                                local batch={}
+                                for _,token in ipairs(names) do batch[token]=true end
                                 for _,obj in ipairs(objects:GetChildren()) do
-                                    if state.claimSeen["Lootbags/"..obj.Name] then pcall(obj.Destroy,obj) end
+                                    if batch["Lootbags/"..obj.Name] then hideLootbagModel(obj) end
                                 end
                             end
                         end
@@ -1714,7 +1766,8 @@ end
 local function lootbagFrontend()
     if state.lootFrontend and state.lootFrontend.script.Parent then return state.lootFrontend end
     if now()<(state.lootFrontendRetryAt or 0) then return nil end
-    state.lootFrontendRetryAt=now()+30
+    -- Retried every 10s until bags exist, so the registry can be recognised.
+    state.lootFrontendRetryAt=now()+10
     if type(getsenv)~="function" then
         state.lootFrontendStatus="executor has no getsenv"
         return nil
@@ -1725,64 +1778,87 @@ local function lootbagFrontend()
         if node:IsA("LocalScript") and node.Name:lower():find("lootbag",1,true) then
             local ok,env=pcall(getsenv,node)
             if ok and type(env)=="table" then
-                local claim
-                for key,value in pairs(env) do
-                    if type(value)=="function" and type(key)=="string" and key:lower():find("claim",1,true) then
-                        claim=value
-                        break
+                -- The known name is exactly "Claim"; a looser match must not pick
+                -- helpers such as CanClaim / IsClaimable / OnClaimed.
+                local claim=rawget(env,"Claim")
+                if type(claim)~="function" then
+                    claim=nil
+                    for key,value in pairs(env) do
+                        local low=type(key)=="string" and key:lower() or ""
+                        if type(value)=="function" and low:find("claim",1,true)
+                            and not (low:sub(1,3)=="can" or low:sub(1,2)=="is" or low:sub(1,2)=="on") then
+                            claim=value
+                            break
+                        end
                     end
                 end
-                -- The registry is a table upvalue of Claim whose entries are bag records.
-                local registry,emptyCandidate
+                -- The registry is a table upvalue of Claim whose entries are bag
+                -- records with a readyForCollection function.
+                local registry
                 if claim and getup then
                     for i=1,30 do
                         local okUp,value=pcall(getup,claim,i)
                         if not okUp then break end
                         if type(value)=="table" then
                             local _,first=next(value)
-                            if type(first)=="table" then registry=value break end
-                            if first==nil and not emptyCandidate then emptyCandidate=value end
+                            if type(first)=="table" then
+                                local okR,fn=pcall(function() return first.readyForCollection end)
+                                if okR and type(fn)=="function" then registry=value break end
+                            end
                         end
                     end
                 end
-                registry=registry or emptyCandidate
-                state.lootFrontend={script=node,claim=claim,registry=registry}
                 state.lootFrontendStatus=node.Name..": Claim "..(claim and "found" or "missing")
-                    ..", registry "..(registry and "found" or "missing")
-                return state.lootFrontend
+                    ..", registry "..(registry and "found" or "not seen yet (no bags on screen?)")
+                if claim and registry then
+                    state.lootFrontend={script=node,claim=claim,registry=registry}
+                    return state.lootFrontend
+                end
             end
         end
     end
     state.lootFrontendStatus="no lootbag script in PlayerScripts"
     return nil
 end
-local hideLootbagModel
 local function claimFrontendLootbags()
     local frontend=lootbagFrontend()
     if not frontend or not frontend.claim or type(frontend.registry)~="table" then return 0 end
-    local claimed=0
+    state.lootHiddenEntries=state.lootHiddenEntries or setmetatable({}, {__mode="k"})
+    state.lootClaimTries=state.lootClaimTries or {}
+    -- Snapshot first: the game's Claim may change the registry or yield.
+    local ready={}
     for id,bag in pairs(frontend.registry) do
-        local ready=true
-        if type(bag)=="table" and type(bag.readyForCollection)=="function" then
-            local ok,value=pcall(bag.readyForCollection)
-            if not ok then ok,value=pcall(bag.readyForCollection,bag) end
-            ready=ok and value~=false
-        end
-        if type(bag)=="table" and Config.HideLootbagVisuals and hideLootbagModel then
-            for _,field in ipairs({"model","Model","instance","Instance","part","Part"}) do
-                local inst=rawget(bag,field)
-                if typeof(inst)=="Instance" then hideLootbagModel(inst) end
+        if type(bag)=="table" then
+            if Config.HideLootbagVisuals and hideLootbagModel and not state.lootHiddenEntries[bag] then
+                state.lootHiddenEntries[bag]=true
+                for _,field in ipairs({"model","Model","instance","Instance","part","Part"}) do
+                    local inst=rawget(bag,field)
+                    if typeof(inst)=="Instance" then hideLootbagModel(inst) end
+                end
+            end
+            local okR,fn=pcall(function() return bag.readyForCollection end)
+            if okR and type(fn)=="function" then
+                local ok,value=pcall(fn)
+                if not ok then ok,value=pcall(fn,bag) end
+                local key=tostring(id)
+                if ok and value and (state.lootClaimTries[key] or 0)<3
+                    and now()>=(state.claimSeen["frontend/"..key] or 0) then
+                    ready[#ready+1]=id
+                    if #ready>=(Config.CollectionBatch or 35) then break end
+                end
             end
         end
-        if ready and now()>=(state.claimSeen["frontend/"..tostring(id)] or 0) then
-            state.claimSeen["frontend/"..tostring(id)]=now()+3
-            if pcall(frontend.claim,id) then claimed=claimed+1 end
-            if claimed>=(Config.CollectionBatch or 35) then break end
-        end
     end
-    state.lootFrontendClaims=state.lootFrontendClaims+claimed
-    state.lootClaims=state.lootClaims+claimed
-    return claimed
+    for _,id in ipairs(ready) do
+        local key=tostring(id)
+        state.claimSeen["frontend/"..key]=now()+3
+        state.lootClaimTries[key]=(state.lootClaimTries[key] or 0)+1
+        -- Off the farm worker, in case the game's Claim waits on an animation.
+        task.spawn(function() pcall(frontend.claim,id) end)
+    end
+    state.lootFrontendClaims=state.lootFrontendClaims+#ready
+    state.lootClaims=state.lootClaims+#ready
+    return #ready
 end
 -- Cosmetic only: hide the locally rendered lootbag parts but keep the
 -- server-side bag models/UIDs available for Lootbags_Claim.
@@ -2098,7 +2174,19 @@ local function vipDiamondTargets()
     local folder=getBreakables()
     local list={}
     if not root or not folder then return list end
-    for _,obj in ipairs(folder:GetChildren()) do
+    if state.vipTargetsAt and now()-state.vipTargetsAt<0.5 and state.vipTargets then
+        for _,t in ipairs(state.vipTargets) do
+            if t.model.Parent then
+                t.distance=(t.position-root.Position).Magnitude
+                list[#list+1]=t
+            end
+        end
+        table.sort(list,function(a,b) return a.distance<b.distance end)
+        return list
+    end
+    local children=folder:GetChildren()
+    for i=1,math.min(#children,600) do
+        local obj=children[i]
         if obj:IsA("Model") or obj:IsA("BasePart") then
             local okID,id=pcall(obj.GetAttribute,obj,"BreakableID")
             local okVip,vip=pcall(obj.GetAttribute,obj,"VIPBreakable")
@@ -2114,6 +2202,7 @@ local function vipDiamondTargets()
         end
     end
     table.sort(list,function(a,b) return a.distance<b.distance end)
+    state.vipTargets,state.vipTargetsAt=list,now()
     return list
 end
 -- The VIP break-zone part of this world's spawn (lowest-numbered owned zone).
@@ -2132,8 +2221,29 @@ local function vipAreaSpot()
 end
 local function farmVipDiamonds(goal)
     if not Config.UseVipDiamonds or now()<(state.vipDiamondOffUntil or 0) then return false end
+    if state.vipDiamondGoal~=goal.identity then
+        -- New quest: the VIP test starts over.
+        state.vipDiamondGoal=goal.identity
+        state.vipDiamondWorks=false
+        state.vipDiamondSince=nil
+    end
     local targets=vipDiamondTargets()
     if #targets==0 then
+        -- The credit test must run while actually hitting piles.
+        state.vipDiamondSince=nil
+        if now()<(state.vipScoutHoldUntil or 0) then
+            return true -- just teleported to the VIP area: give the piles time to stream in
+        end
+        if state.vipScoutPending then
+            state.vipScoutPending=false
+            state.vipDiamondOffUntil=now()+900
+            state.vipDiamondLast="No VIP diamond piles appeared in the spawn VIP area; off for 15 min"
+            return false
+        end
+        -- Random diamonds already known somewhere: hunt those instead of scouting.
+        for _,count in pairs(state.diamondTargetsByZone or {}) do
+            if count>0 then return false end
+        end
         -- Not loaded here: visit the spawn's VIP area at most every 90s.
         if now()>=(state.vipScoutAt or 0) and leaseMovement("farm",3) then
             state.vipScoutAt=now()+90
@@ -2141,6 +2251,8 @@ local function farmVipDiamonds(goal)
             local root=currentRoot()
             if spot and root then
                 root.CFrame=spot
+                state.vipScoutHoldUntil=now()+math.max(2,tonumber(Config.DiamondProbeSeconds) or 2.5)+1
+                state.vipScoutPending=true
                 state.vipDiamondLast="Checking the spawn VIP area for diamond piles"
                 state.scannedKey="";state.lastTargetScan=0
                 clearMovement("farm")
@@ -2151,15 +2263,24 @@ local function farmVipDiamonds(goal)
         end
         return false
     end
+    state.vipScoutPending=false
     if not state.vipDiamondSince then
         state.vipDiamondSince=now()
         state.vipDiamondStart=goal.progress
+        state.vipDiamondCreditAt=now()
     end
-    if goal.progress>state.vipDiamondStart then state.vipDiamondWorks=true end
-    if not state.vipDiamondWorks and now()-state.vipDiamondSince>20 then
-        -- 20s of hits with no quest credit: no VIP access (or they do not count).
+    if goal.progress>state.vipDiamondStart then
+        state.vipDiamondWorks=true
+        state.vipDiamondStart=goal.progress
+        state.vipDiamondCreditAt=now()
+    end
+    local sinceCredit=now()-(state.vipDiamondCreditAt or now())
+    if (not state.vipDiamondWorks and now()-state.vipDiamondSince>20)
+        or (state.vipDiamondWorks and sinceCredit>30) then
+        -- Hits with no quest credit: no VIP access, or they do not count.
         state.vipDiamondOffUntil=now()+900
         state.vipDiamondSince=nil
+        state.vipDiamondWorks=false
         state.vipDiamondLast="No quest credit from VIP diamond piles (no VIP?); random diamonds for 15 min"
         log(state.vipDiamondLast,"WAIT")
         return false
@@ -2236,18 +2357,22 @@ local function farm(goal)
     end
     -- "Not in any area": if the game says we are outside every farming box,
     -- move into the box of the area we are supposed to farm.
-    if now()>=(state.boxCheckAt or 0) and movementAvailable("farm") and not inHatchMovementWindow() then
+    -- The hatch lane may legitimately stand at the egg (outside any box).
+    local hatchMayMove=Config.AutoHatch and state.hatchGoalActive and not state.hatchNeedsCoins
+        and (state.farmGoal==nil or state.farmGoal.kind=="hatch")
+    if now()>=(state.boxCheckAt or 0) and movementAvailable("farm") and not inHatchMovementWindow()
+        and not hatchMayMove and now()>=(state.vipScoutHoldUntil or 0) then
         state.boxCheckAt=now()+3
         local okBox,inBox=callMethod(state.clients.MapCmds,"IsInDottedBox")
         if okBox and inBox==false then
             local zoneName=state.farmZoneOverride or currentFarmZone()
             local target=zoneName and {name=zoneName} or getZoneInfo()
             if target and leaseMovement("farm",3) then
-                local ok,moved=pcall(placeInZone,target)
+                local ok,moved,reason=pcall(placeInZone,target,true)
                 clearMovement("farm")
                 state.boxFixes=state.boxFixes+1
                 state.boxLast=(ok and moved) and ("Moved into "..tostring(target.name).."'s farming area")
-                    or ("Could not enter "..tostring(target.name)..": "..tostring(moved))
+                    or ("Could not enter "..tostring(target.name)..": "..tostring(reason or moved))
                 if cooldownReady("boxFixLog",20) then log(state.boxLast,"RECOVERY") end
                 state.scannedKey="";state.lastTargetScan=0
                 return false
@@ -2273,8 +2398,11 @@ local function farm(goal)
         local counts=diamondLoadedTargetCounts(false)
         local here=currentFarmZone()
         local elsewhere=false
+        state.diamondStalledZones=state.diamondStalledZones or {}
         for zoneName,count in pairs(counts) do
-            if count>0 and zoneName~=here then elsewhere=true; break end
+            if count>0 and zoneName~=here and now()>=(state.diamondStalledZones[zoneName] or 0) then
+                elsewhere=true; break
+            end
         end
         if not dry then
             state.diamondEmptyHops=0
@@ -2312,6 +2440,9 @@ local function farm(goal)
                 ..tostring(Config.DiamondRestSeconds).."s, then scouting again"
             state.scannedKey="";state.lastTargetScan=0
             return false
+        end
+        if stalledDiamonds and cooled and here then
+            state.diamondStalledZones[here]=now()+math.max(12,tonumber(Config.DiamondVisitCooldown) or 45)
         end
         if Config.DiamondZoneRotation and due and cooled
             and now()>=(state.diamondTravelGraceUntil or 0)
