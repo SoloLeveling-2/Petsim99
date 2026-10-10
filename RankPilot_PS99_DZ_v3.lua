@@ -1,5 +1,6 @@
+--!nocheck
 --[[
- RankPilot / PS99 rank-focused, single-account Luau hub v3.8.0
+ RankPilot / PS99 rank-focused, single-account Luau hub v3.10 (fixes by Claude on ChatGPT v3.9)
  Visual pet/lootbag suppression, owned-area diamond scouting and per-quest stall recovery: 2026-10-09
  Repositories researched: firedvl/pet-simulator-99,
    pipipipipia23/aahsdasd-, CHICHazHUB/PSXfarm,
@@ -57,14 +58,17 @@ local Config: any = {
     HidePetVisuals = true, -- Only cosmetic pet render objects, NOT pet controllers or inventory.
     VisualRefreshSeconds = 7, -- Bound visual work for low-RAM multi-instance clients.
     DiamondZoneRotation = true, -- Search other OWNED and loaded zones for diamond breakables.
-    DiamondZoneDwell = 24,     -- When targets exist, give pets time; then consider changing zones.
-    DiamondStallSeconds = 30, -- Switch if the quest counter is not growing.
-    DiamondProbeSeconds = 9,  -- Delay before evaluating a new zone after streaming.
-    DiamondWarmupSeconds = 24, -- Farm ordinary breakables to cause respawns while scouting diamonds.
-    DiamondWarmupMinActions = 12, -- Prefer a few real farm actions before leaving a loaded zone.
-    DiamondTravelCooldown = 22, -- Hard floor between zone moves to reduce teleport/render lag.
-    DiamondVisitCooldown = 65, -- Avoid immediately revisiting an empty or unproductive zone.
-    DiamondTargetRefresh = 16, -- Avoid rescanning all loaded zones every few seconds.
+    DiamondZoneDwell = 8,      -- Diamonds here but no quest credit: leave after this long.
+    DiamondStallSeconds = 12, -- Switch if the quest counter is not growing.
+    DiamondProbeSeconds = 2.5, -- Delay before evaluating a new zone after streaming.
+    DiamondWarmupSeconds = 5, -- Short look per area; no long "break things until diamonds spawn".
+    DiamondWarmupMinActions = 0,
+    DiamondTravelCooldown = 4, -- Minimum gap between area hops.
+    DiamondVisitCooldown = 45, -- Avoid immediately revisiting an empty area.
+    DiamondTargetRefresh = 3, -- How often all loaded areas are checked for diamond breakables.
+    DiamondScoutHops = 6,     -- Empty hops in a row before resting in the best area.
+    DiamondRestSeconds = 25,  -- Farm the best area (still watching every area for diamonds).
+    DiamondHuntVersion = 1,   -- Drop older saved (slow) diamond timings once.
     DiamondRoutingVersion = 1, -- Migrate old fast-hopping interval once.
     DiamondScoutVersion = 1, -- New bounded scouting; migrate older 65s dwell once.
     UpgradeFlowVersion = 1, -- Migrate old slow upgrade interval once.
@@ -162,6 +166,8 @@ local state: any = {
     diamondWarmupActions=0, diamondWarmupDiamonds=0,
     diamondLastTravelAt=-math.huge, diamondPendingLoadUntil=0,
     diamondLastNormalFarm="not attempted",
+    diamondPositions={}, diamondEmptyHops=0, diamondRestUntil=0, diamondJumps=0,
+    boxCheckAt=0, boxFixes=0, boxLast="not checked",
     farmSwitchCount=0, farmSwitchLast="none",
     upgradeTierLast="none", upgradeSelectionLast="not checked",
     upgradeRejectedUIDs={}, upgradeRejectedCount=0,
@@ -410,10 +416,14 @@ local function loadSettings()
                     and ((key=="DiamondZoneDwell" and tonumber(value)==65)
                         or (key=="DiamondStallSeconds" and tonumber(value)==65)
                         or (key=="DiamondTargetRefresh" and tonumber(value)==18))
+                -- v3.10 diamond hunting: older saved timings (24s warm-up, 22s
+                -- travel floor) were what kept the character waiting in one area.
+                local oldHunt=(tonumber(data.DiamondHuntVersion) or 0)<1
+                    and type(value)=="number" and key:sub(1,7)=="Diamond"
                 local oldUpgrade=key=="UpgradeInterval"
                     and (tonumber(data.UpgradeFlowVersion) or 0)<1
                     and tonumber(value)==9
-                if not legacyTier and not oldRotation and not oldScout and not oldUpgrade then Config[key] = value end
+                if not legacyTier and not oldRotation and not oldScout and not oldUpgrade and not oldHunt then Config[key] = value end
             end
         end
         -- This update was explicitly requested: older v3.6 preferences did
@@ -684,6 +694,49 @@ local function matchZoneFolder(zone)
     end
     return nil
 end
+-- A point inside a zone's farming box: the position of one of its loaded
+-- breakables (Workspace attributes or BreakableFrontend records).
+local function breakableSpotInZone(zoneName, near)
+    local best, bestDistance
+    local function consider(pos)
+        if typeof(pos) ~= "Vector3" then return end
+        local d = near and (pos - near).Magnitude or 0
+        if not best or d < bestDistance then best, bestDistance = pos, d end
+    end
+    local things = Workspace:FindFirstChild("__THINGS")
+    local folder = things and things:FindFirstChild("Breakables")
+    if folder then
+        local children = folder:GetChildren()
+        for i = 1, math.min(#children, 400) do
+            local obj = children[i]
+            if obj:IsA("Model") or obj:IsA("BasePart") then
+                local ok, parent = pcall(obj.GetAttribute, obj, "ParentID")
+                if ok and parent == zoneName then
+                    local okPos, pos = pcall(function()
+                        if obj:IsA("BasePart") then return obj.Position end
+                        return obj:GetPivot().Position
+                    end)
+                    if okPos then consider(pos) end
+                end
+            end
+        end
+    end
+    if not best then
+        local module = state.clients.BreakableFrontend or state.clients.BreakableCmds
+        if type(module) == "table" and type(module.AllByZoneAndClass) == "function" then
+            for _, class in ipairs({"Normal", "Chest"}) do
+                local ok, group = pcall(module.AllByZoneAndClass, zoneName, class)
+                if ok and type(group) == "table" then
+                    for _, entry in pairs(group) do
+                        if type(entry) == "table" then consider(entry.position) end
+                    end
+                end
+                if best then break end
+            end
+        end
+    end
+    return best
+end
 local function placeInZone(zone)
     if not zone or not zone.name then return false,"unknown owned zone" end
     local active=state.world and state.world.number
@@ -694,29 +747,42 @@ local function placeInZone(zone)
     end
     local root = currentRoot()
     if not root then return false, "character not ready" end
+    -- 1) Stand next to a breakable that belongs to this area: that is always
+    --    inside the dotted farming box (a zone's teleport pad usually is not).
+    local spot = breakableSpotInZone(zone.name, root.Position)
+    if spot then
+        if (root.Position-spot).Magnitude > Config.RepositionDistance then
+            root.CFrame = CFrame.new(spot + Vector3.new(0, 5, 0))
+        end
+        state.boxCheckAt = now() + 2
+        return true
+    end
     local util = state.clients.ZonesUtil
     if util then
-        -- DZ Hub uses this client utility for the actual dotted farming area.
+        -- 2) The game's own breakable-zone parts (the dotted farming area).
         local ok, zones = callMethod(util, "GetBreakableZones", zone.name)
         if ok and typeof(zones) == "Instance" then
             for _, part in ipairs(zones:GetChildren()) do
                 if part:IsA("BasePart") then
                     local rel = part.CFrame:PointToObjectSpace(root.Position)
-                    local inside = math.abs(rel.X) <= part.Size.X/2 + 2
-                        and math.abs(rel.Z) <= part.Size.Z/2 + 2
+                    local inside = math.abs(rel.X) <= part.Size.X/2 - 2
+                        and math.abs(rel.Z) <= part.Size.Z/2 - 2
                     if inside then return true end
-                    if (root.Position-part.Position).Magnitude > Config.RepositionDistance then
-                        root.CFrame = part.CFrame + Vector3.new(0, 5, 0)
-                    end
+                    -- Outside the box: always move in, however close the edge is.
+                    root.CFrame = part.CFrame + Vector3.new(0, 5, 0)
+                    state.boxCheckAt = now() + 2
                     return true
                 end
             end
         end
+        -- 3) Teleport pad only as a last resort; the box check moves us in
+        --    once the area's breakables have streamed in.
         local okTP, cf = callMethod(util, "GetTeleportPartLocation", zone.name)
         if okTP and typeof(cf) == "CFrame" then
             if (root.Position-cf.Position).Magnitude > Config.RepositionDistance then
                 root.CFrame=cf+Vector3.new(0,5,0)
             end
+            state.boxCheckAt = now() + 2
             return true
         end
     end
@@ -1268,7 +1334,14 @@ local function diamondLoadedTargetCounts(force)
     state.diamondLastTargetAudit=now()
     local zones=diamondAreas(false)
     local counts={}
+    local positions={}
     for _,z in ipairs(zones) do counts[z.name]=0 end
+    local function remember(zone,pos)
+        if typeof(pos)=="Vector3" then
+            positions[zone]=positions[zone] or {}
+            table.insert(positions[zone],pos)
+        end
+    end
     local folder=findChild(findChild(Workspace,"__THINGS"),"Breakables")
     if folder then
         for _,model in ipairs(folder:GetChildren()) do
@@ -1278,6 +1351,7 @@ local function diamondLoadedTargetCounts(force)
                 if type(zone)=="string" and counts[zone]~=nil
                     and type(id)=="string" and id:lower():find("diamond",1,true) then
                     counts[zone]=counts[zone]+1
+                    remember(zone,partPosition(model))
                 end
             end
         end
@@ -1293,16 +1367,20 @@ local function diamondLoadedTargetCounts(force)
                     if ok and type(records)=="table" then
                         for _,b in pairs(records) do
                             local id=""
+                            local pos=nil
                             if typeof(b)=="Instance" then
                                 id=tostring(b:GetAttribute("BreakableID") or "")
+                                pos=partPosition(b)
                             elseif type(b)=="table" then
                                 id=tostring(b.id or (b.dir and b.dir._id) or "")
                                 if b.model and typeof(b.model)=="Instance" then
                                     id=id.." "..tostring(b.model:GetAttribute("BreakableID") or "")
                                 end
+                                pos=typeof(b.position)=="Vector3" and b.position or partPosition(b.model)
                             end
                             if id:lower():find("diamond",1,true) then
                                 counts[zone.name]=counts[zone.name]+1
+                                remember(zone.name,pos)
                             end
                         end
                     end
@@ -1311,7 +1389,24 @@ local function diamondLoadedTargetCounts(force)
         end
     end
     state.diamondTargetsByZone=counts
+    state.diamondPositions=positions
     return counts
+end
+-- Teleport straight next to a loaded diamond breakable in that area.
+local function jumpToDiamond(zoneName)
+    local list=state.diamondPositions and state.diamondPositions[zoneName]
+    local root=currentRoot()
+    if not root or not list or #list==0 then return false end
+    local best,bestDistance=nil,math.huge
+    for _,pos in ipairs(list) do
+        local d=(pos-root.Position).Magnitude
+        if d<bestDistance then best,bestDistance=pos,d end
+    end
+    if best and bestDistance>12 then
+        root.CFrame=CFrame.new(best+Vector3.new(4,5,4))
+        state.diamondJumps=state.diamondJumps+1
+    end
+    return best~=nil
 end
 local function nextDiamondArea()
     state.diamondVisits=state.diamondVisits or {}
@@ -1333,7 +1428,8 @@ local function nextDiamondArea()
         if zone.name~=previous then
             local last=state.diamondVisits[zone.name] or -math.huge
             local age=timestamp-last
-            if age>=revisit then
+            -- An area with a loaded diamond is always worth going back to.
+            if age>=revisit or (counts[zone.name] or 0)>0 then
                 local count=counts[zone.name] or 0
                 local travel=math.abs((zone.number or 0)-previousNumber)
                 local signal=count>0 and (160+math.min(30,count)*8) or 0
@@ -1951,6 +2047,28 @@ local function farm(goal)
         end
         state.farmZoneOverride=best.name
     end
+    -- "Not in any area": if the game says we are outside every farming box,
+    -- move into the box of the area we are supposed to farm.
+    if now()>=(state.boxCheckAt or 0) and movementAvailable("farm") and not inHatchMovementWindow() then
+        state.boxCheckAt=now()+3
+        local okBox,inBox=callMethod(state.clients.MapCmds,"IsInDottedBox")
+        if okBox and inBox==false then
+            local zoneName=state.farmZoneOverride or currentFarmZone()
+            local target=zoneName and {name=zoneName} or getZoneInfo()
+            if target and leaseMovement("farm",3) then
+                local ok,moved=pcall(placeInZone,target)
+                clearMovement("farm")
+                state.boxFixes=state.boxFixes+1
+                state.boxLast=(ok and moved) and ("Moved into "..tostring(target.name).."'s farming area")
+                    or ("Could not enter "..tostring(target.name)..": "..tostring(moved))
+                if cooldownReady("boxFixLog",20) then log(state.boxLast,"RECOVERY") end
+                state.scannedKey="";state.lastTargetScan=0
+                return false
+            end
+        else
+            state.boxLast=okBox and "Inside a farming area" or "IsInDottedBox unavailable"
+        end
+    end
     local targets=visibleTargetCandidates(kind)
     if diamondAnywhere then
         if goal.progress>(state.diamondLastCredit or 0) then
@@ -1962,17 +2080,52 @@ local function farm(goal)
         local elapsed=now()-(state.diamondZoneSince or now())
         local sinceCredit=now()-(state.diamondLastCreditedAt or now())
         local dry=#targets==0
-        local warmup=math.max(14,tonumber(Config.DiamondWarmupSeconds) or 24)
-        local farmedEnough=state.diamondWarmupActions>=(tonumber(Config.DiamondWarmupMinActions) or 12)
-        -- Work ordinary breakables first. The server may roll diamond
-        -- breakables as destroyed objects respawn; that is not guaranteed.
-        local stalledDry=dry and elapsed>=warmup and
-            (farmedEnough or elapsed>=warmup+11)
+        local warmup=math.max(2,tonumber(Config.DiamondWarmupSeconds) or 5)
+        local farmedEnough=state.diamondWarmupActions>=(tonumber(Config.DiamondWarmupMinActions) or 0)
+        -- Where are diamonds loaded right now? (all owned areas, refreshed every few seconds)
+        local counts=diamondLoadedTargetCounts(false)
+        local here=currentFarmZone()
+        local elsewhere=false
+        for zoneName,count in pairs(counts) do
+            if count>0 and zoneName~=here then elsewhere=true; break end
+        end
+        if not dry then
+            state.diamondEmptyHops=0
+            state.diamondRestUntil=0
+        elseif here and (counts[here] or 0)>0 and jumpToDiamond(here) then
+            -- Diamonds in this area but out of reach: move next to them.
+            state.scannedKey="";state.lastTargetScan=0
+            state.diamondLastStatus="Moved next to diamonds in "..tostring(here)
+            return false
+        end
+        local resting=now()<(state.diamondRestUntil or 0)
+        -- No long "break things until diamonds spawn": leave an empty area after a
+        -- short look, and go straight to any area where a diamond is loaded.
+        local stalledDry=dry and not resting and (elsewhere or (elapsed>=warmup and farmedEnough))
         local stalledDiamonds=not dry and elapsed>=math.max(warmup,Config.DiamondZoneDwell)
-            and sinceCredit>=math.max(20,tonumber(Config.DiamondStallSeconds) or 30)
-        local due=stalledDry or stalledDiamonds
+            and sinceCredit>=math.max(6,tonumber(Config.DiamondStallSeconds) or 12)
+        local due=stalledDry or stalledDiamonds or (resting and dry and elsewhere)
         local cooled=now()-(state.diamondLastTravelAt or -math.huge)
-            >=math.max(18,tonumber(Config.DiamondTravelCooldown) or 22)
+            >=math.max(2,tonumber(Config.DiamondTravelCooldown) or 4)
+        if dry and not resting and not elsewhere and due
+            and state.diamondEmptyHops>=(tonumber(Config.DiamondScoutHops) or 6) then
+            -- Several empty areas in a row: rest in the best area (useful for
+            -- "break breakables in best area" too) while still watching every area.
+            local best=getZoneInfo()
+            state.diamondEmptyHops=0
+            state.diamondRestUntil=now()+(tonumber(Config.DiamondRestSeconds) or 25)
+            if best and leaseMovement("farm",3) then
+                pcall(placeInZone,best)
+                clearMovement("farm")
+                state.diamondZone=best.name
+                state.farmZoneOverride=best.name
+                state.diamondZoneSince=now()
+            end
+            state.diamondLastStatus="No diamonds loaded anywhere; farming best area for "
+                ..tostring(Config.DiamondRestSeconds).."s, then scouting again"
+            state.scannedKey="";state.lastTargetScan=0
+            return false
+        end
         if Config.DiamondZoneRotation and due and cooled
             and now()>=(state.diamondTravelGraceUntil or 0)
             and now()>=(state.diamondPendingLoadUntil or 0) then
@@ -1989,14 +2142,22 @@ local function farm(goal)
                     state.diamondVisits[chosen.name]=now()
                     state.diamondZoneSince=now()
                     state.diamondLastTravelAt=now()
-                    state.diamondTravelGraceUntil=now()+3
-                    state.diamondPendingLoadUntil=now()+2.5
+                    state.diamondTravelGraceUntil=now()+1
+                    state.diamondPendingLoadUntil=now()+math.max(1,tonumber(Config.DiamondProbeSeconds) or 2.5)
                     state.diamondLastCreditedAt=now()
                     state.diamondWarmupActions=0
                     state.diamondMoveCount=state.diamondMoveCount+1
                     state.diamondScoutCount=state.diamondScoutCount+1
-                    state.diamondLastStatus="Arrived at "..chosen.name
-                        .."; breaking ordinary objects before next scout"
+                    state.diamondRestUntil=0
+                    if (counts[chosen.name] or 0)>0 then
+                        state.diamondEmptyHops=0
+                        jumpToDiamond(chosen.name)
+                        state.diamondLastStatus="Arrived at diamonds in "..chosen.name
+                    else
+                        state.diamondEmptyHops=state.diamondEmptyHops+1
+                        state.diamondLastStatus="Scouting "..chosen.name.." (empty hop "
+                            ..state.diamondEmptyHops.."/"..tostring(Config.DiamondScoutHops)..")"
+                    end
                     state.scannedKey="";state.lastTargetScan=0
                     state.diamondLastTargetAudit=0
                     return false
@@ -4095,7 +4256,7 @@ local function getReport()
     local rawGoals = data and data.Goals
     local goalCount = 0
     if type(rawGoals) == "table" then for _ in pairs(rawGoals) do goalCount = goalCount + 1 end end
-    local report = {"RankPilot v3.9 warm-up diamond scouting + low-lag visuals",
+    local report = {"RankPilot v3.10 direct diamond hunting + in-box farming + lootbag fix",
         "World: "..describe(state.world.number).." ("..state.world.name..") via "..state.world.source,
         "Current World zone: "..describe(state.world.zone).." | Highest owned: "..describe(state.world.best),
         "Highest owned World: "..describe(state.world.bestWorld),
@@ -4202,6 +4363,10 @@ local function getReport()
         "Diamond target zone: "..tostring(state.diamondZone)
             .." | Status: "..tostring(state.diamondLastStatus),
         "Diamond scouting status: "..tostring(state.diamondScoutLast),
+        "Diamond hunt: jumps to diamonds "..tostring(state.diamondJumps)
+            .." | empty hops "..tostring(state.diamondEmptyHops).."/"..tostring(Config.DiamondScoutHops)
+            .." | resting in best area: "..tostring(now()<(state.diamondRestUntil or 0)),
+        "Farming box: "..tostring(state.boxLast).." | moved in "..tostring(state.boxFixes).." times",
         "Diamond visit normal farm attacks: "..tostring(state.diamondWarmupActions)
             .." | Total diamond quest credits observed: "..tostring(state.diamondWarmupDiamonds)
             .." | Last regular attack: "..tostring(state.diamondLastNormalFarm),
@@ -5203,7 +5368,7 @@ task.spawn(function() goldConversionWorker(threadGeneration) end)
 task.spawn(function() rainbowConversionWorker(threadGeneration) end)
 
 environment.RankPilot = {
-    Version="3.9.0-WarmupScout-LowLag",
+    Version="3.10.0-DiamondHunt-InBox",
     Config=Config,
     Status=state,
     Start=run,
