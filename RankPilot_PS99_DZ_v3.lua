@@ -69,6 +69,7 @@ local Config: any = {
     DiamondScoutHops = 6,     -- Empty hops in a row before resting in the best area.
     DiamondRestSeconds = 25,  -- Farm the best area (still watching every area for diamonds).
     DiamondHuntVersion = 1,   -- Drop older saved (slow) diamond timings once.
+    UseVipDiamonds = true,    -- "VIP Diamond Pile" in each world's spawn VIP area (needs VIP; auto-detected)
     DiamondRoutingVersion = 1, -- Migrate old fast-hopping interval once.
     DiamondScoutVersion = 1, -- New bounded scouting; migrate older 65s dwell once.
     UpgradeFlowVersion = 1, -- Migrate old slow upgrade interval once.
@@ -168,6 +169,9 @@ local state: any = {
     diamondLastNormalFarm="not attempted",
     diamondPositions={}, diamondEmptyHops=0, diamondRestUntil=0, diamondJumps=0,
     boxCheckAt=0, boxFixes=0, boxLast="not checked",
+    vipDiamondOffUntil=0, vipDiamondSince=nil, vipDiamondStart=0, vipDiamondWorks=false,
+    vipDiamondHits=0, vipDiamondLast="not tried", vipScoutAt=0,
+    lootFrontend=nil, lootFrontendRetryAt=0, lootFrontendStatus="not checked", lootFrontendClaims=0,
     farmSwitchCount=0, farmSwitchLast="none",
     upgradeTierLast="none", upgradeSelectionLast="not checked",
     upgradeRejectedUIDs={}, upgradeRejectedCount=0,
@@ -1673,7 +1677,8 @@ local function collectDrops()
                             local id=tonumber(name)
                             if id then ids[#ids+1]=id;names[#names+1]=token end
                         else
-                            ids[name]=name;names[#names+1]=token
+                            -- Lootbags_Claim takes an ARRAY of bag names ({name, ...}).
+                            ids[#ids+1]=name;names[#names+1]=token
                         end
                         collected=collected+1
                         if collected>=Config.CollectionBatch then break end
@@ -1684,9 +1689,16 @@ local function collectDrops()
                     if ok and result~=false then
                         for _,token in ipairs(names) do state.claimSeen[token]=now()+4 end
                         if entry.name=="Orbs" then state.orbClaims=state.orbClaims+collected
-                        else state.lootClaims=state.lootClaims+collected end
-                        -- Never destroy the local objects. A sent claim is NOT
-                        -- confirmation that the server awarded anything.
+                        else
+                            state.lootClaims=state.lootClaims+collected
+                            -- Claimed bags are removed from the screen (the claim is
+                            -- already sent; the model is only the local picture).
+                            if Config.HideLootbagVisuals then
+                                for _,obj in ipairs(objects:GetChildren()) do
+                                    if state.claimSeen["Lootbags/"..obj.Name] then pcall(obj.Destroy,obj) end
+                                end
+                            end
+                        end
                     elseif cooldownReady("claim:"..entry.name,45) then
                         log(entry.remote.." not available: "..describe(result),"WAIT")
                     end
@@ -1696,6 +1708,82 @@ local function collectDrops()
     end
 end
 
+-- The game's own lootbag client ("Lootbags Frontend" LocalScript) keeps the bags it
+-- shows in a registry table and claims them with its Claim function. When the
+-- __THINGS.Lootbags folder stays empty while bags are visible, this is where they are.
+local function lootbagFrontend()
+    if state.lootFrontend and state.lootFrontend.script.Parent then return state.lootFrontend end
+    if now()<(state.lootFrontendRetryAt or 0) then return nil end
+    state.lootFrontendRetryAt=now()+30
+    if type(getsenv)~="function" then
+        state.lootFrontendStatus="executor has no getsenv"
+        return nil
+    end
+    local getup=(type(debug)=="table" and debug.getupvalue) or (type(getupvalue)=="function" and getupvalue) or nil
+    local scripts=LocalPlayer:FindFirstChild("PlayerScripts")
+    for _,node in ipairs(scripts and scripts:GetDescendants() or {}) do
+        if node:IsA("LocalScript") and node.Name:lower():find("lootbag",1,true) then
+            local ok,env=pcall(getsenv,node)
+            if ok and type(env)=="table" then
+                local claim
+                for key,value in pairs(env) do
+                    if type(value)=="function" and type(key)=="string" and key:lower():find("claim",1,true) then
+                        claim=value
+                        break
+                    end
+                end
+                -- The registry is a table upvalue of Claim whose entries are bag records.
+                local registry,emptyCandidate
+                if claim and getup then
+                    for i=1,30 do
+                        local okUp,value=pcall(getup,claim,i)
+                        if not okUp then break end
+                        if type(value)=="table" then
+                            local _,first=next(value)
+                            if type(first)=="table" then registry=value break end
+                            if first==nil and not emptyCandidate then emptyCandidate=value end
+                        end
+                    end
+                end
+                registry=registry or emptyCandidate
+                state.lootFrontend={script=node,claim=claim,registry=registry}
+                state.lootFrontendStatus=node.Name..": Claim "..(claim and "found" or "missing")
+                    ..", registry "..(registry and "found" or "missing")
+                return state.lootFrontend
+            end
+        end
+    end
+    state.lootFrontendStatus="no lootbag script in PlayerScripts"
+    return nil
+end
+local hideLootbagModel
+local function claimFrontendLootbags()
+    local frontend=lootbagFrontend()
+    if not frontend or not frontend.claim or type(frontend.registry)~="table" then return 0 end
+    local claimed=0
+    for id,bag in pairs(frontend.registry) do
+        local ready=true
+        if type(bag)=="table" and type(bag.readyForCollection)=="function" then
+            local ok,value=pcall(bag.readyForCollection)
+            if not ok then ok,value=pcall(bag.readyForCollection,bag) end
+            ready=ok and value~=false
+        end
+        if type(bag)=="table" and Config.HideLootbagVisuals and hideLootbagModel then
+            for _,field in ipairs({"model","Model","instance","Instance","part","Part"}) do
+                local inst=rawget(bag,field)
+                if typeof(inst)=="Instance" then hideLootbagModel(inst) end
+            end
+        end
+        if ready and now()>=(state.claimSeen["frontend/"..tostring(id)] or 0) then
+            state.claimSeen["frontend/"..tostring(id)]=now()+3
+            if pcall(frontend.claim,id) then claimed=claimed+1 end
+            if claimed>=(Config.CollectionBatch or 35) then break end
+        end
+    end
+    state.lootFrontendClaims=state.lootFrontendClaims+claimed
+    state.lootClaims=state.lootClaims+claimed
+    return claimed
+end
 -- Cosmetic only: hide the locally rendered lootbag parts but keep the
 -- server-side bag models/UIDs available for Lootbags_Claim.
 local function setLootbagVisual(node,hide)
@@ -1727,6 +1815,10 @@ local function setLootbagVisual(node,hide)
         end
     end
 end
+hideLootbagModel=function(inst)
+    pcall(setLootbagVisual,inst,true)
+    for _,obj in ipairs(inst:GetDescendants()) do pcall(setLootbagVisual,obj,true) end
+end
 local function refreshLootbagVisuals(force)
     if not Config.HideLootbagVisuals then return end
     if not force and now()-state.lootbagVisualScannedAt<Config.VisualRefreshSeconds then return end
@@ -1735,6 +1827,7 @@ local function refreshLootbagVisuals(force)
     local debris=findChild(Workspace,"__DEBRIS")
     local rendered=findChild(Workspace,"__RENDERED")
     local clientFX=findChild(Workspace,"__CLIENT")
+    local camera=Workspace.CurrentCamera
     local sources,seen={},{}
     local function addSource(folder)
         if folder and not seen[folder] then
@@ -1745,7 +1838,7 @@ local function refreshLootbagVisuals(force)
     -- Visuals may be under a render/FX container even when the claimable
     -- __THINGS.Lootbags folder is empty. Search identifiable bag roots only.
     local roots={}
-    for _,root in pairs({things,rendered,clientFX,debris,Workspace}) do
+    for _,root in pairs({things,rendered,clientFX,debris,camera,Workspace}) do
         if root then roots[#roots+1]=root end
     end
     for _,root in ipairs(roots) do
@@ -1768,7 +1861,7 @@ local function refreshLootbagVisuals(force)
     -- Inspect single-level FX children only when their names clearly refer
     -- to lootbags. Never disable a general lootbag collection script.
     local scanned=0
-    for _,root in pairs({debris,rendered,clientFX}) do
+    for _,root in pairs({debris,rendered,clientFX,camera}) do
         if root then
             local children=root:GetChildren()
             for i=1,math.min(#children,160) do
@@ -1997,6 +2090,94 @@ local function damageBreakable(target)
     local ok, result = network("Breakables_PlayerDealDamage", {target.uid}, false)
     return ok and result ~= false
 end
+-- "VIP Diamond Pile" is the only diamond breakable in BIG Games' zone data: up to
+-- 25 of them in the VIP area of each world's spawn, respawning every 0.5s. It needs
+-- the VIP gamepass, so access is detected from whether hitting them moves the quest.
+local function vipDiamondTargets()
+    local root=currentRoot()
+    local folder=getBreakables()
+    local list={}
+    if not root or not folder then return list end
+    for _,obj in ipairs(folder:GetChildren()) do
+        if obj:IsA("Model") or obj:IsA("BasePart") then
+            local okID,id=pcall(obj.GetAttribute,obj,"BreakableID")
+            local okVip,vip=pcall(obj.GetAttribute,obj,"VIPBreakable")
+            local name=tostring(okID and id or ""):lower()
+            if name:find("diamond",1,true) and ((okVip and vip==true) or name:find("vip",1,true)) then
+                local pos=partPosition(obj)
+                if pos then
+                    local okUid,uid=pcall(obj.GetAttribute,obj,"BreakableUID")
+                    list[#list+1]={uid=(okUid and uid) or obj.Name,id=id,model=obj,position=pos,
+                        distance=(pos-root.Position).Magnitude,from="VIP diamonds"}
+                end
+            end
+        end
+    end
+    table.sort(list,function(a,b) return a.distance<b.distance end)
+    return list
+end
+-- The VIP break-zone part of this world's spawn (lowest-numbered owned zone).
+local function vipAreaSpot()
+    local areas=diamondAreas(false)
+    local spawn=areas[1]
+    local folder=spawn and matchZoneFolder(spawn)
+    local zones=folder and folder:FindFirstChild("INTERACT") and folder.INTERACT:FindFirstChild("BREAK_ZONES")
+    for _,part in ipairs(zones and zones:GetChildren() or {}) do
+        local okAttr,vipAttr=pcall(part.GetAttribute,part,"VIP")
+        if part:IsA("BasePart") and (part.Name:lower():find("vip",1,true) or (okAttr and vipAttr)) then
+            return part.CFrame+Vector3.new(0,5,0)
+        end
+    end
+    return nil
+end
+local function farmVipDiamonds(goal)
+    if not Config.UseVipDiamonds or now()<(state.vipDiamondOffUntil or 0) then return false end
+    local targets=vipDiamondTargets()
+    if #targets==0 then
+        -- Not loaded here: visit the spawn's VIP area at most every 90s.
+        if now()>=(state.vipScoutAt or 0) and leaseMovement("farm",3) then
+            state.vipScoutAt=now()+90
+            local spot=vipAreaSpot()
+            local root=currentRoot()
+            if spot and root then
+                root.CFrame=spot
+                state.vipDiamondLast="Checking the spawn VIP area for diamond piles"
+                state.scannedKey="";state.lastTargetScan=0
+                clearMovement("farm")
+                return true
+            end
+            clearMovement("farm")
+            state.vipDiamondLast="No VIP area found in this world's spawn"
+        end
+        return false
+    end
+    if not state.vipDiamondSince then
+        state.vipDiamondSince=now()
+        state.vipDiamondStart=goal.progress
+    end
+    if goal.progress>state.vipDiamondStart then state.vipDiamondWorks=true end
+    if not state.vipDiamondWorks and now()-state.vipDiamondSince>20 then
+        -- 20s of hits with no quest credit: no VIP access (or they do not count).
+        state.vipDiamondOffUntil=now()+900
+        state.vipDiamondSince=nil
+        state.vipDiamondLast="No quest credit from VIP diamond piles (no VIP?); random diamonds for 15 min"
+        log(state.vipDiamondLast,"WAIT")
+        return false
+    end
+    local target=targets[1]
+    local root=currentRoot()
+    if root and target.distance>18 then
+        root.CFrame=CFrame.new(target.position+Vector3.new(3,5,3))
+    end
+    aimPetsAt(target,targets,"diamond")
+    damageBreakable(target)
+    state.vipDiamondHits=state.vipDiamondHits+1
+    state.vipDiamondLast="Breaking VIP diamond piles ("..#targets.." loaded)"
+        ..(state.vipDiamondWorks and "; quest credit confirmed" or "; checking quest credit")
+    state.diamondLastStatus=state.vipDiamondLast
+    state.currentTarget=tostring(target.uid)
+    return true
+end
 local function farm(goal)
     if not healthy("farm") or not Config.AutoFarm then return false end
     local rate=math.clamp(tonumber(Config.FarmTapRate) or 8,1,16)
@@ -2046,6 +2227,12 @@ local function farm(goal)
             return false
         end
         state.farmZoneOverride=best.name
+    end
+    if diamondAnywhere then
+        local okVip,usedVip=pcall(farmVipDiamonds,goal)
+        if okVip and usedVip then return true end
+    else
+        state.vipDiamondSince=nil
     end
     -- "Not in any area": if the game says we are outside every farming box,
     -- move into the box of the area we are supposed to farm.
@@ -4367,6 +4554,9 @@ local function getReport()
             .." | empty hops "..tostring(state.diamondEmptyHops).."/"..tostring(Config.DiamondScoutHops)
             .." | resting in best area: "..tostring(now()<(state.diamondRestUntil or 0)),
         "Farming box: "..tostring(state.boxLast).." | moved in "..tostring(state.boxFixes).." times",
+        "VIP diamonds: "..tostring(state.vipDiamondLast).." | hits "..tostring(state.vipDiamondHits)
+            .." | works "..tostring(state.vipDiamondWorks),
+        "Lootbag frontend: "..tostring(state.lootFrontendStatus).." | claims "..tostring(state.lootFrontendClaims),
         "Diamond visit normal farm attacks: "..tostring(state.diamondWarmupActions)
             .." | Total diamond quest credits observed: "..tostring(state.diamondWarmupDiamonds)
             .." | Last regular attack: "..tostring(state.diamondLastNormalFarm),
@@ -5179,6 +5369,12 @@ local function fastWorker(generation)
             local ok,err=pcall(collectDrops)
             if not ok and cooldownReady("collector:error",25) then
                 log("Collector: "..describe(err),"ERROR")
+            end
+            if Config.AutoCollectLootbags and cooldownReady("frontendLootbags",0.5) then
+                local okBags,bagErr=pcall(claimFrontendLootbags)
+                if not okBags and cooldownReady("frontendLootbags:error",60) then
+                    log("Lootbag frontend: "..describe(bagErr),"ERROR")
+                end
             end
         end
         -- Visual suppression runs independently of farming and claims.
