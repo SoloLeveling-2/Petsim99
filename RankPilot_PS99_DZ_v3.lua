@@ -787,7 +787,8 @@ local function placeInZone(zone, mustEnter)
     if inside == nil then
         local okZone, current = callMethod(state.clients.MapCmds, "GetCurrentZone")
         local okBox, inBox = callMethod(state.clients.MapCmds, "IsInDottedBox")
-        if okZone and current == zone.name and okBox and inBox == true then inside = true end
+        if okZone and current == zone.name and okBox and inBox == true then inside = true
+        elseif (okZone and type(current) == "string" and current ~= zone.name) or (okBox and inBox == false) then inside = false end
     end
     if inside == true and not mustEnter then return true end
     -- 1) Stand next to a breakable that belongs to this area: that is always
@@ -795,7 +796,8 @@ local function placeInZone(zone, mustEnter)
     local spot = breakableSpotInZone(zone.name, root.Position)
     if spot then
         -- Known to be outside (or asked to enter): move however close it is.
-        if inside == false or mustEnter or (root.Position-spot).Magnitude > Config.RepositionDistance then
+        local distance = (root.Position-spot).Magnitude
+        if distance > 6 and (inside == false or mustEnter or distance > Config.RepositionDistance) then
             root.CFrame = CFrame.new(spot + Vector3.new(0, 5, 0))
             state.boxCheckAt = now() + 2
         end
@@ -1494,11 +1496,16 @@ local function nextDiamondArea()
         -- All zones on cooldown. An active quest should still revisit the
         -- least-recently-visited OWNED zone once it can make progress again.
         local oldest=math.huge
+        local stalled=state.diamondStalledZones or {}
         for _,zone in ipairs(areas) do
-            if zone.name~=previous then
+            if zone.name~=previous and timestamp>=(stalled[zone.name] or 0) then
                 local visited=state.diamondVisits[zone.name] or -math.huge
                 if visited<oldest then chosen,oldest=zone,visited end
             end
+        end
+        if not chosen then
+            -- Only areas whose diamonds gave no credit are left: rest in the best area.
+            state.diamondEmptyHops=math.max(state.diamondEmptyHops or 0,tonumber(Config.DiamondScoutHops) or 6)
         end
     end
     if chosen then
@@ -1774,8 +1781,10 @@ local function lootbagFrontend()
     end
     local getup=(type(debug)=="table" and debug.getupvalue) or (type(getupvalue)=="function" and getupvalue) or nil
     local scripts=LocalPlayer:FindFirstChild("PlayerScripts")
+    local foundScript=false
     for _,node in ipairs(scripts and scripts:GetDescendants() or {}) do
         if node:IsA("LocalScript") and node.Name:lower():find("lootbag",1,true) then
+            foundScript=true
             local ok,env=pcall(getsenv,node)
             if ok and type(env)=="table" then
                 -- The known name is exactly "Claim"; a looser match must not pick
@@ -1817,7 +1826,7 @@ local function lootbagFrontend()
             end
         end
     end
-    state.lootFrontendStatus="no lootbag script in PlayerScripts"
+    if not foundScript then state.lootFrontendStatus="no lootbag script in PlayerScripts" end
     return nil
 end
 local function claimFrontendLootbags()
@@ -1854,10 +1863,16 @@ local function claimFrontendLootbags()
         state.claimSeen["frontend/"..key]=now()+3
         state.lootClaimTries[key]=(state.lootClaimTries[key] or 0)+1
         -- Off the farm worker, in case the game's Claim waits on an animation.
-        task.spawn(function() pcall(frontend.claim,id) end)
+        task.spawn(function()
+            local ok,err=pcall(frontend.claim,id)
+            if ok then
+                state.lootFrontendClaims=state.lootFrontendClaims+1
+                state.lootClaims=state.lootClaims+1
+            elseif cooldownReady("lootFrontendClaimError",120) then
+                log("Lootbag frontend Claim failed: "..describe(err),"WAIT")
+            end
+        end)
     end
-    state.lootFrontendClaims=state.lootFrontendClaims+#ready
-    state.lootClaims=state.lootClaims+#ready
     return #ready
 end
 -- Cosmetic only: hide the locally rendered lootbag parts but keep the
@@ -2185,7 +2200,7 @@ local function vipDiamondTargets()
         return list
     end
     local children=folder:GetChildren()
-    for i=1,math.min(#children,600) do
+    for i=#children,math.max(1,#children-799),-1 do
         local obj=children[i]
         if obj:IsA("Model") or obj:IsA("BasePart") then
             local okID,id=pcall(obj.GetAttribute,obj,"BreakableID")
@@ -2221,11 +2236,14 @@ local function vipAreaSpot()
 end
 local function farmVipDiamonds(goal)
     if not Config.UseVipDiamonds or now()<(state.vipDiamondOffUntil or 0) then return false end
-    if state.vipDiamondGoal~=goal.identity then
-        -- New quest: the VIP test starts over.
+    if state.vipDiamondGoal~=goal.identity or goal.progress<(state.vipDiamondStart or 0) then
+        -- New (or re-rolled) quest: the VIP test starts over.
         state.vipDiamondGoal=goal.identity
         state.vipDiamondWorks=false
         state.vipDiamondSince=nil
+        state.vipDiamondStart=goal.progress
+        state.vipScoutPending=false
+        state.vipScoutHoldUntil=0
     end
     local targets=vipDiamondTargets()
     if #targets==0 then
@@ -2236,13 +2254,20 @@ local function farmVipDiamonds(goal)
         end
         if state.vipScoutPending then
             state.vipScoutPending=false
-            state.vipDiamondOffUntil=now()+900
-            state.vipDiamondLast="No VIP diamond piles appeared in the spawn VIP area; off for 15 min"
-            return false
+            local root=currentRoot()
+            -- Only judge the VIP area if we are actually still standing in it (a
+            -- hatch trip may have moved us away during the wait).
+            if root and state.vipScoutSpot and (root.Position-state.vipScoutSpot.Position).Magnitude<40 then
+                state.vipDiamondOffUntil=now()+900
+                state.vipDiamondLast="No VIP diamond piles appeared in the spawn VIP area; off for 15 min"
+                return false
+            end
+            state.vipScoutAt=now()+20
         end
-        -- Random diamonds already known somewhere: hunt those instead of scouting.
-        for _,count in pairs(state.diamondTargetsByZone or {}) do
-            if count>0 then return false end
+        -- Random diamonds already known in an area worth visiting: hunt those first.
+        local stalled=state.diamondStalledZones or {}
+        for zoneName,count in pairs(state.diamondTargetsByZone or {}) do
+            if count>0 and now()>=(stalled[zoneName] or 0) then return false end
         end
         -- Not loaded here: visit the spawn's VIP area at most every 90s.
         if now()>=(state.vipScoutAt or 0) and leaseMovement("farm",3) then
@@ -2251,6 +2276,7 @@ local function farmVipDiamonds(goal)
             local root=currentRoot()
             if spot and root then
                 root.CFrame=spot
+                state.vipScoutSpot=spot
                 state.vipScoutHoldUntil=now()+math.max(2,tonumber(Config.DiamondProbeSeconds) or 2.5)+1
                 state.vipScoutPending=true
                 state.vipDiamondLast="Checking the spawn VIP area for diamond piles"
@@ -2360,6 +2386,7 @@ local function farm(goal)
     -- The hatch lane may legitimately stand at the egg (outside any box).
     local hatchMayMove=Config.AutoHatch and state.hatchGoalActive and not state.hatchNeedsCoins
         and (state.farmGoal==nil or state.farmGoal.kind=="hatch")
+        and not (state.farmGoal==nil and state.chestDeferralActive)
     if now()>=(state.boxCheckAt or 0) and movementAvailable("farm") and not inHatchMovementWindow()
         and not hatchMayMove and now()>=(state.vipScoutHoldUntil or 0) then
         state.boxCheckAt=now()+3
@@ -2512,7 +2539,7 @@ local function farm(goal)
         -- Critical: after the last egg-hatch quest completes, the character
         -- may still be standing at an egg capsule. An empty scanner in that
         -- location must not prevent returning to the actual farming zone.
-        if not diamondAnywhere and now()-(state.farmReturnLast or 0)>=22
+        if not diamondAnywhere and not hatchMayMove and now()-(state.farmReturnLast or 0)>=22
             and movementAvailable("farm") and not inHatchMovementWindow() then
             local best=getZoneInfo()
             if best and (not best.world or best.world==state.world.number) then
