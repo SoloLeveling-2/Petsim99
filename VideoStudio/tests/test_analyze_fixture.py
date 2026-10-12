@@ -4,16 +4,8 @@ import pytest
 
 
 @pytest.fixture(scope="module")
-def analysis(fixture_video, tmp_path_factory):
-    from studio.analyze import analyze_source
-    from studio.config import load_profile
-    from studio.media import SourceGuard
-
-    out = tmp_path_factory.mktemp("analysis")
-    guard = SourceGuard(fixture_video.path)
-    result = analyze_source(fixture_video.path, load_profile(fixture_video.profile_path), out)
-    guard.verify(full=True)  # the original recording is byte-for-byte unchanged
-    return result, out
+def analysis(fixture_analysis):
+    return fixture_analysis
 
 
 def test_fixture_ground_truth(analysis, fixture_video):

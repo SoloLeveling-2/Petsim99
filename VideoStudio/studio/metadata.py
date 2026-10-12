@@ -34,7 +34,7 @@ def facts_from(analysis: dict) -> dict:
     }
 
 
-def _fill(template: str, facts: dict) -> str | None:
+def fill_template(template: str, facts: dict) -> str | None:
     if "{stars}" in template and not facts["stars_verified"]:
         return None
     if "{quests}" in template and not facts["quests_confirmed"]:
@@ -46,12 +46,12 @@ def _fill(template: str, facts: dict) -> str | None:
     return re.sub(r"\b1 ([Mm])inutes\b", r"1 \1inute", text)
 
 
-def _pick(templates: list[str], fallbacks: list[str], facts: dict, limit: int) -> str:
+def pick_template(templates: list[str], fallbacks: list[str], facts: dict, limit: int) -> str:
     for template in list(templates) + list(fallbacks):
-        text = _fill(template, facts)
+        text = fill_template(template, facts)
         if text and len(text) <= limit:
             return text
-    return (_fill(fallbacks[0], facts) or fallbacks[0])[:limit].rstrip()
+    return (fill_template(fallbacks[0], facts) or fallbacks[0])[:limit].rstrip()
 
 
 def _summary(facts: dict) -> str:
@@ -92,12 +92,14 @@ def build_metadata(analysis: dict, plan: dict | None, brand: dict, research: dic
     music = (plan or {}).get("music") or {}
     music_line = f"Music: {music['title']} ({music['license_type']})." if music else ""
 
-    yt_title = _pick(titles["youtube_shorts"], titles["youtube_shorts_no_numbers"], facts, YT_TITLE_MAX)
+    verified = facts["stars_verified"] is not None  # nothing verified: no counting claims at all
+    yt_title = pick_template(titles["youtube_shorts"] if verified else [], titles["youtube_shorts_no_numbers"], facts,
+                             YT_TITLE_MAX)
     yt_hashtags = brand["hashtags"]["youtube_shorts"]
     yt_description = "\n\n".join(x for x in [disclosure["caption"], _summary(facts), brand["cta"], music_line,
                                              " ".join(yt_hashtags)] if x)[:YT_DESCRIPTION_MAX]
 
-    tt_line = _pick(titles["tiktok"], titles["tiktok_no_numbers"], facts, 150)
+    tt_line = pick_template(titles["tiktok"] if verified else [], titles["tiktok_no_numbers"], facts, 150)
     tt_hashtags = brand["hashtags"]["tiktok"]
     tt_caption = "\n".join([tt_line, disclosure["caption"], brand["cta"], " ".join(tt_hashtags)])[:TIKTOK_CAPTION_MAX]
 

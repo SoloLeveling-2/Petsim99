@@ -33,15 +33,17 @@ def _mean_in(t: np.ndarray, z: np.ndarray, start: float, end: float) -> float:
     return float(z[mask].mean()) if mask.any() else 0.0
 
 
+def activity_scorer(motion: list[tuple[float, float]], audio: list[tuple[float, float]]):
+    """Return f(start, end) -> mean robust z-score of motion and audio in that span."""
+    mt, mz = _robust_z(motion)
+    at, az = _robust_z(audio)
+    return lambda start, end: (_mean_in(mt, mz, start, end) + _mean_in(at, az, start, end)) / 2
+
+
 def score_windows(motion: list[tuple[float, float]], audio: list[tuple[float, float]], events: list[dict],
                   duration: float, pre: float = 2.5, post: float = 2.5, activity_len: float = 4.0,
                   max_activity: int = 10) -> list[Window]:
-    mt, mz = _robust_z(motion)
-    at, az = _robust_z(audio)
-
-    def activity(start: float, end: float) -> float:
-        return (_mean_in(mt, mz, start, end) + _mean_in(at, az, start, end)) / 2
-
+    activity = activity_scorer(motion, audio)
     windows: list[Window] = []
     for ev in sorted(events, key=lambda e: e["t"]):
         start, end = max(0.0, ev["t"] - pre), min(duration, ev["t"] + post)

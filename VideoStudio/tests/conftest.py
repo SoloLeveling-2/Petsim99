@@ -36,6 +36,22 @@ def fixture_video():
     return info
 
 
+@pytest.fixture(scope="session")
+def fixture_analysis(fixture_video):
+    """analysis.json of the synthetic recording, computed once per test session."""
+    from studio.analyze import analyze_source
+    from studio.config import load_profile
+    from studio.media import SourceGuard
+
+    out = ARTIFACTS / "fixture_analysis"
+    if out.exists():
+        shutil.rmtree(out)
+    guard = SourceGuard(fixture_video.path)
+    result = analyze_source(fixture_video.path, load_profile(fixture_video.profile_path), out)
+    guard.verify(full=True)  # the original recording is byte-for-byte unchanged
+    return result, out
+
+
 @pytest.fixture
 def artifacts_dir(request):
     d = ARTIFACTS / request.node.name
