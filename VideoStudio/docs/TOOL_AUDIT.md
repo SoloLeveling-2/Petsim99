@@ -7,13 +7,13 @@ succeeded; nothing here was assumed from an install message.
 
 | Tool | Installed | Reachable from this session | Authenticated | How it is used by the pipeline |
 |---|---|---|---|---|
-| FFmpeg 6.1.1 / FFprobe | yes (`/usr/bin`) | n/a (local) | n/a | Decoding, ROI sampling, cutting, layout, mixing, encoding. Compiled with NVENC, QSV, VAAPI, AMF-less build; libass, xfade, loudnorm present. |
+| FFmpeg 6.1.1 / FFprobe | yes (`/usr/bin`) | n/a (local) | n/a | Decoding, ROI sampling, cutting, layout, mixing, encoding. This Ubuntu build includes NVENC, QSV and VAAPI encoders (not AMF), plus libass, xfade and loudnorm. |
 | Hardware video encode/decode | encoders compiled in | **no device**: no `/dev/dri`, no `nvidia-smi` | n/a | `studio hw` probes each encoder with a real 1-frame test encode on *your* machine and falls back to libx264. Not verifiable here. |
 | OpenCV | `opencv-python-headless 5.0.0.93` (installed in venv) | n/a | n/a | Frame differencing, ROI change detection, colour/activity scoring, synthetic test fixture. |
 | OCR (RapidOCR 3.10 + onnxruntime 1.31) | yes, models bundled in wheel | works offline | n/a | Reads the on-screen rank-star counter and quest-panel text. ~17 ms per crop on CPU. |
 | Claude vision (in-session) | yes | yes | yes (this session) | Used during the build to inspect rendered frames (see TEST_RESULTS.md). |
 | Claude vision (pipeline, via API) | code path present | `api.anthropic.com` reachable | **no `ANTHROPIC_API_KEY`** | Optional `--vision` verification of candidate events. Off by default because it costs money; never runs without the flag. |
-| Remotion 4.0.534 | npm project in `VideoStudio/remotion` | npm registry reachable | n/a | Renders the branded animated overlay (transparent PNG sequence). Uses the preinstalled Chromium. |
+| Remotion 4.0.534 | npm project in `VideoStudio/remotion` (verified: overlay rendered and composited) | npm registry reachable | n/a | Renders the branded animated overlay (transparent PNG sequence). Uses the preinstalled Chromium here; downloads its own on your machine. |
 | vidIQ MCP (plugin 0.1.6) | plugin installed | **blocked** — `mcp.vidiq.com` refused by the environment network policy (HTTP 403 on CONNECT) | **not verified** (OAuth never reached) | Research input file `research/vidiq.json`; titles/tags fall back to unvalidated defaults and say so. |
 | Metricool MCP | server added (`claude mcp add`) | **blocked** — `ai.metricool.com` refused (403) | **not verified** | Analytics/platform management not available. Dashboard publication authorizations are recorded only; nothing is sent. |
 | Descript MCP (plugin 1.1.0) | plugin installed | **blocked** — `api.descript.com` refused (403) | **not verified** (OAuth + Drive selection required) | Optional; not used. The pipeline does not need it for the current edit style. |
