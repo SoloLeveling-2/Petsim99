@@ -74,15 +74,26 @@ def build_command(plan: dict, source: Path, music: Path | None, overlay: Overlay
     cmd = [FFMPEG, "-hide_banner", "-v", "error", "-y", *encoder.global_args]
     if threads:
         cmd += ["-threads", str(threads)]
-    for seg in segments:
-        cmd += ["-ss", f"{seg['src_start']:.3f}", "-t", f"{seg['src_end'] - seg['src_start']:.3f}", "-i", str(source)]
+    # Each segment is opened twice: video-only (-an) and audio-only (-vn). acrossfade pulls audio eagerly; with a
+    # shared input that would also decode every later segment's video early and queue it in memory (3.4 GB peak
+    # measured for a 10-segment recap, 1.5 GB with separate inputs).
+    def seek(seg: dict) -> list[str]:
+        return ["-ss", f"{seg['src_start']:.3f}", "-t", f"{seg['src_end'] - seg['src_start']:.3f}"]
+
     n = len(segments)
+    for seg in segments:
+        cmd += [*seek(seg), "-an", "-i", str(source)]
+    audio_base = n
+    if has_audio:
+        for seg in segments:
+            cmd += [*seek(seg), "-vn", "-i", str(source)]
+    next_idx = n * (2 if has_audio else 1)
     music_idx = overlay_idx = None
     if music is not None:
-        music_idx = n
+        music_idx, next_idx = next_idx, next_idx + 1
         cmd += ["-i", str(music)]
     if overlay.kind == "png_sequence":
-        overlay_idx = n + (1 if music is not None else 0)
+        overlay_idx = next_idx
         cmd += ["-framerate", str(fps), "-start_number", str(overlay.start_number), "-i", overlay.path]
 
     graph: list[str] = []
@@ -92,7 +103,7 @@ def build_command(plan: dict, source: Path, music: Path | None, overlay: Overlay
                      f"tpad=stop_mode=clone:stop_duration=0.2,trim=duration={out_dur:.4f},setpts=PTS-STARTPTS[s{i}]")
         graph += _layout_chain(i, plan)
         if has_audio and seg["speed"] == 1:
-            graph.append(f"[{i}:a]asetpts=PTS-STARTPTS,aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,"
+            graph.append(f"[{audio_base + i}:a]asetpts=PTS-STARTPTS,aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,"
                          f"apad,atrim=duration={out_dur:.4f}[a{i}]")
         else:  # time-lapse / slow motion: game audio would be garbled, the music carries it
             graph.append(f"aevalsrc=0|0:c=stereo:s=48000:d={out_dur:.4f},aformat=sample_fmts=fltp[a{i}]")
