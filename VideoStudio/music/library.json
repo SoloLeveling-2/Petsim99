@@ -1,0 +1,16 @@
+{
+  "_help": "Every track needs license, license_type (owned | royalty_free | licensed | platform_library), proof and allowed_platforms. Tracks without them are never used. TikTok Commercial Music Library tracks cannot be exported into a file: add those in the TikTok app instead.",
+  "tracks": [
+    {
+      "id": "studio-original-01",
+      "title": "Rank Rush (original)",
+      "file": "tracks/studio-original-01.wav",
+      "generator": {"seconds": 120.0, "bpm": 124, "seed": 7},
+      "license": "Original composition synthesised locally by VideoStudio/studio/music.py. No third-party samples, melodies or loops; you own it.",
+      "license_type": "owned",
+      "proof": "Generated from source code in this repository (studio/music.py, seed 7).",
+      "attribution_required": false,
+      "allowed_platforms": ["youtube_shorts", "tiktok"]
+    }
+  ]
+}
