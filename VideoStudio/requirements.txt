@@ -1,0 +1,10 @@
+# Runtime
+numpy>=1.26
+opencv-python-headless>=4.9
+rapidocr==3.10.0
+onnxruntime>=1.18
+# Optional: Claude vision verification (only used with --vision, costs API credits)
+# anthropic>=0.40
+# Tests
+pytest>=8
+playwright==1.56.0

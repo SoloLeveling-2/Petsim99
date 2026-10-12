@@ -1,0 +1,8 @@
+workspace/
+__pycache__/
+*.pyc
+.pytest_cache/
+remotion/node_modules/
+remotion/out/
+music/tracks/*.wav
+tests/.artifacts/
