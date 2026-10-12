@@ -1,0 +1,17 @@
+{
+  "name": "ps99_default",
+  "notes": "Uncalibrated starting point. 'suggested_rois' are guesses that the dashboard's calibration page pre-draws; nothing is counted until you save real regions for your recording.",
+  "rois": {},
+  "suggested_rois": {
+    "star_counter": {"x": 0.02, "y": 0.29, "w": 0.16, "h": 0.06},
+    "quest_panel": {"x": 0.0, "y": 0.35, "w": 0.24, "h": 0.33},
+    "completion_banner": {"x": 0.3, "y": 0.08, "w": 0.4, "h": 0.12}
+  },
+  "star_pattern": "(?P<cur>\\d{1,5})\\s*/\\s*(?P<total>\\d{1,5})",
+  "sample_fps": 2.0,
+  "max_gain": 60,
+  "confirm_samples": 3,
+  "revert_window": 5.0,
+  "ocr_min_conf": 0.6,
+  "banner_keywords": ["complete", "rank up", "quest"]
+}

@@ -1,0 +1,76 @@
+{
+  "channel_name": "Your Channel",
+  "handle": "@yourhandle",
+  "product_name": "VyHub Auto Ranking",
+  "game_name": "Pet Simulator 99",
+  "colors": {
+    "primary": "#FFC83D",
+    "accent": "#3DDC97",
+    "highlight": "#7C5CFF",
+    "danger": "#FF4D6D",
+    "ink": "#14121F",
+    "paper": "#FFFFFF"
+  },
+  "font": {
+    "family": "Lilita One",
+    "file": "fonts/LilitaOne-Regular.ttf",
+    "license": "SIL Open Font License 1.1 (fonts/OFL.txt)"
+  },
+  "disclosure": {
+    "short": "Auto Ranking is a paid service (paid in gems)",
+    "card_title": "DISCLOSURE",
+    "card_body": "VyHub Auto Ranking is a PAID service. You pay for it in gems.",
+    "caption": "Disclosure: VyHub Auto Ranking is a paid service, paid in Pet Simulator 99 gems."
+  },
+  "hooks": [
+    "+{stars} RANK STARS in {minutes} MIN",
+    "{quests} QUESTS DONE in {minutes} MIN",
+    "WATCH THE STARS STACK UP"
+  ],
+  "hooks_no_numbers": [
+    "AUTO RANKING IN ACTION",
+    "WATCH THE RANK QUESTS CLEAR"
+  ],
+  "cta": "Follow for the next run",
+  "titles": {
+    "youtube_shorts": [
+      "+{stars} Rank Stars in {minutes} Minutes with Auto Ranking | Pet Sim 99",
+      "{quests} Rank Quests in {minutes} Minutes (Auto Ranking) | Pet Sim 99"
+    ],
+    "youtube_shorts_no_numbers": [
+      "Auto Ranking Clearing Rank Quests | Pet Sim 99"
+    ],
+    "tiktok": [
+      "+{stars} rank stars in {minutes} minutes with Auto Ranking"
+    ],
+    "tiktok_no_numbers": [
+      "Auto Ranking clearing rank quests"
+    ]
+  },
+  "hashtags": {
+    "youtube_shorts": ["#PetSimulator99", "#PS99", "#Roblox", "#Shorts"],
+    "tiktok": ["#petsimulator99", "#ps99", "#roblox", "#petsim99"]
+  },
+  "blocked_terms": [
+    "event script",
+    "event hub"
+  ],
+  "variants": [
+    {"id": "recap", "label": "Full-run recap", "target_seconds": 45, "hook_seconds": 2.6, "outro_seconds": 3.0,
+     "max_event_clips": 8, "clip_pre": 2.2, "clip_post": 2.4, "timelapse_speed": 8.0, "timelapse_seconds": 1.4},
+    {"id": "highlight", "label": "Best moment", "target_seconds": 22, "hook_seconds": 2.2, "outro_seconds": 2.6,
+     "max_event_clips": 3, "clip_pre": 2.2, "clip_post": 2.6, "timelapse_speed": 0, "timelapse_seconds": 0}
+  ],
+  "music": {
+    "default_track": "studio-original-01",
+    "game_volume": 0.55,
+    "music_volume": 0.30
+  },
+  "output": {
+    "width": 1080,
+    "height": 1920,
+    "fps": 30,
+    "loudness_lufs": -14,
+    "xfade_seconds": 0.25
+  }
+}
