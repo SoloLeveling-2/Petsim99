@@ -36,11 +36,21 @@ def parse_star_text(text: str, pattern: str) -> tuple[int, int | None] | None:
 class OcrEngine:
     """Thin wrapper around RapidOCR. Models ship inside the wheel; no network is used."""
 
-    def __init__(self):
+    def __init__(self, threads: int | None = None):
         from rapidocr import RapidOCR
 
         logging.getLogger("RapidOCR").setLevel(logging.WARNING)
-        self._engine = RapidOCR()
+        params = {
+            "Global.log_level": "warning",
+            "Global.use_cls": False,  # HUD text is never rotated
+            # The default ("min", 736) upscales a 220x56 counter crop to ~2900x736 before
+            # text detection; capping the long side keeps small crops at native size.
+            "Det.limit_type": "max",
+            "Det.limit_side_len": 960,
+        }
+        if threads:
+            params["EngineConfig.onnxruntime.intra_op_num_threads"] = threads
+        self._engine = RapidOCR(params=params)
 
     @staticmethod
     def _prep(img: np.ndarray) -> np.ndarray:
@@ -60,13 +70,19 @@ class OcrEngine:
         return boxes
 
     def read_line(self, img: np.ndarray) -> tuple[str, float]:
+        """Text left-to-right, with the confidence of the boxes that contain digits.
+
+        Icons next to a counter (a star, a gem) are often misread with low confidence;
+        that must not veto a confidently read number beside them.
+        """
         boxes = sorted(self._boxes(img), key=lambda b: b[1])
         if not boxes:
             result = self._engine(self._prep(img), use_det=False, use_cls=False, use_rec=True)
             if result is None or not getattr(result, "txts", None):
                 return "", 0.0
             return " ".join(result.txts), float(min(result.scores))
-        return " ".join(b[2] for b in boxes), min(b[3] for b in boxes)
+        numeric = [b[3] for b in boxes if any(c.isdigit() for c in b[2])]
+        return " ".join(b[2] for b in boxes), min(numeric) if numeric else max(b[3] for b in boxes)
 
     def read_lines(self, img: np.ndarray) -> list[tuple[str, float]]:
         boxes = sorted(self._boxes(img), key=lambda b: (round(b[0] / 12), b[1]))
@@ -82,11 +98,17 @@ class OcrResult:
 
 
 class GatedReader:
-    """Runs OCR only when the region visibly changed (or after `keepalive_s`)."""
+    """Runs OCR only when the region visibly changed (or after `keepalive_s`).
 
-    def __init__(self, engine, diff_threshold: float = 6.0, keepalive_s: float = 8.0):
+    "Changed" means at least `changed_fraction` of pixels moved by more than
+    `pixel_threshold` grey levels: a single digit flip touches ~2% of a counter's pixels
+    strongly, while video compression noise stays far below the pixel threshold.
+    """
+
+    def __init__(self, engine, pixel_threshold: int = 40, changed_fraction: float = 0.005, keepalive_s: float = 8.0):
         self.engine = engine
-        self.diff_threshold = diff_threshold
+        self.pixel_threshold = pixel_threshold
+        self.changed_fraction = changed_fraction
         self.keepalive_s = keepalive_s
         self._last_thumb: np.ndarray | None = None
         self._last: OcrResult | None = None
@@ -95,14 +117,16 @@ class GatedReader:
     @staticmethod
     def _thumb(img: np.ndarray) -> np.ndarray:
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
-        h = max(4, int(round(gray.shape[0] * 96 / max(1, gray.shape[1]))))
-        return cv2.resize(gray, (96, h), interpolation=cv2.INTER_AREA).astype(np.int16)
+        if gray.shape[1] > 256:
+            h = max(4, int(round(gray.shape[0] * 256 / gray.shape[1])))
+            gray = cv2.resize(gray, (256, h), interpolation=cv2.INTER_AREA)
+        return gray.astype(np.int16)
 
     def read(self, t: float, img: np.ndarray) -> OcrResult:
         thumb = self._thumb(img)
         if self._last is not None and self._last_thumb is not None and thumb.shape == self._last_thumb.shape:
-            diff = float(np.abs(thumb - self._last_thumb).mean())
-            if diff < self.diff_threshold and t - self._last.t < self.keepalive_s:
+            changed = float((np.abs(thumb - self._last_thumb) > self.pixel_threshold).mean())
+            if changed < self.changed_fraction and t - self._last.t < self.keepalive_s:
                 return OcrResult(t, self._last.text, self._last.conf, True)
         text, conf = self.engine.read_line(img)
         self.calls += 1

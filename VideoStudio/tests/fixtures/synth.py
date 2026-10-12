@@ -16,7 +16,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-VERSION = 3
+VERSION = 4
 W, H, FPS, SECONDS = 1280, 720, 30, 72.0
 
 STAR_BOX = (30, 200, 220, 56)
@@ -76,7 +76,13 @@ def _rows(t: float) -> tuple[list[str], int | None]:
 
 
 def _outlined(img, text, org, scale, color, thick=2, outline=6, font=cv2.FONT_HERSHEY_DUPLEX):
-    cv2.putText(img, text, org, font, scale, (0, 0, 0), outline, cv2.LINE_AA)
+    # Hershey glyph advance grows with stroke thickness, so the outline is drawn as offset
+    # copies at the fill's thickness (a thicker stroke would run past the text's end).
+    r = max(1, (outline - thick) // 2)
+    for dx in range(-r, r + 1):
+        for dy in range(-r, r + 1):
+            if dx * dx + dy * dy <= r * r:
+                cv2.putText(img, text, (org[0] + dx, org[1] + dy), font, scale, (0, 0, 0), thick, cv2.LINE_AA)
     cv2.putText(img, text, org, font, scale, color, thick, cv2.LINE_AA)
 
 

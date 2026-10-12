@@ -58,6 +58,38 @@ def test_ocr_reads_fixture_counter(fixture_video):
     assert conf > 0.8
 
 
+def test_ocr_confidence_ignores_misread_icon(fixture_video):
+    """At 14.5 s the star icon is misread as '￥' (conf ~0.55) next to a perfect '19/40'."""
+    from studio.config import load_profile
+    from studio.ocr import OcrEngine, parse_star_text
+
+    profile = load_profile(fixture_video.profile_path)
+    frame = _frame_at(fixture_video.path, 14.5, 1280, 720)
+    x, y, w, h = profile.rois["star_counter"].to_pixels(1280, 720)
+    text, conf = OcrEngine().read_line(frame[y:y + h, x:x + w])
+    assert parse_star_text(text, profile.star_pattern) == (19, 40)
+    assert conf > 0.9
+
+
+def test_ocr_small_crop_is_fast(fixture_video):
+    """Small HUD crops must not be upscaled for text detection (was ~1.8 s per read)."""
+    import time
+
+    from studio.config import load_profile
+    from studio.ocr import OcrEngine
+
+    profile = load_profile(fixture_video.profile_path)
+    frame = _frame_at(fixture_video.path, 14.5, 1280, 720)
+    x, y, w, h = profile.rois["star_counter"].to_pixels(1280, 720)
+    crop = frame[y:y + h, x:x + w]
+    engine = OcrEngine()
+    engine.read_line(crop)
+    started = time.perf_counter()
+    for _ in range(5):
+        engine.read_line(crop)
+    assert (time.perf_counter() - started) / 5 < 0.25
+
+
 def test_ocr_reads_panel_lines(fixture_video):
     from studio.config import load_profile
     from studio.ocr import OcrEngine
@@ -81,7 +113,7 @@ def test_gated_reader_skips_unchanged():
             calls.append(1)
             return "12/40", 0.99
 
-    reader = GatedReader(FakeEngine(), diff_threshold=6.0, keepalive_s=8.0)
+    reader = GatedReader(FakeEngine(), keepalive_s=8.0)
     img = np.full((40, 120, 3), 50, np.uint8)
     a = reader.read(0.0, img)
     b = reader.read(0.5, img.copy())
@@ -94,3 +126,21 @@ def test_gated_reader_skips_unchanged():
     d = reader.read(10.0, changed)  # keepalive forces a fresh read
     assert d.reused is False
     assert len(calls) == 3
+
+
+def test_gated_reader_sees_small_digit_change():
+    """A digit change touches ~2% of the counter's pixels; it must trigger a fresh read."""
+    from studio.ocr import GatedReader
+
+    class FakeEngine:
+        def read_line(self, img):
+            return "x", 0.99
+
+    reader = GatedReader(FakeEngine())
+    img = np.full((56, 220, 3), 40, np.uint8)
+    reader.read(0.0, img)
+    noisy = np.clip(img.astype(int) + np.random.default_rng(1).integers(-10, 11, img.shape), 0, 255).astype(np.uint8)
+    assert reader.read(0.5, noisy).reused is True  # compression-level noise is ignored
+    digit = noisy.copy()
+    digit[20:36, 150:166] = 250  # 256 px = 2.1% of the region
+    assert reader.read(1.0, digit).reused is False
