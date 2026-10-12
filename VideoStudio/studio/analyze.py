@@ -190,7 +190,11 @@ def analyze_source(src: Path, profile: Profile, out_dir: Path, *, sample_fps: fl
     evidence = _write_evidence(src, info, profile, out_dir, quests, timeline.events)
     if vision:
         from .vision import verify_events
-        vision_report = verify_events(out_dir, evidence, timeline.events, budget=vision_budget)
+        star_to_evidence = {q.star_event: q.id for q in quests if q.star_event}
+        star_to_evidence.update({e.id: e.id for e in timeline.events if e.kind == "review"})
+        vision_report = verify_events(out_dir, evidence, timeline.events, star_to_evidence, budget=vision_budget)
+        for event_id in vision_report["disagreements"]:
+            warnings.append(f"Claude read star event {event_id} differently from OCR: review it before publishing.")
     else:
         vision_report = {"enabled": False}
     guard.verify()
