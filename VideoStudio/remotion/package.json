@@ -1,0 +1,21 @@
+{
+  "name": "ps99-studio-overlay",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Branded animated overlay for PS99 Shorts/TikTok, rendered as a transparent PNG sequence.",
+  "scripts": {
+    "studio": "remotion studio src/index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@remotion/cli": "4.0.534",
+    "@remotion/fonts": "4.0.534",
+    "react": "19.2.0",
+    "react-dom": "19.2.0",
+    "remotion": "4.0.534"
+  },
+  "devDependencies": {
+    "@types/react": "19.2.2",
+    "typescript": "5.9.3"
+  }
+}

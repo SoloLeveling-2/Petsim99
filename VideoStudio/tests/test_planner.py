@@ -107,6 +107,21 @@ def test_disclosure_card_then_badge(plans, brand):
         assert d["text"] == brand["disclosure"]["short"]
 
 
+def test_layout_rects_inside_frame_and_safe_area(plans):
+    for plan in plans.values():
+        layout = plan["layout"]
+        assert layout["mode"] == "split_ui"
+        main, panel, star = layout["main_rect"], layout["panel_rect"], layout["star_rect"]
+        for r in (main, panel, star):
+            assert all(v % 2 == 0 for v in r.values()), r  # even sizes for yuv420p
+            assert 0 <= r["x"] and r["x"] + r["w"] <= 1080 and 0 <= r["y"] and r["y"] + r["h"] <= 1920
+        assert main["w"] == 1080
+        assert main["y"] + main["h"] <= panel["y"]  # panel inset sits below the gameplay
+        assert panel["y"] + panel["h"] <= 1530      # above the platform caption area
+        src_aspect = 1280 / 720 * layout["panel_roi"]["w"] / layout["panel_roi"]["h"]
+        assert abs(panel["w"] / panel["h"] - src_aspect) < 0.05
+
+
 def test_uncalibrated_plan_has_no_counter(fixture_analysis, brand):
     from studio.planner import plan_variant
 

@@ -53,10 +53,11 @@ def popen(cmd: list[str], **kwargs) -> subprocess.Popen:
     return subprocess.Popen([str(c) for c in cmd], **_low_priority_kwargs(), **kwargs)
 
 
-def run(cmd: list[str], log_path: Path | None = None, check: bool = True, timeout: float | None = None) -> subprocess.CompletedProcess:
+def run(cmd: list[str], log_path: Path | None = None, check: bool = True, timeout: float | None = None,
+        cwd: Path | None = None) -> subprocess.CompletedProcess:
     cmd = [str(c) for c in cmd]
     proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                          timeout=timeout, **_low_priority_kwargs())
+                          timeout=timeout, cwd=cwd, **_low_priority_kwargs())
     if log_path is not None:
         log_path = Path(log_path)
         log_path.parent.mkdir(parents=True, exist_ok=True)
