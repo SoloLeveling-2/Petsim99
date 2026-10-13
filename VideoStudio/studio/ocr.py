@@ -60,7 +60,9 @@ class OcrEngine:
         return np.ascontiguousarray(img)
 
     def _boxes(self, img: np.ndarray) -> list[tuple[float, float, str, float]]:
-        result = self._engine(self._prep(img))
+        # RapidOCR keeps use_det/use_cls/use_rec from the previous call, so after read_line's
+        # recognition-only fallback a bare call would skip detection; always ask explicitly.
+        result = self._engine(self._prep(img), use_det=True, use_cls=False, use_rec=True)
         if result is None or not getattr(result, "txts", None):
             return []
         boxes = []
