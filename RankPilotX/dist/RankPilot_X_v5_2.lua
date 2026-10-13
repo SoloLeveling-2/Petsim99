@@ -6700,8 +6700,8 @@ do
         {key = "CrystalKeyMode", name = "Crystal Key rank-up mode", status = "EXPERIMENTAL",
             evidence = "Slot pools: Directory.Ranks; chest pad: Map['3 | Castle'].INTERACT.CrystalChest.Pad (idonthaveoneatm 2025-09); open request: taught by recorder"},
     }
-    local run = {phase = "off", pending = nil, misses = 0, nextOpen = 0, opened = 0, pad = nil}
-    M.run = run
+    local runState = {phase = "off", pending = nil, misses = 0, nextOpen = 0, opened = 0, pad = nil}
+    M.runState = runState
 
     function M.opener()
         if M.EVIDENCED_OPEN then return M.EVIDENCED_OPEN end
@@ -6710,44 +6710,44 @@ do
     end
 
     function M.findPad()
-        if run.pad and run.pad.Parent then return run.pad end
-        run.pad = nil
+        if runState.pad and runState.pad.Parent then return runState.pad end
+        runState.pad = nil
         for _, root in ipairs(mapRoots()) do
             if root.Name == "Map" or root.Name == "Map1" then
                 local castle = root:FindFirstChild("3 | Castle")
                 local interact = castle and castle:FindFirstChild("INTERACT")
                 local chest = (interact and interact:FindFirstChild("CrystalChest")) or root:FindFirstChild("CrystalChest", true)
                 local pad = chest and (chest:FindFirstChild("Pad") or chest:FindFirstChild("Pad", true))
-                if pad and pad:IsA("BasePart") then run.pad = pad return pad end
+                if pad and pad:IsA("BasePart") then runState.pad = pad return pad end
             end
         end
         return nil
     end
 
     function M.release(reason)
-        if state.farmHold or run.phase ~= "off" then
+        if state.farmHold or runState.phase ~= "off" then
             state.farmHold = false
             clearMovement("mod:crystal")
         end
-        run.phase, run.pending = "off", nil
-        run.reason = reason
+        runState.phase, runState.pending = "off", nil
+        runState.reason = reason
     end
 
     function M.runner()
         if not Config.CrystalKeyMode or not state.running then M.release("mode off") return end
-        if now() - (plan.checkedAt or 0) >= 5 or run.pending then M.refreshPlan(run.pending ~= nil) end
+        if now() - (plan.checkedAt or 0) >= 5 or runState.pending then M.refreshPlan(runState.pending ~= nil) end
         -- Settle the previous open first: the key stack must shrink.
-        if run.pending then
-            if plan.keys < run.pending.before then
-                run.opened, run.misses, run.pending = run.opened + 1, 0, nil
+        if runState.pending then
+            if plan.keys < runState.pending.before then
+                runState.opened, runState.misses, runState.pending = runState.opened + 1, 0, nil
                 Modules.note("crystal", "open", "confirmed", "Crystal Chest opened (keys " .. plan.keys .. ")")
-            elseif now() - run.pending.sent > 6 then
-                run.pending, run.misses = nil, run.misses + 1
+            elseif now() - runState.pending.sent > 6 then
+                runState.pending, runState.misses = nil, runState.misses + 1
                 Modules.note("crystal", "open", "failed", "no key consumed")
-                if run.misses >= 3 then
+                if runState.misses >= 3 then
                     Config.CrystalKeyMode = false
                     M.release("3 opens consumed no key: mode switched off (re-teach the chest action)")
-                    log("Crystal mode stopped: " .. run.reason, "SAFEGUARD")
+                    log("Crystal mode stopped: " .. runState.reason, "SAFEGUARD")
                     return
                 end
             else
@@ -6764,23 +6764,23 @@ do
         if not pad then M.release("Crystal Chest not loaded (stand in World 1 Castle area)") return end
         -- Hold the breakable quests: no farming while the method runs.
         state.farmHold = true
-        if not movementAvailable("mod:crystal") then run.phase = "waiting for movement" return end
+        if not movementAvailable("mod:crystal") then runState.phase = "waiting for movement" return end
         leaseMovement("mod:crystal", 8)
         local root = currentRoot()
         if root and (root.Position - pad.Position).Magnitude > 8 then
             pcall(function() root.CFrame = pad.CFrame + Vector3.new(0, 3, 0) end)
-            run.phase = "moving to chest"
+            runState.phase = "moving to chest"
             return
         end
-        run.phase = "opening"
-        if now() < run.nextOpen then return end
+        runState.phase = "opening"
+        if now() < runState.nextOpen then return end
         local recorder = Modules.byId.recorder
         if not recorder then M.release("recorder unavailable") return end
         local args, why = recorder.resolve(opener.args)
         if not args then M.release(tostring(why)) return end
-        run.nextOpen = now() + math.max(0.5, tonumber(Config.CrystalOpenSeconds) or 1.5)
+        runState.nextOpen = now() + math.max(0.5, tonumber(Config.CrystalOpenSeconds) or 1.5)
         local accepted = Modules.call("crystal", "open", opener.name, args, opener.method == "Invoke", 0.5)
-        if accepted then run.pending = {before = plan.keys, sent = now()} end
+        if accepted then runState.pending = {before = plan.keys, sent = now()} end
     end
 
     function M.tick()
@@ -6815,7 +6815,8 @@ do
         h.toolbar(p, {
             {"1) TEACH CHEST OPEN", function()
                 local recorder = Modules.byId.recorder
-                local ok, why = recorder and recorder.start(20)
+                if not recorder then return end
+                local ok, why = recorder.start(20)
                 log(ok and "Open the Crystal Chest once by hand within 20 s" or ("Recorder: " .. tostring(why)), "SYSTEM")
             end},
             {"2) SAVE CHEST ACTION", function()
@@ -6840,8 +6841,8 @@ do
         end
         ui.crystalSlots.Text = "Slots  " .. (#parts > 0 and table.concat(parts, "   ") or "none")
         local opener = M.opener()
-        ui.crystalRun.Text = string.format("Mode: %s%s  |  opened %d  |  chest action: %s", run.phase,
-            run.reason and run.phase == "off" and (" (" .. run.reason .. ")") or "", run.opened,
+        ui.crystalRun.Text = string.format("Mode: %s%s  |  opened %d  |  chest action: %s", runState.phase,
+            runState.reason and runState.phase == "off" and (" (" .. runState.reason .. ")") or "", runState.opened,
             opener and opener.name or "not taught")
     end
     Modules.define(M)
