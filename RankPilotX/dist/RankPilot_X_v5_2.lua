@@ -6237,6 +6237,178 @@ do
     })
 end)()
 end
+-- ==== module: 05_recorder.lua ====
+do
+-- Action recorder ("teach an action"). For game actions with no readable
+-- source (e.g. opening the Crystal Chest), the user performs the action once
+-- by hand while the recorder briefly wraps the game's own Library.Client.Network
+-- Invoke/Fire functions and notes which request the game itself sent. A feature
+-- may then repeat exactly that request; nothing is guessed. Wrappers are
+-- installed only during a short window and always restored (also on Stop).
+-- Arguments are stored as a template: a string equal to an inventory item
+-- UID becomes {item = <item id>} and is re-resolved to the current UID on replay.
+(function()
+    local M = {id = "recorder", title = "Action recorder", page = "diagnostics"}
+    M.defaults = {LearnedActions = {}}
+    local rec = {active = false, untilAt = 0, originals = nil, owner = nil, captures = {}}
+    M.rec = rec
+    local METHODS = {"Invoke", "Fire", "UnreliableFire"}
+    -- Constant background traffic that is never the action being taught.
+    local NOISE = {"Breakables_", "Orbs", "Lootbags", "Pets", "Idle", "Is Real Player", "Mark Approached",
+        "Ping", "Tutorial", "EventLog", "Slingshot", "Hoverboard", "Emote", "Settings"}
+
+    local function noisy(name)
+        for _, word in ipairs(NOISE) do if string.find(name, word, 1, true) then return true end end
+        return false
+    end
+
+    -- Map inventory UIDs to item ids so templates survive stack changes.
+    local function uidIndex()
+        local data = saveData(true)
+        local index = {}
+        local inv = type(data) == "table" and data.Inventory or {}
+        for class, rows in pairs(type(inv) == "table" and inv or {}) do
+            if type(rows) == "table" then
+                for uid, row in pairs(rows) do
+                    if type(row) == "table" and type(row.id) == "string" then index[uid] = {class = class, id = row.id} end
+                end
+            end
+        end
+        return index
+    end
+
+    function M.template(args, index)
+        local out = {}
+        for i, v in ipairs(args) do
+            local t = type(v)
+            if t == "string" and index[v] then
+                out[i] = {item = index[v].id, class = index[v].class}
+            elseif t == "string" or t == "number" or t == "boolean" then
+                out[i] = v
+            else
+                return nil, "argument " .. i .. " is a " .. t .. " (cannot be replayed safely)"
+            end
+        end
+        return out
+    end
+
+    function M.resolve(template)
+        local args = {}
+        for i, v in ipairs(template or {}) do
+            if type(v) == "table" and v.item then
+                local rows = Modules.inventory(v.class or "Misc", true)
+                local uid = nil
+                for candidate, row in pairs(rows or {}) do
+                    if type(row) == "table" and row.id == v.item and (tonumber(row._am) or 1) > 0 then uid = candidate break end
+                end
+                if not uid then return nil, "no " .. tostring(v.item) .. " left" end
+                args[i] = uid
+            else
+                args[i] = v
+            end
+        end
+        return args
+    end
+
+    function M.stop()
+        if rec.originals and rec.owner then
+            for method, fn in pairs(rec.originals) do pcall(function() rec.owner[method] = fn end) end
+        end
+        rec.originals, rec.owner, rec.active = nil, nil, false
+    end
+
+    function M.start(seconds)
+        M.stop()
+        local net = state.clients and state.clients.Network
+        if type(net) ~= "table" then return false, "game Network module unavailable" end
+        local index = uidIndex()
+        rec.captures, rec.originals, rec.owner = {}, {}, net
+        for _, method in ipairs(METHODS) do
+            local original = net[method]
+            if type(original) == "function" then
+                rec.originals[method] = original
+                local ok = pcall(function()
+                    net[method] = function(name, ...)
+                        if rec.active and type(name) == "string" and not noisy(name) and #rec.captures < 40 then
+                            local template, why = M.template({...}, index)
+                            table.insert(rec.captures, {method = method, name = name, template = template,
+                                problem = why, at = now()})
+                        end
+                        return original(name, ...)
+                    end
+                end)
+                if not ok then rec.originals[method] = nil end
+            end
+        end
+        if next(rec.originals) == nil then rec.owner = nil return false, "Network functions are read-only here" end
+        rec.active, rec.untilAt = true, now() + math.clamp(tonumber(seconds) or 15, 5, 60)
+        log("Recorder ON: perform the action in-game now (" .. math.floor(rec.untilAt - now()) .. " s)", "SYSTEM")
+        return true
+    end
+
+    -- Most recent capture whose name matches one of the patterns (plain, lower-case).
+    function M.find(patterns)
+        for i = #rec.captures, 1, -1 do
+            local c = rec.captures[i]
+            local lower = string.lower(c.name)
+            for _, p in ipairs(patterns) do
+                if string.find(lower, p, 1, true) and c.template then return c end
+            end
+        end
+        return nil
+    end
+
+    function M.learn(key, capture)
+        if not capture or not capture.template then return false end
+        local learned = type(Config.LearnedActions) == "table" and Config.LearnedActions or {}
+        learned[key] = {name = capture.name, method = capture.method, args = capture.template}
+        Config.LearnedActions = learned
+        persist()
+        return true
+    end
+    function M.learned(key)
+        local learned = type(Config.LearnedActions) == "table" and Config.LearnedActions or {}
+        local action = learned[key]
+        if type(action) == "table" and type(action.name) == "string" and type(action.args) == "table" then return action end
+        return nil
+    end
+
+    function M.tick()
+        if rec.active and now() >= rec.untilAt then
+            M.stop()
+            log("Recorder OFF: " .. #rec.captures .. " game request(s) captured", "SYSTEM")
+        end
+    end
+    M.active = function() return rec.active end
+    M.runWhilePaused = true
+    M.interval = 1
+    function M.cleanup() M.stop() end
+
+    function M.report()
+        local names = {}
+        for _, c in ipairs(rec.captures) do table.insert(names, c.method .. " " .. c.name) end
+        return "captures: " .. (#names > 0 and table.concat(names, "; ") or "none")
+    end
+
+    function M.buildUI(h, ui)
+        local p = h.page("diagnostics")
+        h.section(p, "TEACH AN ACTION", "Records which request the game sends when YOU perform an action")
+        h.toolbar(p, {{"RECORD 15 SECONDS", function() local ok, why = M.start(15) if not ok then log("Recorder: " .. tostring(why), "WAIT") end end},
+            {"STOP RECORDING", M.stop}})
+        ui.recorderRows = {}
+        for i = 1, 4 do ui.recorderRows[i] = h.rowLabel(p, i == 1 and "No recording yet" or "") end
+    end
+    function M.render(ui)
+        if ui.activePage ~= "diagnostics" or not ui.recorderRows then return end
+        for i = 1, 4 do
+            local c = rec.captures[#rec.captures - i + 1]
+            ui.recorderRows[i].Text = c and string.format("%s %s (%s)", c.method, c.name, c.template and "replayable" or tostring(c.problem))
+                or (i == 1 and (rec.active and "Recording... perform the action now" or "No recording yet") or "")
+        end
+    end
+    Modules.define(M)
+end)()
+end
 -- ==== module: 10_rank.lua ====
 do
 -- Rank telemetry, stall recovery and rank-reward confirmation.
@@ -6411,6 +6583,136 @@ do
         local idle = tele.lastCreditAt and (now() - tele.lastCreditAt) / 60 or 0
         ui.rankStall.Text = string.format("Last credited progress %.1f min ago  |  recoveries %d  |  %s",
             idle, tele.recoveries, tostring(tele.last))
+    end
+    Modules.define(M)
+end)()
+end
+-- ==== module: 15_crystal.lua ====
+do
+-- Crystal Key rank-up planner (user-reported "crystal key method").
+-- Evidence for the slot rule: the official rank directory (BIG Games API
+-- "Ranks" collection, configData.Goals = one weighted quest pool per slot,
+-- e.g. rank 30 slot 1 = {CURRENT_BREAKABLE(21) x3, COLLECT_POTION(14),
+-- COLLECT_ENCHANT(15), DIAMOND_BREAKABLE(9)}) read live from
+-- Directory.Ranks[RankIDFromNumber(rank)].Goals. Players report the game never
+-- gives two active quests the same type, so when every non-collect type of
+-- slot 1's pool is already held (unfinished) in slots 2-4, slot 1 can only roll
+-- collect potions / collect enchants, which Crystal Chest drops complete.
+-- This module is READ-ONLY planning: it reports whether the account is set
+-- up and how many keys it holds. Opening the chest is a separate, opt-in step.
+(function()
+    local M = {id = "crystal", title = "Crystal Key planner", page = "ranks", interval = 5}
+    M.COLLECT = {[14] = "collect potions", [15] = "collect enchants"}
+    M.NAMES = {[1] = "breakables", [7] = "currency", [9] = "diamond breakables", [14] = "collect potions",
+        [15] = "collect enchants", [21] = "breakables (current area)", [34] = "use potions"}
+    local plan = {status = "not checked", ready = false, slots = {}, blockers = {}, keys = 0}
+    M.plan = plan
+
+    -- Active quests by slot. Save.Goals is keyed by slot (VY AutoRank iterates
+    -- `for tier, g in pairs(save.Goals)`; RankPilot keeps the same key).
+    function M.readSlots(data)
+        local slots = {}
+        if type(data) ~= "table" or type(data.Goals) ~= "table" then return slots end
+        for key, g in pairs(data.Goals) do
+            local slot = tonumber(key)
+            if slot and type(g) == "table" and g.Type ~= nil then
+                slots[slot] = {slot = slot, type = tonumber(g.Type) or g.Type, amount = tonumber(g.Amount) or 0,
+                    progress = tonumber(g.Progress) or 0, uid = g.UID, stars = tonumber(g.Stars) or 1}
+            end
+        end
+        return slots
+    end
+
+    -- Quest types slot 1 can roll at this rank, from the game's own directory.
+    -- Directory tables are frozen (unknown keys throw), so read inside pcall.
+    function M.slotPool(rank, slotIndex)
+        local _, definition = rankDefinition(rank)
+        if type(definition) ~= "table" then return nil end
+        local ok, types = pcall(function()
+            local pool = definition.Goals[slotIndex or 1]
+            local found = {}
+            for _, entry in pairs(pool) do
+                local t = type(entry) == "table" and tonumber(rawget(entry, "Type") or entry.Type) or nil
+                if t then found[t] = true end
+            end
+            return found
+        end)
+        if not ok or type(types) ~= "table" or next(types) == nil then return nil end
+        return types
+    end
+
+    -- Pure analysis: given slot-1 pool types and active slots, is slot 1
+    -- forced to a collect quest? Returns ready, status text, blocker list.
+    function M.analyze(pool, slots)
+        if not pool then return false, "rank quest pools unreadable (Directory.Ranks)", {} end
+        local collectable = false
+        for t in pairs(M.COLLECT) do if pool[t] then collectable = true end end
+        if not collectable then return false, "slot 1 cannot roll collect quests at this rank", {} end
+        local held = {}
+        for slot, q in pairs(slots) do
+            if slot >= 2 and q.progress < q.amount then held[q.type] = slot end
+        end
+        local missing = {}
+        for t in pairs(pool) do
+            if not M.COLLECT[t] and not held[t] then table.insert(missing, t) end
+        end
+        table.sort(missing)
+        local first = slots[1]
+        if #missing > 0 then
+            local names = {}
+            for _, t in ipairs(missing) do table.insert(names, M.NAMES[t] or ("type " .. tostring(t))) end
+            local hint = "keep completing other quests until slots 2-4 hold: " .. table.concat(names, ", ")
+            if first and not M.COLLECT[first.type] and pool[first.type] then
+                hint = "finish slot 1 (" .. (M.NAMES[first.type] or tostring(first.type)) .. ") first; " .. hint
+            end
+            return false, hint, missing
+        end
+        if not first then return false, "slot 1 is empty (waiting for a new quest)", {} end
+        if not M.COLLECT[first.type] then
+            return false, "slot 1 holds " .. (M.NAMES[first.type] or tostring(first.type)) .. "; finish it to reroll", {}
+        end
+        return true, "READY: slot 1 = " .. M.COLLECT[first.type] .. " (" .. first.progress .. "/" .. first.amount
+            .. "); breakable quests are held in other slots", {}
+    end
+
+    function M.tick()
+        local data = saveData()
+        if type(data) ~= "table" then plan.status = "Save unavailable" return end
+        local slots = M.readSlots(data)
+        local rank = tonumber(data.Rank)
+        local pool = rank and M.slotPool(rank, 1)
+        local ready, status, blockers = M.analyze(pool, slots)
+        plan.ready, plan.status, plan.blockers, plan.slots = ready, status, blockers, slots
+        plan.keys = Modules.countItem("Misc", "Crystal Key")
+        Modules.state("crystal").last = status .. " | crystal keys " .. plan.keys
+    end
+    M.active = function() return true end
+    M.runWhilePaused = true
+
+    function M.report()
+        local parts = {}
+        for slot = 1, 4 do
+            local q = plan.slots[slot]
+            if q then table.insert(parts, string.format("s%d=%s %d/%d", slot, M.NAMES[q.type] or tostring(q.type), q.progress, q.amount)) end
+        end
+        return tostring(plan.status) .. " | keys=" .. tostring(plan.keys) .. " | " .. table.concat(parts, ", ")
+    end
+
+    function M.buildUI(h, ui)
+        local p = h.page("ranks")
+        h.section(p, "CRYSTAL KEY METHOD", "Checks the quest-slot setup from the game's own rank data")
+        ui.crystalStatus = h.rowLabel(p, "Crystal setup: not checked")
+        ui.crystalSlots = h.rowLabel(p, "Slots: not read")
+    end
+    function M.render(ui)
+        if ui.activePage ~= "ranks" or not ui.crystalStatus then return end
+        ui.crystalStatus.Text = "Crystal setup: " .. tostring(plan.status) .. "  |  keys " .. tostring(plan.keys)
+        local parts = {}
+        for slot = 1, 4 do
+            local q = plan.slots[slot]
+            if q then table.insert(parts, string.format("%d: %s %d/%d", slot, M.NAMES[q.type] or ("type " .. tostring(q.type)), q.progress, q.amount)) end
+        end
+        ui.crystalSlots.Text = "Slots  " .. (#parts > 0 and table.concat(parts, "   ") or "none")
     end
     Modules.define(M)
 end)()
