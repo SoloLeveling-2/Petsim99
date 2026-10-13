@@ -56,3 +56,74 @@ assert(#requests == 0, "planner never sends requests")
 print("PASS crystal planner: live slot pools, blockers, slot-1 rule, completion awareness, read-only")
 ''', names=["15_crystal.lua"], setup=SETUP, name="crystal")
 print("PASS test_crystal")
+
+# ---------------------------------------------------------------- runner
+run_modules(r'''
+local crystal, recorder = Modules.byId.crystal, Modules.byId.recorder
+assert(Config.CrystalKeyMode == false, "spending mode is OFF by default")
+-- World 1 map with the Castle chest pad (path from idonthaveoneatm 2025-09).
+local pad = {Name = "Pad", Parent = true, Position = Vector3.new(100, 0, 0), CFrame = CFrame.new(100, 0, 0),
+  IsA = function(_, c) return c == "BasePart" end, FindFirstChild = function() return nil end}
+local chest = {FindFirstChild = function(_, n) return n == "Pad" and pad or nil end}
+local interact = {FindFirstChild = function(_, n) return n == "CrystalChest" and chest or nil end}
+local castle = {FindFirstChild = function(_, n) return n == "INTERACT" and interact or nil end}
+local map = {Name = "Map", FindFirstChild = function(_, n) return n == "3 | Castle" and castle or nil end}
+mapRoots = function() return {map} end
+Vector3.new = function(x, y, z) return setmetatable({X = x or 0, Y = y or 0, Z = z or 0}, V3) end
+V3 = {__sub = function(a, b) return setmetatable({X = a.X - b.X, Y = a.Y - b.Y, Z = a.Z - b.Z}, V3) end,
+  __index = function(t, k) if k == "Magnitude" then return math.sqrt(t.X^2 + t.Y^2 + t.Z^2) end end}
+pad.Position = Vector3.new(100, 0, 0)
+local root = currentRoot()
+root.Position = Vector3.new(0, 0, 0)
+local plusMeta = {__add = function(a, b) return {X = a.X + b.X, Y = a.Y + b.Y, Z = a.Z + b.Z} end}
+pad.CFrame = setmetatable({X = 100, Y = 0, Z = 0}, plusMeta)
+fake.save = {Rank = 30, Goals = {[1] = {Type = 14, Amount = 70, Progress = 3}, [2] = {Type = 21, Amount = 3500, Progress = 9},
+    [3] = {Type = 9, Amount = 900, Progress = 0}}, Inventory = {Misc = {k = {id = "Crystal Key", _am = 3}}}}
+state.world = {number = 1}
+state.running = true
+Config.CrystalKeyMode = true
+-- Not taught yet: nothing is sent, farming is not held.
+tickModule("crystal")
+assert(crystal.run.phase == "off" and crystal.run.reason:find("teach", 1, true) and not state.farmHold)
+-- Teach: the user opens the chest by hand while recording.
+local net = {Invoke = function(name, ...) return true end}
+fake.clients.Network = net
+state.clients = fake.clients
+assert(recorder.start(20))
+net.Invoke("ChestThing_Open", "k")
+recorder.stop()
+assert(recorder.learn("crystalChest", recorder.find({"chest"})))
+-- Wrong world: released, no request.
+state.world = {number = 2}
+advance(1) tickModule("crystal")
+assert(crystal.run.reason:find("World 1", 1, true) and sent("ChestThing_Open") == 0)
+state.world = {number = 1}
+-- First tick moves onto the pad and holds farming.
+advance(1) tickModule("crystal")
+assert(state.farmHold == true and crystal.run.phase == "moving to chest")
+root.Position = Vector3.new(100, 0, 0)
+fake.responses.ChestThing_Open = true
+advance(2) tickModule("crystal")
+local r = lastRequest("ChestThing_Open")
+assert(r and r.args[1] == "k" and r.invoke == true, "replays the taught request with the current key UID")
+-- Key consumed -> confirmed; then the next open.
+fake.save.Inventory.Misc.k._am = 2
+advance(2) tickModule("crystal")
+assert(crystal.run.opened == 1 and Modules.stat("crystal", "open").confirmed == 1)
+advance(2) tickModule("crystal")
+assert(sent("ChestThing_Open") == 2)
+-- Three opens that consume nothing switch the mode off and release the hold.
+for _ = 1, 3 do advance(7) tickModule("crystal") advance(2) tickModule("crystal") end
+assert(Config.CrystalKeyMode == false and state.farmHold == false, crystal.run.reason)
+-- Setup lost (e.g. rank up rerolled quests): release immediately.
+Config.CrystalKeyMode = true
+crystal.run.misses = 0
+fake.save.Goals = {[1] = {Type = 21, Amount = 2750, Progress = 0}}
+advance(10) tickModule("crystal")
+assert(state.farmHold == false and crystal.run.reason:find("setup", 1, true))
+-- Pause releases the hold too.
+crystal.onPause()
+assert(crystal.run.phase == "off")
+print("PASS crystal runner: needs taught action + World 1 + setup + keys, holds farming, confirms by key count, fail-safe off")
+''', names=["05_recorder.lua", "15_crystal.lua"], setup=SETUP, name="crystal-runner")
+print("PASS test_crystal runner")

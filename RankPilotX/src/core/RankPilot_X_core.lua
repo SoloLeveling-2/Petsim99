@@ -2360,7 +2360,7 @@ local function vyOwnedPetIDs()
 end
 
 local function vyBulkAssign(targets, kind, immediate)
-    if not Config.VYPersistentPetBulk or not state.running or state.shutdown
+    if not Config.VYPersistentPetBulk or not state.running or state.shutdown or state.farmHold
         or type(targets)~="table" or #targets==0 then return false end
     local timestamp=now()
     local interval=math.max(0.35,tonumber(Config.VYBulkSeconds) or 1)
@@ -2591,6 +2591,8 @@ end
 
 local function farm(goal)
     if not healthy("farm") or not Config.AutoFarm then return false end
+    -- v5.2: a module (Crystal Key mode) may hold breakable quests unfinished.
+    if state.farmHold then return false end
     local rate=math.clamp(tonumber(Config.FarmTapRate) or 7,1,
         Config.LowLagMode and 7 or 16)
     local seconds=Config.FastFarm and 1/rate or Config.FarmActionSeconds
