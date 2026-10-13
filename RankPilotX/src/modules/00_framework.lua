@@ -105,13 +105,14 @@
         return row
     end
 
-    -- Rate-limited remote call that keeps the raw result. Returns
-    -- (accepted, result); accepted=false on cooldown, missing remote or a
-    -- false/nil-error response. Callers must still verify game state.
+    -- Rate-limited remote call that keeps the raw results. Returns
+    -- (accepted, result, extra); accepted=false on cooldown, missing remote or
+    -- a false response (extra then usually holds the server's reason).
+    -- Callers must still verify game state before counting a success.
     function Modules.call(id, key, remote, args, invoke, interval)
         if not cooldownReady("mod-remote:" .. remote, interval or 3) then return false, "cooldown" end
         Modules.note(id, key, "attempted")
-        local ok, result = network(remote, args or {}, invoke)
+        local ok, result, extra = network(remote, args or {}, invoke)
         if not ok then
             Modules.note(id, key, "failed", remote .. " failed: " .. describe(result))
             failFeature("mod:" .. id, result)
@@ -119,11 +120,11 @@
         end
         state.commandCount = state.commandCount + 1
         if result == false then
-            Modules.note(id, key, "failed", remote .. " refused")
-            return false, result
+            Modules.note(id, key, "failed", remote .. " refused" .. (extra ~= nil and (": " .. describe(extra)) or ""))
+            return false, result, extra
         end
         Modules.note(id, key, "accepted")
-        return true, result
+        return true, result, extra
     end
 
     -- Client module lookup by name. state.clients is the game's own

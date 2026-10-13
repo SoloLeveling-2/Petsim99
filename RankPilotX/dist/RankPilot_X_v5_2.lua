@@ -5985,13 +5985,14 @@ do
         return row
     end
 
-    -- Rate-limited remote call that keeps the raw result. Returns
-    -- (accepted, result); accepted=false on cooldown, missing remote or a
-    -- false/nil-error response. Callers must still verify game state.
+    -- Rate-limited remote call that keeps the raw results. Returns
+    -- (accepted, result, extra); accepted=false on cooldown, missing remote or
+    -- a false response (extra then usually holds the server's reason).
+    -- Callers must still verify game state before counting a success.
     function Modules.call(id, key, remote, args, invoke, interval)
         if not cooldownReady("mod-remote:" .. remote, interval or 3) then return false, "cooldown" end
         Modules.note(id, key, "attempted")
-        local ok, result = network(remote, args or {}, invoke)
+        local ok, result, extra = network(remote, args or {}, invoke)
         if not ok then
             Modules.note(id, key, "failed", remote .. " failed: " .. describe(result))
             failFeature("mod:" .. id, result)
@@ -5999,11 +6000,11 @@ do
         end
         state.commandCount = state.commandCount + 1
         if result == false then
-            Modules.note(id, key, "failed", remote .. " refused")
-            return false, result
+            Modules.note(id, key, "failed", remote .. " refused" .. (extra ~= nil and (": " .. describe(extra)) or ""))
+            return false, result, extra
         end
         Modules.note(id, key, "accepted")
-        return true, result
+        return true, result, extra
     end
 
     -- Client module lookup by name. state.clients is the game's own
@@ -6492,18 +6493,23 @@ do
 -- Every action here spends inventory, so all toggles are OFF by default,
 -- each stack keeps a reserve, and use is confirmed by the stack amount
 -- dropping in Save data (a fired request alone is not counted as success).
---   Fruits: Consume (Fire) (uid, 1)             VY AutoRank
+--   Fruits: Consume (Fire) (uid, n)             VY AutoRank; juhjuh ps99-hub 2026-08 (n = queue gap)
+--   FruitCmds.GetActiveFruits / ComputeFruitQueueLimit   firedvl autoFruits, juhjuh (fallback 20)
 --   Potions: Consume (Fire) (uid, 1)            decompiled capture + VY AutoRank
 --   FlexibleFlagCmds.Consume(flagId, uid, 1)    VY AutoRank (returns true / false,msg)
+--   Consumables_Consume (Invoke) (uid, 1)       Fishka AutoUseBoosts 2026-03, juhjuh 2026-08;
+--                                               active while Save.Consumables[id] is non-empty
 (function()
     local M = {id = "items", title = "Items & Boosts", page = "items", interval = 4}
     M.defaults = {AutoEatFruits = false, EatShinyFruits = false, FruitReserve = 10, FruitEatSeconds = 240,
         AutoUsePotions = false, PotionReserve = 5, PotionUseSeconds = 600,
-        AutoUseFlags = false, FlagReserve = 2, FlagUseSeconds = 300}
+        AutoUseFlags = false, FlagReserve = 2, FlagUseSeconds = 300,
+        AutoUseBoosts = false, BoostReserve = 1}
     M.features = {
         {key = "AutoEatFruits", name = "Keep fruit boosts", status = "UNVERIFIED", evidence = "Fruits: Consume (uid,1) Fire - VY AutoRank"},
         {key = "AutoUsePotions", name = "Keep potion boosts", status = "UNVERIFIED", evidence = "Potions: Consume (uid,1) Fire - decompiled capture, VY"},
         {key = "AutoUseFlags", name = "Place flags in current area", status = "UNVERIFIED", evidence = "FlexibleFlagCmds.Consume(flagId,uid,1) - VY AutoRank"},
+        {key = "AutoUseBoosts", name = "Use consumable boosts", status = "UNVERIFIED", evidence = "Consumables_Consume(uid,1) - Fishka 2026-03, juhjuh 2026-08"},
     }
     local pending = {}       -- uid -> {before, sent, kind, id}
     local lastUse = {}       -- kind..":"..id -> time of last confirmed/attempted use
@@ -6591,14 +6597,58 @@ do
         return ok and inside == true
     end
 
+    -- When the game exposes its fruit queue, eat exactly the gap to the queue
+    -- limit (never past it); otherwise fall back to one fruit per interval.
+    function M.fruitPlan(list, reserve)
+        local cmds = Modules.client("FruitCmds")
+        local okActive, active = callMethod(cmds, "GetActiveFruits")
+        if not okActive or type(active) ~= "table" then return nil end
+        local okLimit, limit = callMethod(cmds, "ComputeFruitQueueLimit")
+        limit = (okLimit and tonumber(limit)) or 20
+        local plan = {}
+        for _, entry in ipairs(list) do
+            local queued = 0
+            local rows = active[entry.id]
+            if type(rows) == "table" then
+                for _, sub in pairs(rows) do queued = queued + ((type(sub) == "table") and #sub or 1) end
+            end
+            local want = math.min(limit - queued, entry.amount - reserve)
+            if want >= 1 then
+                entry.useAmount = math.floor(want)
+                table.insert(plan, entry)
+            end
+        end
+        return plan
+    end
+
+    function M.boostActive(data, id)
+        local active = type(data) == "table" and data.Consumables
+        local row = type(active) == "table" and active[id] or nil
+        return type(row) == "table" and next(row) ~= nil
+    end
+
     function M.tick()
         M.verify("Fruit")
         M.verify("Potion")
         M.verify("Misc")
+        M.verify("Consumable")
         if Config.AutoEatFruits and not M.questNeeds("fruit") then
-            local list = M.candidates("Fruit", math.max(0, tonumber(Config.FruitReserve) or 10), Config.EatShinyFruits)
-            M.useOne("fruit", "Fruit", list, math.max(30, tonumber(Config.FruitEatSeconds) or 240), function(entry)
-                return Modules.call("items", "fruit", "Fruits: Consume", {entry.uid, 1}, false, 1)
+            local reserve = math.max(0, tonumber(Config.FruitReserve) or 10)
+            local list = M.candidates("Fruit", reserve, Config.EatShinyFruits)
+            local plan = M.fruitPlan(list, reserve)
+            local cooldown = plan and 30 or math.max(30, tonumber(Config.FruitEatSeconds) or 240)
+            M.useOne("fruit", "Fruit", plan or list, cooldown, function(entry)
+                return Modules.call("items", "fruit", "Fruits: Consume", {entry.uid, entry.useAmount or 1}, false, 1)
+            end)
+        end
+        if Config.AutoUseBoosts then
+            local data = saveData()
+            local list = {}
+            for _, entry in ipairs(M.candidates("Consumable", math.max(0, tonumber(Config.BoostReserve) or 1), true)) do
+                if not M.boostActive(data, entry.id) then table.insert(list, entry) end
+            end
+            M.useOne("boost", "Consumable", list, 60, function(entry)
+                return Modules.call("items", "boost", "Consumables_Consume", {entry.uid, 1}, true, 1)
             end)
         end
         if Config.AutoUsePotions and not M.questNeeds("potion") then
@@ -6628,6 +6678,7 @@ do
     end
     M.active = function()
         return Config.AutoEatFruits == true or Config.AutoUsePotions == true or Config.AutoUseFlags == true
+            or Config.AutoUseBoosts == true
     end
 
     function M.report()
@@ -6657,14 +6708,17 @@ do
                 Config.PotionReserve = opts[idx % #opts + 1]
             end)
         h.toggle(p, "AutoUseFlags", "Place flags in current area", "FlexibleFlagCmds.Consume; never inside instances; keeps a reserve")
+        h.toggle(p, "AutoUseBoosts", "Use consumable boosts", "Consumables_Consume for boosts that are not already active; keeps 1 of each")
         ui.itemsStatus = h.rowLabel(p, "Items: not checked")
     end
 
     function M.render(ui)
         if ui.activePage ~= "items" or not ui.itemsStatus then return end
         local fruit, potion, flag = Modules.stat("items", "fruit"), Modules.stat("items", "potion"), Modules.stat("items", "flag")
-        ui.itemsStatus.Text = string.format("Confirmed uses  fruit %d/%d  potion %d/%d  flag %d/%d (confirmed/attempted)",
-            fruit.confirmed, fruit.attempted, potion.confirmed, potion.attempted, flag.confirmed, flag.attempted)
+        local boost = Modules.stat("items", "boost")
+        ui.itemsStatus.Text = string.format("Confirmed/attempted  fruit %d/%d  potion %d/%d  flag %d/%d  boost %d/%d",
+            fruit.confirmed, fruit.attempted, potion.confirmed, potion.attempted, flag.confirmed, flag.attempted,
+            boost.confirmed, boost.attempted)
     end
     Modules.define(M)
 end)()
@@ -6765,6 +6819,135 @@ do
     function M.render(ui)
         if ui.activePage ~= "events" or not ui.eventsLive then return end
         ui.eventsLive.Text = "Active events: " .. tostring(live.summary)
+    end
+    Modules.define(M)
+end)()
+end
+-- ==== module: 50_farmtools.lua ====
+do
+-- Farm tools: ultimates, toys and TNT. Sources (research 2026-10-11):
+--   Network["Ultimates: Activate"] Invoke(ultimateId); id from
+--     UltimateCmds.GetEquippedItem():GetId(), gated by UltimateCmds.IsCharged(id)
+--     [Fishka AutoUseUltimate.lua 2026-03-31; juhjuh ps99-hub main.lua 2026-08; qvirthh 2026-10-03]
+--   SqueakyToy_Consume / ToyBall_Consume / ToyBone_Consume Invoke() no args
+--     [Fishka AutoEatFruitsAndToys.lua 2026-03-30; single source] buff 600/300/300 s (BIG Games API Buffs)
+--   TNT_Consume / TNT_Crate_Consume Invoke() no args [CHICHazHUB PSXfarm, 2024-02 only]
+-- Ultimates are free and fire only when the game says they are charged.
+-- Toys and TNT spend items: OFF by default, confirmed by the Misc stack
+-- shrinking, and an item that is not consumed twice in a row is disabled.
+(function()
+    local M = {id = "farmtools", title = "Farm tools", page = "farm", interval = 3}
+    M.defaults = {AutoUltimate = true, AutoUseToys = false, AutoUseTNT = false}
+    M.features = {
+        {key = "AutoUltimate", name = "Use ultimate when charged", status = "UNVERIFIED",
+            evidence = "Ultimates: Activate(id) + UltimateCmds.IsCharged - 3 sources 2026"},
+        {key = "AutoUseToys", name = "Use toys", status = "EXPERIMENTAL",
+            evidence = "<Toy>_Consume() no-arg Invoke - one 2026 source"},
+        {key = "AutoUseTNT", name = "Use TNT / TNT crates", status = "EXPERIMENTAL",
+            evidence = "TNT_Consume / TNT_Crate_Consume no-arg Invoke - 2024 source only"},
+    }
+    M.ITEMS = {
+        {id = "Squeaky Toy", remote = "SqueakyToy_Consume", key = "toys", seconds = 600},
+        {id = "Toy Ball", remote = "ToyBall_Consume", key = "toys", seconds = 300},
+        {id = "Toy Bone", remote = "ToyBone_Consume", key = "toys", seconds = 300},
+        {id = "TNT", remote = "TNT_Consume", key = "tnt", seconds = 12},
+        {id = "TNT Crate", remote = "TNT_Crate_Consume", key = "tnt", seconds = 20},
+    }
+    local itemState = {}  -- id -> {next, pending={before,sent}, misses, disabled}
+    local ult = {last = "not checked", pendingId = nil, pendingAt = 0}
+    M.itemState, M.ult = itemState, ult
+
+    function M.ultimateTick()
+        local cmds = Modules.client("UltimateCmds")
+        if not cmds then ult.last = "UltimateCmds unavailable" return false end
+        local okItem, item = callMethod(cmds, "GetEquippedItem")
+        if not okItem or item == nil then ult.last = "no ultimate equipped" return false end
+        local okId, id = pcall(function() return item:GetId() end)
+        if not okId or type(id) ~= "string" then ult.last = "equipped ultimate id unreadable" return false end
+        local okCharged, charged = callMethod(cmds, "IsCharged", id)
+        if not okCharged then ult.last = "IsCharged unavailable: not firing blindly" return false end
+        if ult.pendingId == id and now() - ult.pendingAt < 6 then
+            if charged == false then
+                Modules.note("farmtools", "ultimate", "confirmed", id .. " used (charge consumed)")
+                ult.pendingId = nil
+            end
+            return false
+        end
+        ult.pendingId = nil
+        if charged ~= true then ult.last = id .. " charging" return false end
+        local accepted = Modules.call("farmtools", "ultimate", "Ultimates: Activate", {id}, true, 4)
+        if accepted then
+            ult.pendingId, ult.pendingAt = id, now()
+            ult.last = id .. " activated; waiting for charge to reset"
+        end
+        return accepted
+    end
+
+    -- Shared pending/confirm logic for no-argument Misc item remotes.
+    function M.itemTick(spec)
+        local s = itemState[spec.id] or {next = 0, misses = 0}
+        itemState[spec.id] = s
+        if s.disabled then return false end
+        local count = Modules.countItem("Misc", spec.id, s.pending ~= nil)
+        if s.pending then
+            if count < s.pending.before then
+                Modules.note("farmtools", spec.key, "confirmed", spec.id .. " used")
+                s.pending, s.misses = nil, 0
+            elseif now() - s.pending.sent > 6 then
+                s.pending, s.misses = nil, s.misses + 1
+                Modules.note("farmtools", spec.key, "failed", spec.id .. " not consumed according to Save")
+                if s.misses >= 2 then
+                    s.disabled = true
+                    log(spec.remote .. " did not consume " .. spec.id .. " twice; disabled until RECHECK", "SAFEGUARD")
+                end
+            end
+            return false
+        end
+        if count < 1 or now() < s.next then return false end
+        s.next = now() + spec.seconds
+        local accepted = Modules.call("farmtools", spec.key, spec.remote, {}, true, 2)
+        if accepted then s.pending = {before = count, sent = now()} end
+        return accepted
+    end
+
+    function M.tick()
+        if Config.AutoUltimate and state.running and Config.AutoFarm and not inHatchMovementWindow() then
+            M.ultimateTick()
+        end
+        if (Config.AutoUseToys or Config.AutoUseTNT) and state.running and Config.AutoFarm then
+            for _, spec in ipairs(M.ITEMS) do
+                if (spec.key == "toys" and Config.AutoUseToys) or (spec.key == "tnt" and Config.AutoUseTNT) then
+                    M.itemTick(spec)
+                end
+            end
+        end
+    end
+    M.active = function() return Config.AutoUltimate == true or Config.AutoUseToys == true or Config.AutoUseTNT == true end
+    function M.recheck()
+        for _, s in pairs(itemState) do s.disabled, s.misses = false, 0 end
+    end
+
+    function M.report()
+        local disabled = {}
+        for id, s in pairs(itemState) do if s.disabled then table.insert(disabled, id) end end
+        return "ultimate=" .. tostring(ult.last) .. (#disabled > 0 and (" | disabled: " .. table.concat(disabled, ", ")) or "")
+    end
+
+    function M.buildUI(h, ui)
+        local p = h.page("farm")
+        h.section(p, "FARM TOOLS", "Ultimates are free; toys and TNT spend items and are confirmed by inventory")
+        h.toggle(p, "AutoUltimate", "Use ultimate when charged", "Ultimates: Activate for the equipped ultimate, only when IsCharged says so")
+        h.toggle(p, "AutoUseToys", "Use toys", "Squeaky Toy / Toy Ball / Toy Bone once per buff duration (experimental)")
+        h.toggle(p, "AutoUseTNT", "Use TNT and TNT crates", "Experimental 2024 remotes; disabled automatically if items are not consumed")
+        ui.farmToolsStatus = h.rowLabel(p, "Ultimate: not checked")
+        h.note(p, "Breakable sprinklers are not automated: no readable source shows how the game places them.", 40)
+    end
+    function M.render(ui)
+        if ui.activePage ~= "farm" or not ui.farmToolsStatus then return end
+        local u = Modules.stat("farmtools", "ultimate")
+        ui.farmToolsStatus.Text = string.format("Ultimate: %s  |  used %d/%d confirmed  |  toys %d  tnt %d",
+            tostring(ult.last), u.confirmed, u.attempted, Modules.stat("farmtools", "toys").confirmed,
+            Modules.stat("farmtools", "tnt").confirmed)
     end
     Modules.define(M)
 end)()
@@ -6983,6 +7166,240 @@ do
     function M.render(ui)
         if ui.activePage ~= "performance" or not ui.playerMemory then return end
         ui.playerMemory.Text = M.memoryText()
+    end
+    Modules.define(M)
+end)()
+end
+-- ==== module: 70_trading.lua ====
+do
+-- Trading & Mailbox. Sources (research 2026-10-11):
+--   Machines: Mark Approached (Fire) ("MailboxMachine") + "Mailbox: Claim All" (Invoke) -> (ok, err);
+--     30 s server cooldown "You must wait 30 seconds before using the mailbox!"
+--     [qvirthh ps99.ui 2026-10-03; fornamess 2026-06; kyro 2026-08; others]
+--   "Mailbox: Send" (Invoke) (recipient, message, class, uid, amount) -> true | (false, reason)
+--     [Xinity0324 automail 2026-06; PandaOvO 2026-08; 5-argument form in every 2024-2026 source]
+--   Trading Plaza place ids 15502339080 / 15588442388 [sakahr315 Booth 2026-06; kyro 2026-08]
+-- Safety: claiming only receives items. Sending is MANUAL ONLY: an exact
+-- recipient typed by the user, one selected non-protected stack, the
+-- "Allow mail sending" switch (OFF by default, switched OFF again after each
+-- send), a second click within 5 s, an affordability check, and a Save check
+-- afterwards. Nothing is ever sent automatically, on a timer, or to a preset
+-- account. Booth listing and trade requests are not implemented: there is no
+-- evidenced remote to undo a listing.
+(function()
+    local M = {id = "trading", title = "Trading & Mailbox", page = "trading", interval = 10}
+    M.defaults = {AutoClaimMailbox = false, AllowMailSend = false, MailRecipient = ""}
+    M.features = {
+        {key = "AutoClaimMailbox", name = "Claim mailbox", status = "UNVERIFIED",
+            evidence = "Mailbox: Claim All - 5+ sources 2026"},
+        {key = "AllowMailSend", name = "Allow one manual mail send", status = "EXPERIMENTAL",
+            evidence = "Mailbox: Send (5 args) - 2026 automail sources; manual only"},
+    }
+    M.PLAZA = {[15502339080] = true, [15588442388] = true}
+    M.CLASSES = {"Pet", "Misc", "Potion", "Enchant", "Fruit", "Consumable", "Lootbox"}
+    local mail = {next = 0, last = "not checked", claimed = 0, pendingTotal = nil, pendingAt = 0,
+        selection = 0, amountMode = 1, confirmAt = -100, sendLast = "nothing sent"}
+    M.mail = mail
+
+    local function inventoryTotal(data)
+        local inv = type(data) == "table" and data.Inventory
+        if type(inv) ~= "table" then return nil end
+        local total = 0
+        for _, class in ipairs(M.CLASSES) do
+            for _, row in pairs(type(inv[class]) == "table" and inv[class] or {}) do
+                if type(row) == "table" then total = total + math.max(0, tonumber(row._am) or 1) end
+            end
+        end
+        return total
+    end
+    M.inventoryTotal = inventoryTotal
+
+    function M.claimTick()
+        if now() < mail.next then return false end
+        mail.next = now() + 60
+        local before = inventoryTotal(saveData(true))
+        pcall(network, "Machines: Mark Approached", {"MailboxMachine"}, false)
+        local ok, result, reason = Modules.call("trading", "mailbox", "Mailbox: Claim All", {}, true, 30)
+        local message = type(reason) == "string" and reason or (type(result) == "string" and result) or nil
+        if message and string.find(string.lower(message), "wait", 1, true) then
+            mail.next = now() + 31 -- server cooldown: "You must wait 30 seconds..."
+            mail.last = message
+            return false
+        end
+        if not ok then
+            mail.last = "Claim All refused: " .. describe(message or result)
+            return false
+        end
+        mail.pendingTotal, mail.pendingAt = before, now()
+        mail.last = "Claim All accepted; checking inventory"
+        return true
+    end
+
+    function M.confirmClaim()
+        if not mail.pendingTotal or now() - mail.pendingAt < 4 then return end
+        local after = inventoryTotal(saveData(true))
+        if after and after > mail.pendingTotal then
+            mail.claimed = mail.claimed + 1
+            Modules.note("trading", "mailbox", "confirmed", "mail claimed: inventory +" .. (after - mail.pendingTotal))
+            mail.last = "Mail claimed (inventory +" .. (after - mail.pendingTotal) .. ")"
+        else
+            mail.last = "Mailbox empty or nothing new"
+        end
+        mail.pendingTotal = nil
+    end
+
+    function M.tick()
+        M.confirmClaim()
+        if Config.AutoClaimMailbox then M.claimTick() end
+    end
+    M.active = function() return Config.AutoClaimMailbox == true or mail.pendingTotal ~= nil end
+
+    -- ------------------------------------------------------------- manual mail
+    function M.validRecipient(name)
+        name = tostring(name or "")
+        if #name < 3 or #name > 20 then return false end
+        if string.find(name, "^[%w_]+$") == nil then return false end
+        if LocalPlayer and name == LocalPlayer.Name then return false end
+        return true
+    end
+
+    -- Sendable stacks: never pets the framework marks protected (huge,
+    -- titanic, exclusive, shiny, locked, listed), never locked items.
+    function M.sendable()
+        local data = saveData()
+        local inv = type(data) == "table" and data.Inventory or {}
+        local list = {}
+        for _, class in ipairs(M.CLASSES) do
+            for uid, row in pairs(type(inv[class]) == "table" and inv[class] or {}) do
+                if type(row) == "table" and type(row.id) == "string" and row._lk ~= true then
+                    local blocked = class == "Pet" and Modules.isProtectedPet(uid, row)
+                    if not blocked then
+                        table.insert(list, {class = class, uid = uid, id = row.id, amount = math.max(1, tonumber(row._am) or 1)})
+                    end
+                end
+            end
+        end
+        table.sort(list, function(a, b)
+            if a.class ~= b.class then return a.class < b.class end
+            if a.id ~= b.id then return a.id < b.id end
+            return tostring(a.uid) < tostring(b.uid)
+        end)
+        return list
+    end
+
+    function M.selected()
+        local list = M.sendable()
+        if #list == 0 then return nil end
+        local index = (mail.selection % #list) + 1
+        return list[index]
+    end
+    function M.sendAmount(entry)
+        if not entry then return 0 end
+        if mail.amountMode == 1 then return 1 end
+        if mail.amountMode == 2 then return math.min(10, entry.amount) end
+        return entry.amount
+    end
+
+    -- Base cost from the game's own constants; nil means "unknown -> refuse".
+    function M.mailCost()
+        local library = findChild(ReplicatedStorage, "Library")
+        local constants = tryModule(findChild(findChild(library, "Balancing"), "Constants"))
+        local base = constants and tonumber(constants.MailboxDiamondCost)
+        return base
+    end
+
+    function M.send()
+        local entry = M.selected()
+        local recipient = tostring(Config.MailRecipient or "")
+        if not Config.AllowMailSend then return false, "turn ON 'Allow one manual mail send' first" end
+        if not M.validRecipient(recipient) then return false, "enter an exact Roblox username (3-20 letters/digits/_)" end
+        if not entry then return false, "no sendable (non-protected, unlocked) stack" end
+        local amount = M.sendAmount(entry)
+        local cost = M.mailCost()
+        if not cost then return false, "mail cost unreadable; refusing to send" end
+        local okAfford, canAfford = callMethod(state.clients.CurrencyCmds, "CanAfford", "Diamonds", cost)
+        if not okAfford or canAfford ~= true then return false, "cannot verify " .. tostring(cost) .. " diamonds for postage" end
+        if now() - mail.confirmAt > 5 then
+            mail.confirmAt = now()
+            return false, string.format("press SEND again within 5 s to mail %d x %s (%s) to %s", amount, entry.id, entry.class, recipient)
+        end
+        mail.confirmAt = -100
+        Config.AllowMailSend = false -- one send per explicit opt-in
+        persist()
+        local ok, result = Modules.call("trading", "mailsend", "Mailbox: Send",
+            {recipient, "", entry.class, entry.uid, amount}, true, 5)
+        if not ok or result ~= true then return false, "Mailbox: Send refused: " .. describe(result) end
+        task.delay(4, function()
+            local rows = Modules.inventory(entry.class, true)
+            local row = rows and rows[entry.uid]
+            local left = type(row) == "table" and (tonumber(row._am) or 1) or 0
+            if left < entry.amount then
+                Modules.note("trading", "mailsend", "confirmed", "sent " .. amount .. " x " .. entry.id .. " to " .. recipient)
+            end
+        end)
+        return true, "sent request: " .. amount .. " x " .. entry.id .. " to " .. recipient
+    end
+
+    function M.report()
+        return string.format("mailbox=%s claimed=%d | mail send=%s | plaza=%s", tostring(mail.last), mail.claimed,
+            tostring(mail.sendLast), tostring(M.PLAZA[game.PlaceId] == true))
+    end
+
+    function M.buildUI(h, ui)
+        local p = h.page("trading")
+        h.section(p, "MAILBOX", "Claiming only receives items")
+        h.toggle(p, "AutoClaimMailbox", "Claim mailbox", "Mailbox: Claim All every 60 s; respects the 30 s server cooldown")
+        ui.mailStatus = h.rowLabel(p, "Mailbox: not checked")
+        h.section(p, "PROTECTED INVENTORY", "Huge, titanic, exclusive, shiny, locked and listed pets are never mailed or used")
+        ui.protectedStatus = h.rowLabel(p, "Protected pets: not counted")
+        h.section(p, "MANUAL MAIL (OPTIONAL)", "Never automatic. One send per opt-in, exact recipient, second click to confirm")
+        local recipientRow = h.rowLabel(p, "Recipient:")
+        pcall(function()
+            local box = h.create("TextBox", {Name = "MailRecipient", BackgroundColor3 = h.theme.surface,
+                BorderSizePixel = 0, Position = UDim2.fromOffset(110, 5), Size = UDim2.fromOffset(250, 28),
+                Font = Enum.Font.Gotham, TextSize = 12, TextColor3 = h.theme.white, Text = tostring(Config.MailRecipient or ""),
+                PlaceholderText = "exact username", ClearTextOnFocus = false}, recipientRow.Parent)
+            h.rounded(box, 6)
+            table.insert(state.connections, box.FocusLost:Connect(function()
+                Config.MailRecipient = string.gsub(tostring(box.Text or ""), "%s", "")
+                box.Text = Config.MailRecipient
+                persist()
+            end))
+        end)
+        h.choice(p, "Item to send", "Cycles through non-protected, unlocked stacks",
+            function()
+                local entry = M.selected()
+                return entry and (entry.id .. " x" .. entry.amount .. "  >") or "none  >"
+            end,
+            function() mail.selection = mail.selection + 1 end)
+        h.choice(p, "Amount", "1, up to 10, or the whole stack",
+            function() return ({"1", "up to 10", "whole stack"})[mail.amountMode] .. "  >" end,
+            function() mail.amountMode = mail.amountMode % 3 + 1 end)
+        h.toggle(p, "AllowMailSend", "Allow one manual mail send", "Turns itself OFF after one send. Postage diamonds are spent")
+        h.toolbar(p, {{"SEND (PRESS TWICE)", function()
+            local ok, message = M.send()
+            mail.sendLast = tostring(message)
+            log("Mail: " .. tostring(message), ok and "TRADE" or "SAFEGUARD")
+        end, h.theme.red}})
+        ui.mailSendStatus = h.rowLabel(p, "Mail send: nothing sent")
+        h.section(p, "BOOTHS & TRADES", "Read-only")
+        ui.plazaStatus = h.rowLabel(p, "Trading Plaza: not checked")
+        h.note(p, "Booth listing and trade requests are intentionally not automated: there is no evidenced remote to remove a listing, and selling/trading must never run unattended.", 52)
+    end
+
+    function M.render(ui)
+        if ui.activePage ~= "trading" or not ui.mailStatus then return end
+        ui.mailStatus.Text = string.format("Mailbox: %s  |  claims confirmed %d", tostring(mail.last), mail.claimed)
+        local data = saveData()
+        local pets = type(data) == "table" and data.Inventory and data.Inventory.Pet or {}
+        local protected, total = 0, 0
+        for uid, row in pairs(type(pets) == "table" and pets or {}) do
+            total = total + 1
+            if Modules.isProtectedPet(uid, row) then protected = protected + 1 end
+        end
+        ui.protectedStatus.Text = string.format("Protected pet stacks: %d of %d", protected, total)
+        ui.mailSendStatus.Text = "Mail send: " .. tostring(mail.sendLast)
+        ui.plazaStatus.Text = "Trading Plaza: " .. (M.PLAZA[game.PlaceId] and "in a plaza server" or "not in the plaza")
     end
     Modules.define(M)
 end)()
