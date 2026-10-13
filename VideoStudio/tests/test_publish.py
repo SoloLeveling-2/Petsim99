@@ -2,6 +2,7 @@
 import hashlib
 import json
 import time
+import urllib.parse
 
 import pytest
 
@@ -251,3 +252,27 @@ def test_cli_publish_needs_typed_confirmation_then_records(tmp_path, monkeypatch
     assert pub["remote_id"] == "yt1" and pub["options"]["made_for_kids"] is False
     assert cli.main(args) == 1 and "already posted" in capsys.readouterr().out
     assert len(uploads) == 1
+
+
+def test_connect_finishes_from_pasted_redirect(creds):
+    from studio.publish.oauth import Pending
+
+    opened = []
+    http = FakeHttp([("POST", youtube.TOKEN_URL, ok_json({"access_token": "A1", "refresh_token": "R1",
+                                                          "expires_in": 3599}))])
+
+    def no_browser_return(state, auth_url=None):
+        raise PublishError("sign-in timed out")
+
+    with pytest.raises(PublishError, match="timed out"):
+        youtube.connect(creds, opened.append, http=http, receive=no_browser_return)
+    state = urllib.parse.parse_qs(urllib.parse.urlparse(opened[0]).query)["state"][0]
+    with pytest.raises(PublishError, match="different sign-in"):
+        youtube.connect(creds, opened.append, http=http, redirect_url="http://127.0.0.1:8766/callback/?state=x&code=c")
+    with pytest.raises(PublishError, match="code="):
+        youtube.connect(creds, opened.append, http=http, redirect_url=f"http://127.0.0.1:8766/callback/?state={state}")
+    token = youtube.connect(creds, opened.append, http=http,
+                            redirect_url=f"http://127.0.0.1:8766/callback/?state={state}&code=4%2Fabc&scope=x")
+    assert token["access_token"] == "A1" and len(opened) == 1
+    assert http.calls[-1]["body"]["code"] == "4/abc" and http.calls[-1]["body"]["code_verifier"]
+    assert not Pending(creds / "youtube_pending.json").path.exists()

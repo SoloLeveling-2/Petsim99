@@ -17,6 +17,8 @@ LOOPBACK_HOST = "127.0.0.1"
 LOOPBACK_PORT = 8766
 CALLBACK_PATH = "/callback/"
 REDIRECT_URI = f"http://{LOOPBACK_HOST}:{LOOPBACK_PORT}{CALLBACK_PATH}"
+START_PATH = "/start"
+START_URL = f"http://{LOOPBACK_HOST}:{LOOPBACK_PORT}{START_PATH}"  # short link that forwards to the sign-in page
 
 
 def pkce_pair(hex_challenge: bool = False) -> tuple[str, str]:
@@ -27,13 +29,55 @@ def pkce_pair(hex_challenge: bool = False) -> tuple[str, str]:
     return verifier, challenge
 
 
-def receive_code(state: str, timeout: float = 300, port: int = LOOPBACK_PORT) -> str:
-    """Wait for the browser to come back to the loopback redirect and return the auth code."""
+def code_from_redirect(url: str, state: str) -> str:
+    """The auth code from a pasted redirect URL (the browser's address bar after signing in)."""
+    q = {k: v[0] for k, v in parse_qs(urlparse(url.strip()).query).items()}
+    if "error" in q:
+        raise PublishError(f"sign-in failed: {q['error']} {q.get('error_description', '')}".strip())
+    if "code" not in q:
+        raise PublishError("that address has no ?code=... in it; copy the whole address bar after signing in")
+    if q.get("state") != state:
+        raise PublishError("that address belongs to a different sign-in attempt; start `connect` again")
+    return q["code"]
+
+
+class Pending:
+    """PKCE verifier and state of the sign-in in progress, so a pasted redirect can finish it."""
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+
+    def save(self, verifier: str, state: str) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps({"verifier": verifier, "state": state, "at": int(time.time())}),
+                             encoding="utf-8")
+
+    def load(self) -> dict:
+        if not self.path.is_file():
+            raise PublishError("no sign-in in progress; run `connect` first, then paste the address")
+        data = json.loads(self.path.read_text(encoding="utf-8"))
+        if time.time() - data.get("at", 0) > 3600:
+            raise PublishError("the sign-in attempt is over an hour old; run `connect` again")
+        return data
+
+    def clear(self) -> None:
+        self.path.unlink(missing_ok=True)
+
+
+def receive_code(state: str, timeout: float = 600, port: int = LOOPBACK_PORT, auth_url: str | None = None) -> str:
+    """Wait for the browser to come back to the loopback redirect and return the auth code.
+    While waiting, START_URL forwards to `auth_url`, so the user can type a short address."""
     result: dict = {}
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             url = urlparse(self.path)
+            if url.path == START_PATH and auth_url:
+                self.send_response(302)
+                self.send_header("Location", auth_url)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             if url.path != CALLBACK_PATH:
                 self.send_error(404)
                 return
@@ -71,7 +115,10 @@ def receive_code(state: str, timeout: float = 300, port: int = LOOPBACK_PORT) ->
             server.handle_request()
     if "code" in result:
         return result["code"]
-    raise PublishError(f"sign-in failed: {result['error']}" if result else "sign-in timed out (no browser redirect)")
+    raise PublishError(f"sign-in failed: {result['error']}" if result else
+                       "sign-in timed out (the browser never came back). If the last page showed an address "
+                       "starting with http://127.0.0.1:8766/callback/, copy it and run: "
+                       "python -m studio connect <platform> --redirect-url \"<that address>\"")
 
 
 class TokenFile:

@@ -19,7 +19,7 @@ from pathlib import Path
 
 from . import PublishError
 from .http import Http
-from .oauth import REDIRECT_URI, TokenFile, expiry, pkce_pair, receive_code
+from .oauth import REDIRECT_URI, Pending, TokenFile, code_from_redirect, expiry, pkce_pair, receive_code
 
 SCOPE = "https://www.googleapis.com/auth/youtube.upload"
 AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
@@ -46,22 +46,32 @@ def tokens(cred_dir: Path) -> TokenFile:
     return TokenFile(Path(cred_dir) / "youtube_token.json")
 
 
-def connect(cred_dir: Path, open_url, http: Http | None = None, receive=receive_code) -> dict:
+def connect(cred_dir: Path, open_url, http: Http | None = None, receive=receive_code,
+            redirect_url: str | None = None) -> dict:
+    """Sign in via the browser. With `redirect_url`, finish the attempt in progress from a pasted address."""
     http = http or Http(timeout=60)
     c = client(cred_dir)
-    verifier, challenge = pkce_pair()
-    state = secrets.token_urlsafe(16)
-    open_url(AUTH_URL + "?" + urllib.parse.urlencode({
-        "client_id": c["client_id"], "redirect_uri": REDIRECT_URI, "response_type": "code", "scope": SCOPE,
-        "access_type": "offline", "prompt": "consent", "state": state,
-        "code_challenge": challenge, "code_challenge_method": "S256"}))
-    code = receive(state)
+    pending = Pending(Path(cred_dir) / "youtube_pending.json")
+    if redirect_url:
+        p = pending.load()
+        verifier, code = p["verifier"], code_from_redirect(redirect_url, p["state"])
+    else:
+        verifier, challenge = pkce_pair()
+        state = secrets.token_urlsafe(16)
+        pending.save(verifier, state)
+        auth_url = AUTH_URL + "?" + urllib.parse.urlencode({
+            "client_id": c["client_id"], "redirect_uri": REDIRECT_URI, "response_type": "code", "scope": SCOPE,
+            "access_type": "offline", "prompt": "consent", "state": state,
+            "code_challenge": challenge, "code_challenge_method": "S256"})
+        open_url(auth_url)
+        code = receive(state, auth_url=auth_url)
     resp = http.post_form(TOKEN_URL, {"client_id": c["client_id"], "client_secret": c["client_secret"],
                                       "code": code, "code_verifier": verifier, "grant_type": "authorization_code",
                                       "redirect_uri": REDIRECT_URI})
     data = resp.json()
     if resp.status != 200 or "access_token" not in data:
         raise PublishError(f"Google token exchange failed ({resp.status}): {resp.text()}")
+    pending.clear()
     return tokens(cred_dir).save(expiry(data))
 
 

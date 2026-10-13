@@ -261,7 +261,10 @@ def cmd_package(args) -> int:
 
 
 def _open_url(url: str) -> None:
-    _print("Opening the sign-in page in your browser. If nothing opens, paste this link into it:", url)
+    from .publish.oauth import START_URL
+
+    _print("Opening the sign-in page in your browser. If no tab opens, type this address into your browser:",
+           f"  {START_URL}", "(it forwards to the real sign-in page; it works for the next 10 minutes)")
     if sys.platform == "win32":
         import subprocess
 
@@ -275,7 +278,7 @@ def cmd_connect(args) -> int:
 
     mod = youtube if args.platform == "youtube" else tiktok
     try:
-        mod.connect(CREDENTIALS, _open_url)
+        mod.connect(CREDENTIALS, _open_url, redirect_url=args.redirect_url)
         lines = [f"Connected to {args.platform}. Sign-in saved in {CREDENTIALS} (git-ignored)."]
         if mod is tiktok:
             info = tiktok.creator_info(CREDENTIALS)
@@ -441,6 +444,7 @@ def build_parser() -> argparse.ArgumentParser:
     pk.add_argument("platform", choices=["youtube_shorts", "tiktok"])
     cn = sub.add_parser("connect", help="sign in to YouTube or TikTok once, for `publish`")
     cn.add_argument("platform", choices=["youtube", "tiktok"])
+    cn.add_argument("--redirect-url", help="finish a sign-in by pasting the browser's address after allowing access")
     pb = sub.add_parser("publish", help="post an AUTHORIZED render to YouTube Shorts or TikTok (asks first)")
     pb.add_argument("render_id")
     pb.add_argument("platform", choices=["youtube_shorts", "tiktok"])

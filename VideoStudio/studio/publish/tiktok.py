@@ -18,7 +18,7 @@ from pathlib import Path
 
 from . import PublishError
 from .http import Http
-from .oauth import REDIRECT_URI, TokenFile, expiry, pkce_pair, receive_code
+from .oauth import REDIRECT_URI, Pending, TokenFile, code_from_redirect, expiry, pkce_pair, receive_code
 
 SCOPES = "user.info.basic,video.publish"
 AUTH_URL = "https://www.tiktok.com/v2/auth/authorize/"
@@ -57,18 +57,29 @@ def _token_call(http: Http, fields: dict) -> dict:
     return expiry(data)
 
 
-def connect(cred_dir: Path, open_url, http: Http | None = None, receive=receive_code) -> dict:
+def connect(cred_dir: Path, open_url, http: Http | None = None, receive=receive_code,
+            redirect_url: str | None = None) -> dict:
+    """Sign in via the browser. With `redirect_url`, finish the attempt in progress from a pasted address."""
     http = http or Http(timeout=60)
     c = client(cred_dir)
-    verifier, challenge = pkce_pair(hex_challenge=True)
-    state = secrets.token_urlsafe(16)
-    open_url(AUTH_URL + "?" + urllib.parse.urlencode({
-        "client_key": c["client_key"], "scope": SCOPES, "response_type": "code", "redirect_uri": REDIRECT_URI,
-        "state": state, "code_challenge": challenge, "code_challenge_method": "S256"}))
-    code = receive(state)
-    return tokens(cred_dir).save(_token_call(http, {
+    pending = Pending(Path(cred_dir) / "tiktok_pending.json")
+    if redirect_url:
+        p = pending.load()
+        verifier, code = p["verifier"], code_from_redirect(redirect_url, p["state"])
+    else:
+        verifier, challenge = pkce_pair(hex_challenge=True)
+        state = secrets.token_urlsafe(16)
+        pending.save(verifier, state)
+        auth_url = AUTH_URL + "?" + urllib.parse.urlencode({
+            "client_key": c["client_key"], "scope": SCOPES, "response_type": "code", "redirect_uri": REDIRECT_URI,
+            "state": state, "code_challenge": challenge, "code_challenge_method": "S256"})
+        open_url(auth_url)
+        code = receive(state, auth_url=auth_url)
+    token = tokens(cred_dir).save(_token_call(http, {
         "client_key": c["client_key"], "client_secret": c["client_secret"], "code": code,
         "grant_type": "authorization_code", "redirect_uri": REDIRECT_URI, "code_verifier": verifier}))
+    pending.clear()
+    return token
 
 
 def _access_token(cred_dir: Path, http: Http) -> str:
