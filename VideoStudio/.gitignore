@@ -6,3 +6,4 @@ remotion/node_modules/
 remotion/out/
 music/tracks/*.wav
 tests/.artifacts/
+.venv/
