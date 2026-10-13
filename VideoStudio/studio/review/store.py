@@ -1,9 +1,10 @@
 """Approval and publication-authorization records, bound to the exact bytes reviewed.
 
-Nothing in this module (or anywhere in the studio) uploads, schedules or edits a
-profile. An authorization records that you approved this exact video file and this
-exact post text for one platform; `package()` then prepares a folder for you to upload
-by hand. Any change to the video or the post text makes earlier approvals stale.
+Nothing in this module uploads, schedules or edits a profile. An authorization records
+that you approved this exact video file and this exact post text for one platform;
+`package()` then prepares a folder for you to upload by hand, and the opt-in
+`studio.publish` commands use `publish_target()` / `record_publication()` to post it.
+Any change to the video or the post text makes earlier approvals stale.
 """
 from __future__ import annotations
 
@@ -119,7 +120,12 @@ class ReviewStore:
         status, auths, history = self._state(render_id, manifest)
         plan_path = self.render_dir(render_id) / manifest.get("plan_file", "plan.json")
         plan = json.loads(plan_path.read_text(encoding="utf-8")) if plan_path.is_file() else {}
+        publications = {}
+        for h in history:
+            if h["type"] == "publication":
+                publications.setdefault(h["platform"], []).append(h)
         return {**manifest, "status": status, "authorizations": auths, "history": history,
+                "publications": publications,
                 "content": self.content_hash(render_id, manifest),
                 "plan_summary": {k: plan.get(k) for k in ("duration", "segments", "layout") if k in plan}}
 
@@ -170,6 +176,29 @@ class ReviewStore:
                  "-b:v", "0", "-c:a", "libopus", "-b:a", "96k", tmp])
             tmp.replace(out)
         return out
+
+    def publish_target(self, render_id: str, platform: str, again: bool = False) -> dict:
+        """What may be posted: the authorized post text and the video path. Refuses without a
+        valid authorization, and refuses a second post of the same content unless `again`."""
+        detail = self.get(render_id)
+        auth = detail["authorizations"].get(platform)
+        if not auth or not auth["valid"]:
+            raise ReviewError(f"no valid authorization for {platform}")
+        done = [p for p in detail["publications"].get(platform, []) if p["content"] == detail["content"]]
+        if done and not again:
+            last = done[-1]
+            raise ReviewError(f"already posted to {platform} at {last['at']} "
+                              f"({last.get('url') or last.get('remote_id')}); pass --again to post it again")
+        return {"render_id": render_id, "platform": platform, "post": auth["post"], "authorization": auth,
+                "content": detail["content"], "video": self.render_dir(render_id) / detail["video"]["file"],
+                "duration": detail["video"]["duration"]}
+
+    def record_publication(self, render_id: str, platform: str, content: dict, result: dict) -> dict:
+        keep = ("status", "remote_id", "url", "visibility", "upload_status", "post_ids", "account", "options")
+        return self._append(render_id, {"type": "publication", "platform": platform,
+                                        **{k: result[k] for k in keep if k in result},
+                                        "at": _now(), "at_index": len(self._history(render_id)),
+                                        "content": content})
 
     def package(self, render_id: str, platform: str) -> Path:
         """A folder with the authorized video and post text, for uploading by hand."""

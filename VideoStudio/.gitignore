@@ -7,3 +7,4 @@ remotion/out/
 music/tracks/*.wav
 tests/.artifacts/
 .venv/
+credentials/

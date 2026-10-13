@@ -195,7 +195,7 @@ async function renderDetail(id) {
           h('section', {class: 'panel notice', testid: 'no-upload-notice'},
             h('strong', {text: 'Nothing is published from here. '}),
             'Approving and authorizing only record your decision for this exact video and post text. ' +
-            'Upload it yourself from the prepared package (python -m studio package <id> <platform>) or ask Claude to, after you confirm.'),
+            'Upload it yourself from the prepared package (python -m studio package <id> <platform>), or post it with python -m studio publish <id> <platform>, which asks you to type POST first.'),
           h('section', {class: 'panel'}, h('h2', {text: 'Your decision'}), notes,
             h('div', {class: 'row'},
               h('button', {class: 'btn good', testid: 'approve', text: 'Approve edit', on: {click: () => decide('approve')}}),

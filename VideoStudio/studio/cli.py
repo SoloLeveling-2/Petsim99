@@ -64,6 +64,15 @@ def cmd_audit(args) -> int:
     key = "set" if os.environ.get("ANTHROPIC_API_KEY") else "not set"
     rows.append(("Claude vision", "optional", f"anthropic package {'installed' if has_sdk else 'not installed'}; "
                                               f"ANTHROPIC_API_KEY {key}; only used with --vision (costs credits)"))
+    from .publish import CREDENTIALS
+
+    for label, stem in (("YouTube posting", "youtube"), ("TikTok posting", "tiktok")):
+        has_client = (CREDENTIALS / f"{stem}_client.json").is_file()
+        has_token = (CREDENTIALS / f"{stem}_token.json").is_file()
+        rows.append((label, "connected" if has_token else "optional",
+                     "signed in; posts only authorized renders via `publish`" if has_token
+                     else f"`python -m studio connect {stem}` after saving credentials/{stem}_client.json"
+                     if has_client else f"not set up (see studio/publish/{stem}.py for the one-time setup)"))
     rows.append(("vidIQ / Metricool / Descript", "via Claude Code",
                  "MCP connectors are used from a Claude Code session (/mcp to sign in); the studio never calls them"))
     width = max(len(r[0]) for r in rows)
@@ -251,6 +260,115 @@ def cmd_package(args) -> int:
     return 0
 
 
+def _open_url(url: str) -> None:
+    _print("Opening the sign-in page in your browser. If nothing opens, paste this link into it:", url)
+    if sys.platform == "win32":
+        import subprocess
+
+        subprocess.Popen(["explorer.exe", url])  # not elevated, unlike a browser started from this shell
+    else:
+        webbrowser.open(url)
+
+
+def cmd_connect(args) -> int:
+    from .publish import CREDENTIALS, PublishError, tiktok, youtube
+
+    mod = youtube if args.platform == "youtube" else tiktok
+    try:
+        mod.connect(CREDENTIALS, _open_url)
+        lines = [f"Connected to {args.platform}. Sign-in saved in {CREDENTIALS} (git-ignored)."]
+        if mod is tiktok:
+            info = tiktok.creator_info(CREDENTIALS)
+            allowed = [k for k, v in tiktok.VISIBILITY.items() if v in (info.get("privacy_level_options") or [])]
+            lines.append(f"Account: @{info.get('creator_username')} · visibility allowed: {', '.join(allowed) or 'none'}")
+    except PublishError as exc:
+        _print(f"Not connected: {exc}")
+        return 1
+    _print(*lines)
+    return 0
+
+
+def cmd_publish(args) -> int:
+    import hashlib
+
+    from .publish import CREDENTIALS, PublishError, tiktok, youtube
+    from .review.store import ReviewError, ReviewStore
+
+    store = ReviewStore(Path(args.workspace))
+    try:
+        target = store.publish_target(args.render_id, args.platform, again=args.again)
+    except ReviewError as exc:
+        _print(f"Not posted: {exc}.")
+        return 1
+    data = target["video"].read_bytes()
+    if hashlib.sha256(data).hexdigest() != target["content"]["video_sha256"]:
+        _print("Not posted: the video file no longer matches what you authorized. Review it again.")
+        return 1
+    post, paid = target["post"], args.paid_promotion == "yes"
+    visibility = args.visibility or "public"
+    try:
+        if args.paid_promotion is None:
+            raise PublishError("say whether anyone paid or rewarded you for showing Auto Ranking: "
+                               "--paid-promotion yes|no")
+        if args.platform == "youtube_shorts":
+            if args.made_for_kids is None:
+                raise PublishError("YouTube requires an audience choice: --made-for-kids yes|no")
+            body = youtube.build_body(post, visibility, args.made_for_kids == "yes", paid)
+            if not args.dry_run and not youtube.tokens(CREDENTIALS).load():
+                raise PublishError("YouTube is not connected; run `python -m studio connect youtube` first")
+            account = "your signed-in YouTube channel"
+            options = {"visibility": visibility, "made_for_kids": args.made_for_kids == "yes", "paid_promotion": paid}
+            summary = [f"  Title:       {body['snippet']['title']}",
+                       f"  Visibility:  {visibility} · made for kids: {args.made_for_kids} · "
+                       f"paid promotion: {args.paid_promotion}"]
+        else:
+            if not tiktok.tokens(CREDENTIALS).load():
+                raise PublishError("TikTok is not connected; run `python -m studio connect tiktok` first")
+            creator = tiktok.creator_info(CREDENTIALS)
+            info = tiktok.build_post_info(post, visibility, creator, target["duration"], paid)
+            account = f"@{creator.get('creator_username')}"
+            options = {"visibility": visibility, "paid_promotion": paid, "privacy_level": info["privacy_level"]}
+            summary = [f"  Caption:     {info['title'].splitlines()[0]} ...",
+                       f"  Visibility:  {visibility} · disclosure: your brand"
+                       f"{' + branded content' if paid else ''}"]
+    except PublishError as exc:
+        _print(f"Not posted: {exc}")
+        return 1
+    _print(f"About to post to {args.platform} as {account}:",
+           f"  Video:       {target['video']} ({len(data) / 1e6:.1f} MB, {target['duration']:.1f} s)", *summary)
+    if args.dry_run:
+        _print("Dry run: nothing was posted.")
+        return 0
+    if not args.yes:
+        try:
+            answer = input("Type POST to publish now: ")
+        except EOFError:
+            answer = ""
+        if answer.strip() != "POST":
+            _print("Cancelled: nothing was posted.")
+            return 1
+    try:
+        result = (youtube.upload(CREDENTIALS, data, body) if args.platform == "youtube_shorts"
+                  else tiktok.upload(CREDENTIALS, data, info))
+    except PublishError as exc:
+        _print(f"Not posted: {exc}")
+        return 1
+    result.setdefault("status", "published")
+    result.update(account=account, options=options)
+    store.record_publication(args.render_id, args.platform, target["content"], result)
+    lines = [f"Posted to {args.platform}: {result.get('url') or 'publish id ' + result['remote_id']} "
+             f"({result['status']})."]
+    if args.platform == "youtube_shorts" and result.get("visibility") not in (None, visibility):
+        lines.append(f"YouTube set the visibility to {result.get('visibility')}.")
+    if args.platform == "youtube_shorts" and visibility != "private":
+        lines.append("If Google locks it as private, the API project has not passed YouTube's audit yet; "
+                     "you can still see it in YouTube Studio.")
+    if result["status"] == "processing":
+        lines.append("TikTok is still processing it; check the TikTok app in a few minutes.")
+    _print(*lines, "Recorded in the review history.")
+    return 0
+
+
 def cmd_verify_source(args) -> int:
     ws = _workspace(args)
     sid = _resolve_source(ws, args.source)
@@ -321,6 +439,19 @@ def build_parser() -> argparse.ArgumentParser:
     pk = sub.add_parser("package", help="prepare an AUTHORIZED render for manual upload (uploads nothing)")
     pk.add_argument("render_id")
     pk.add_argument("platform", choices=["youtube_shorts", "tiktok"])
+    cn = sub.add_parser("connect", help="sign in to YouTube or TikTok once, for `publish`")
+    cn.add_argument("platform", choices=["youtube", "tiktok"])
+    pb = sub.add_parser("publish", help="post an AUTHORIZED render to YouTube Shorts or TikTok (asks first)")
+    pb.add_argument("render_id")
+    pb.add_argument("platform", choices=["youtube_shorts", "tiktok"])
+    pb.add_argument("--visibility", choices=["public", "unlisted", "private", "friends", "followers"],
+                    help="default public; unlisted is YouTube-only, friends/followers TikTok-only")
+    pb.add_argument("--made-for-kids", choices=["yes", "no"], help="YouTube audience setting (required for YouTube)")
+    pb.add_argument("--paid-promotion", choices=["yes", "no"],
+                    help="did anyone pay or reward you for showing Auto Ranking? (required)")
+    pb.add_argument("--dry-run", action="store_true", help="show what would be posted, post nothing")
+    pb.add_argument("--yes", action="store_true", help="skip typing POST to confirm")
+    pb.add_argument("--again", action="store_true", help="allow posting the same video to the same platform twice")
     vs = sub.add_parser("verify-source", help="prove the original recording is unchanged (full SHA-256)")
     vs.add_argument("source")
     m = sub.add_parser("music", help="check or generate the licensed music library")
@@ -330,6 +461,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 COMMANDS = {"audit": cmd_audit, "find": cmd_find, "ingest": cmd_ingest, "analyze": cmd_analyze, "plan": cmd_plan,
             "render": cmd_render, "run": cmd_run, "review": cmd_review, "package": cmd_package,
+            "connect": cmd_connect, "publish": cmd_publish,
             "verify-source": cmd_verify_source, "music": cmd_music}
 
 
