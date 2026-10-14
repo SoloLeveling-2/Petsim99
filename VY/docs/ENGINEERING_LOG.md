@@ -2,6 +2,36 @@
 
 Newest first. Each entry: what changed, why, evidence, tests, limits, rollback.
 
+## 2026-10-14 — v1.1.8: 12 reproduced fixes (Crystal, Fishing scheduling, persistence)
+
+**Why.** A five-area review workflow ran (Crystal, Fishing/P0-01, areas, consumables, lifecycle; each with two adversarial verifiers). The Crystal and Fishing reviewers finished: 6 and 7 findings, each reproduced in the reviewer's extract harness. The other agents hit the session limit and were resumed. I re-reproduced every finding I chose to fix in the **whole-file** harness before editing (red), then fixed it (green).
+
+**Red on v1.1.7 (whole file, mocked Lune):**
+- `crystal-zero-drop-tail`: sticky halt "no collection credit".
+- `crystal-stars-complete`: 41 keys spent after stars complete.
+- `crystal-travel-refused`: hold forever, pets unequipped.
+- `crystal-retain-strand`: stops with 140 keys left at reserve 100.
+- `crystal-protect-setup`: held diamond quest farmed 0 → 4 before the setup formed.
+- `crystal-rankup`: one World2Teleport right after the rank-up.
+- `persist-race`: saved Minigames OFF became ON.
+- `fishing-slow-travel`: DEFERRED after 1 cast, 0 catches.
+- `fishing-busy-debris`: ABORTED "no observed bite after cast".
+
+**Change.** 22 exact single-match edits in `VY/tools/patch_v118.py`, which rebuilds the file byte-identically. Output: `VY/VY_AutoRank-v1.1.8.luau`, SHA-256 `5E623657F368F5E61218D30B63530575645493948AE7DC1708D0B1CB988E2F69`, 4,795 lines, CRLF. Details in `VY_AUTORANK_v1.1.8_NOTES.md`.
+
+**Green.** 21/21 scenarios pass on v1.1.8, three consecutive runs. On v1.1.7, exactly the 9 scenarios above fail. `luau-compile` OK. `luau-analyze` diagnostics are identical to v1.1.7 apart from shifted line numbers. Selene: 0 errors, the same 6 warnings.
+
+**Deliberately not changed.** These need live evidence first:
+- fishing-04: re-cast while an old line exists; could stall casting if the live rod keeps a hidden line.
+- fishing-05: instance flag set before the model replicates.
+- fishing-06: one `false` tap reply aborts the visit.
+- The 45 s destination timeout re-sends a world request when a place load takes longer.
+- Crystal low-confidence items: empty slot-1 candidate set when slot 2 holds a collect quest; exact `workspace.Map` name; one-shot pet restore.
+
+**Limits.** Offline only. The fakes encode VY's own protocol assumptions. Live acceptance stays user-run (P0-01, then P1-03).
+
+**Rollback.** Install v1.1.7 again. The saved-file format is unchanged.
+
 ## 2026-10-14 — Cloud session onboarding (Claude Code)
 
 **Context.** The user pasted the permanent handoff and later the full v1.1.7 source. This session runs in a Linux cloud container, so the Windows project, `Verify-Handoff.ps1`, Potassium autoexec and the Roblox client are not reachable. All live steps are written as user-run procedures.
