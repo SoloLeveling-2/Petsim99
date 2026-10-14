@@ -1,0 +1,4 @@
+std = "roblox_exec"
+
+[lints]
+multiple_statements = "allow"

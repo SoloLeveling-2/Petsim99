@@ -1,0 +1,3 @@
+# The delivered VY AutoRank source is CRLF; keep its bytes (and SHA-256) exact.
+VY/source/*.luau -text
+VY/VY_AutoRank-*.luau -text
