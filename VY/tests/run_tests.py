@@ -29,6 +29,11 @@ SCENARIOS = [
 ]
 for edge in ["slow-replication", "no-credit", "refused", "not-ready", "stars-keys"]:
     SCENARIOS.append(("crystal-" + edge, ["crystal_edge.luau", SOURCE, edge]))
+SCENARIOS += [
+    ("fishing-current-prompt", ["fishing_flow.luau", SOURCE, "current"]),
+    ("fishing-legacy-gamebar", ["fishing_flow.luau", SOURCE, "legacy"]),
+    ("fishing-cross-world", ["fishing_flow.luau", SOURCE, "current", "travel"]),
+]
 
 
 def main():

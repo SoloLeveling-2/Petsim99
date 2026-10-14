@@ -78,6 +78,7 @@ function W.build(opts)
     W.best = best
     local zones = {
         ["Castle"] = {_id = "Castle", ZoneName = "Castle", ZoneNumber = 3, WorldNumber = 1, Currency = "Coins"},
+        ["Fishing Pier"] = {_id = "Fishing Pier", ZoneName = "Fishing Pier", ZoneNumber = 27, WorldNumber = 1, Currency = "Coins"},
         [best.id] = {_id = best.id, ZoneName = best.id, ZoneNumber = best.number, WorldNumber = best.world, Currency = "Coins"},
     }
     W.zones = zones
@@ -201,8 +202,8 @@ function W.build(opts)
     client("FruitCmds", {})
     client("FlexibleFlagCmds", {Consume = function() return false, "no flag" end})
     client("RandomEventCmds", {GetActive = function() return {} end})
-    client("InstancingCmds", {IsInInstance = function() return false end, GetInstanceID = function() return nil end,
-        Get = function() return nil end})
+    W.instancing = client("InstancingCmds", {IsInInstance = function() return W.instance ~= nil end,
+        GetInstanceID = function() return W.instance end, Get = function() return nil end})
     client("RebirthCmds", {GetNextRebirth = function() return nil end})
     client("EnchantCmds", {GetPower = function() return 1 end})
     client("UpgradeCmds", {GetPower = function() return 1 end})
@@ -239,6 +240,7 @@ function W.build(opts)
     for _, n in ipairs({"Pets_UnequipAll", "Instancing_FireCustomFromClient"}) do node("RemoteEvent", n, remotes) end
     for _, n in ipairs({"CrystalKey_Unlock", "Instancing_InvokeCustomFromClient"}) do node("RemoteFunction", n, remotes) end
 
+    W.ws, W.things, W.character, W.rs = ws, things, character, rs
     W.installServer(opts)
     W.game = game
     return game
