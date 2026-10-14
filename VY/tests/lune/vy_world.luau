@@ -131,12 +131,18 @@ function W.build(opts)
     -- Directory: rank pools copied from the official Ranks data shape (rank 12 slot pools).
     local pool1 = {{Type = 21, Amount = 1700, Weight = 1}, {Type = 14, Amount = 32, Weight = 1},
         {Type = 15, Amount = 32, Weight = 1}, {Type = 9, Amount = 450, Weight = 1}}
-    local rankId = tostring(save.Rank) .. " | Test Rank"
-    local ranks = {[rankId] = {Title = "Test Rank", _id = rankId,
-        Rewards = {{StarsRequired = 2}, {StarsRequired = 400}, {StarsRequired = 400}},
-        Goals = {pool1, {{Type = 21, Amount = 2200}, {Type = 14, Amount = 40}, {Type = 15, Amount = 40}, {Type = 20, Amount = 60}},
-            {{Type = 9, Amount = 900}, {Type = 21, Amount = 3000}, {Type = 34, Amount = 10}},
-            {{Type = 9, Amount = 1500}, {Type = 21, Amount = 4000}, {Type = 42, Amount = 3}}}}}
+    -- Every rank uses the same pools (shape of the official rank 12-14 pools).
+    local ranks = {}
+    local function rankIdFor(n) return tostring(n) .. " | Test Rank" end
+    for n = save.Rank, save.Rank + 2 do
+        ranks[rankIdFor(n)] = {Title = "Test Rank " .. n, _id = rankIdFor(n),
+            Rewards = {{StarsRequired = 2}, {StarsRequired = 400}, {StarsRequired = 400}},
+            Goals = {pool1, {{Type = 21, Amount = 2200}, {Type = 14, Amount = 40}, {Type = 15, Amount = 40}, {Type = 20, Amount = 60}},
+                {{Type = 9, Amount = 900}, {Type = 21, Amount = 3000}, {Type = 34, Amount = 10}},
+                {{Type = 9, Amount = 1500}, {Type = 21, Amount = 4000}, {Type = 42, Amount = 3}}}}
+    end
+    W.totalStars = opts.totalStars or 802
+    local rankId = rankIdFor(save.Rank)
     W.rankId = rankId
     local eggs = {["Egg One"] = {name = "Egg One", pets = {{"Cat"}}}}
 
@@ -155,7 +161,10 @@ function W.build(opts)
     local library = node("Folder", "Library", rs)
     local clientScript = moduleScript("Client", library, {})
     local function client(name, value) moduleScript(name, clientScript, value) return value end
-    client("Save", {Get = function() return save end})
+    client("Save", {Get = function()
+        if W.saveReadyAt and R.vclock() < W.saveReadyAt then return nil end -- data still loading after a teleport
+        return save
+    end})
     client("Network", {
         Fire = function(name, ...) record("Fire", name, ...) end,
         Invoke = function(name, ...) return record("Invoke", name, ...) end,
@@ -221,8 +230,8 @@ function W.build(opts)
     moduleScript("CalcGatePrice", balancing, function() return 100 end)
     local util = node("Folder", "Util", library)
     moduleScript("RanksUtil", util, {
-        RankIDFromNumber = function(n) return n == save.Rank and rankId or nil end,
-        GetTotalStarsRequired = function() return 802 end,
+        RankIDFromNumber = function(n) return ranks[rankIdFor(n)] and rankIdFor(n) or nil end,
+        GetTotalStarsRequired = function() return W.totalStars end,
     })
     moduleScript("ZonesUtil", util, {
         GetInteractFolder = function(id) return interactByZone[id] end,
@@ -286,7 +295,8 @@ local function complete(slot)
     end
     W.event("goal-complete", {slot = slot, type = g.Type, next = nextType})
     if nextType then
-        goals[key] = {UID = newUid(), Type = nextType, Amount = g.Amount, Progress = 0, Stars = slot}
+        local amount = W.opts.rollAmounts and W.opts.rollAmounts[slot] or g.Amount
+        goals[key] = {UID = newUid(), Type = nextType, Amount = amount, Progress = 0, Stars = slot}
     else
         goals[key] = nil
     end
@@ -337,7 +347,13 @@ function W.installServer(opts)
         -- Farming the best area advances breakable quests (incl. the held ones).
         if W.zoneAt(W.root.Position) == W.best.id then
             credit(function(g) return g.Type == 21 or g.Type == 1 end, 5)
-            credit(function(g) return g.Type == 9 end, 1)
+            -- Diamond quests advance only when pets are sent to diamond breakables.
+            local diamonds = false
+            for _, uid in pairs(map) do
+                local model = W.things.Breakables:FindFirstChild(tostring(uid))
+                if model and string.find(tostring(model:GetAttribute("BreakableID")), "Diamond", 1, true) then diamonds = true end
+            end
+            if diamonds then credit(function(g) return g.Type == 9 end, 1) end
         end
     end
     h["Eggs_RequestPurchase"] = function(_, amount)

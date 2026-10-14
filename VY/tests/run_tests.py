@@ -27,13 +27,22 @@ SCENARIOS = [
     ("crystal-flow", ["crystal_flow.luau", SOURCE]),
     ("crystal-travel", ["crystal_travel.luau", SOURCE]),
 ]
-for edge in ["slow-replication", "no-credit", "refused", "not-ready", "stars-keys"]:
+for edge in ["slow-replication", "no-credit", "refused", "not-ready", "stars-keys",
+             "zero-drop-tail", "stars-complete", "travel-refused", "retain-strand", "protect-setup"]:
     SCENARIOS.append(("crystal-" + edge, ["crystal_edge.luau", SOURCE, edge]))
 SCENARIOS += [
-    ("fishing-current-prompt", ["fishing_flow.luau", SOURCE, "current"]),
+    ("crystal-rankup", ["crystal_rankup.luau", SOURCE]),
+    ("persist-race", ["persist_race.luau", SOURCE]),
+    ("fishing-current-prompt", ["fishing_flow.luau", SOURCE]),
     ("fishing-legacy-gamebar", ["fishing_flow.luau", SOURCE, "legacy"]),
-    ("fishing-cross-world", ["fishing_flow.luau", SOURCE, "current", "travel"]),
+    ("fishing-cross-world", ["fishing_flow.luau", SOURCE, "travel"]),
+    ("fishing-slow-travel", ["fishing_flow.luau", SOURCE, "travel", "slow"]),
+    ("fishing-busy-debris", ["fishing_flow.luau", SOURCE, "debris"]),
 ]
+# Scenarios added in v1.1.8 that reproduce v1.1.7 defects (expected to FAIL on v1.1.7).
+V117_KNOWN_RED = {"crystal-zero-drop-tail", "crystal-stars-complete", "crystal-travel-refused",
+                  "crystal-retain-strand", "crystal-protect-setup", "crystal-rankup", "persist-race",
+                  "fishing-slow-travel", "fishing-busy-debris"}
 
 
 def main():
@@ -65,6 +74,8 @@ def main():
         print(f"{status}  {name.ljust(width)}  {detail}")
     failed = [r for r in results if r[1] is False]
     print(f"\n{len(results) - len(failed)}/{len(results)} passed" + (" (mocked runtime, not live PS99)" if not failed else ""))
+    if failed and all(r[0] in V117_KNOWN_RED for r in failed):
+        print("all failures are the documented v1.1.7 defects fixed in v1.1.8 (red baseline)")
     return 1 if failed else 0
 
 
