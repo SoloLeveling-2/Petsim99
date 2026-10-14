@@ -6610,13 +6610,15 @@ do
     local plan = {status = "not checked", ready = false, slots = {}, blockers = {}, keys = 0}
     M.plan = plan
 
-    -- Active quests by slot. Save.Goals is keyed by slot (VY AutoRank iterates
-    -- `for tier, g in pairs(save.Goals)`; RankPilot keeps the same key).
+    -- Active quests by slot. The game's own quest panel places a goal by
+    -- goal.Stars (1 Easy .. 4 Extreme), not by the Save.Goals key (captured
+    -- saves show key == Stars, key type unproven), so Stars wins when valid.
     function M.readSlots(data)
         local slots = {}
         if type(data) ~= "table" or type(data.Goals) ~= "table" then return slots end
         for key, g in pairs(data.Goals) do
-            local slot = tonumber(key)
+            local stars = type(g) == "table" and tonumber(g.Stars) or nil
+            local slot = (stars and stars >= 1 and stars <= 4 and stars % 1 == 0) and stars or tonumber(key)
             if slot and type(g) == "table" and g.Type ~= nil then
                 slots[slot] = {slot = slot, type = tonumber(g.Type) or g.Type, amount = tonumber(g.Amount) or 0,
                     progress = tonumber(g.Progress) or 0, uid = g.UID, stars = tonumber(g.Stars) or 1}
@@ -6673,8 +6675,14 @@ do
         if not M.COLLECT[first.type] then
             return false, "slot 1 holds " .. (M.NAMES[first.type] or tostring(first.type)) .. "; finish it to reroll", {}
         end
+        local also = ""
+        for slot, q in pairs(slots) do
+            if slot >= 2 and M.COLLECT[q.type] and q.progress < q.amount then
+                also = "; slot " .. slot .. " " .. M.COLLECT[q.type] .. " also advances"
+            end
+        end
         return true, "READY: slot 1 = " .. M.COLLECT[first.type] .. " (" .. first.progress .. "/" .. first.amount
-            .. "); breakable quests are held in other slots", {}
+            .. "); breakable quests are held in other slots" .. also, {}
     end
 
     function M.refreshPlan(force)
@@ -6691,22 +6699,40 @@ do
     end
 
     -- ------------------------------------------------------------ runner
-    -- Opt-in, spends Crystal Keys. Opens the chest only with a request that is
-    -- either evidenced in readable source (EVIDENCED_OPEN, nil until found) or
-    -- was recorded from the user's own manual chest opening (recorder).
-    M.EVIDENCED_OPEN = nil
-    M.defaults = {CrystalKeyMode = false, CrystalKeyReserve = 0, CrystalOpenSeconds = 1.5}
+    -- Opt-in, spends Crystal Keys. Opens the chest with a request the user
+    -- recorded from their own manual opening (recorder) or, if none, the
+    -- request confirmed by a live one-key probe (VY AutoRank handoff,
+    -- 2026-10-14): Network.Invoke("CrystalKey_Unlock") with NO arguments took
+    -- full keys 15076 -> 15075 and slot-1 potions 8/32 -> 9/32 after a
+    -- replication delay. One key per request.
+    M.EVIDENCED_OPEN = {name = "CrystalKey_Unlock", method = "Invoke", args = {}}
+    M.CREDIT_WAIT = 10
+    M.defaults = {CrystalKeyMode = false, CrystalKeyReserve = 100, CrystalOpenSeconds = 1.5}
     M.features = {
         {key = "CrystalKeyMode", name = "Crystal Key rank-up mode", status = "EXPERIMENTAL",
-            evidence = "Slot pools: Directory.Ranks; chest pad: Map['3 | Castle'].INTERACT.CrystalChest.Pad (idonthaveoneatm 2025-09); open request: taught by recorder"},
+            evidence = "Slot pools: Directory.Ranks; chest pad: Map['3 | Castle'].INTERACT.CrystalChest.Pad (idonthaveoneatm 2025-09); open: CrystalKey_Unlock() live one-key probe (VY handoff) or a taught request"},
     }
     local runState = {phase = "off", pending = nil, misses = 0, nextOpen = 0, opened = 0, pad = nil}
     M.runState = runState
 
     function M.opener()
-        if M.EVIDENCED_OPEN then return M.EVIDENCED_OPEN end
         local recorder = Modules.byId.recorder
-        return recorder and recorder.learned("crystalChest") or nil
+        local taught = recorder and recorder.learned("crystalChest") or nil
+        return taught or M.EVIDENCED_OPEN
+    end
+
+    -- What counts as a confirmed open: the key stack shrank, or slot-1
+    -- collect progress rose, or slot 1 rolled over (new UID), or stars rose.
+    -- Keys Mastery can keep the key (5-10%), so key count alone is not enough.
+    local function snapshot()
+        local first = plan.slots[1]
+        local data = saveData(false)
+        return {keys = plan.keys, uid = first and first.uid, progress = first and first.progress or 0,
+            stars = type(data) == "table" and tonumber(data.RankStars) or 0}
+    end
+    function M.credited(before, after)
+        return after.keys < before.keys or after.uid ~= before.uid or after.progress > before.progress
+            or after.stars > before.stars
     end
 
     function M.findPad()
@@ -6736,17 +6762,17 @@ do
     function M.runner()
         if not Config.CrystalKeyMode or not state.running then M.release("mode off") return end
         if now() - (plan.checkedAt or 0) >= 5 or runState.pending then M.refreshPlan(runState.pending ~= nil) end
-        -- Settle the previous open first: the key stack must shrink.
+        -- Settle the previous open first; Save replicates after a delay.
         if runState.pending then
-            if plan.keys < runState.pending.before then
+            if M.credited(runState.pending.before, snapshot()) then
                 runState.opened, runState.misses, runState.pending = runState.opened + 1, 0, nil
                 Modules.note("crystal", "open", "confirmed", "Crystal Chest opened (keys " .. plan.keys .. ")")
-            elseif now() - runState.pending.sent > 6 then
+            elseif now() - runState.pending.sent > M.CREDIT_WAIT then
                 runState.pending, runState.misses = nil, runState.misses + 1
-                Modules.note("crystal", "open", "failed", "no key consumed")
+                Modules.note("crystal", "open", "failed", "no key used and no quest credit")
                 if runState.misses >= 3 then
                     Config.CrystalKeyMode = false
-                    M.release("3 opens consumed no key: mode switched off (re-teach the chest action)")
+                    M.release("3 opens gave no key use or credit: mode switched off")
                     log("Crystal mode stopped: " .. runState.reason, "SAFEGUARD")
                     return
                 end
@@ -6756,7 +6782,7 @@ do
         end
         local opener = M.opener()
         local spare = plan.keys - math.max(0, tonumber(Config.CrystalKeyReserve) or 0)
-        if not opener then M.release("teach the chest action first (Auto Rank page)") return end
+        if not opener then M.release("no chest request available") return end
         if spare < 1 then M.release("no spare Crystal Keys") return end
         if not plan.ready then M.release("setup: " .. tostring(plan.status)) return end
         if (state.world and state.world.number) ~= 1 then M.release("go to World 1 (Castle) to use the Crystal Chest") return end
@@ -6774,13 +6800,18 @@ do
         end
         runState.phase = "opening"
         if now() < runState.nextOpen then return end
-        local recorder = Modules.byId.recorder
-        if not recorder then M.release("recorder unavailable") return end
-        local args, why = recorder.resolve(opener.args)
-        if not args then M.release(tostring(why)) return end
+        local args, why = {}, nil
+        if #opener.args > 0 then
+            local recorder = Modules.byId.recorder
+            if not recorder then M.release("recorder unavailable") return end
+            args, why = recorder.resolve(opener.args)
+            if not args then M.release(tostring(why)) return end
+        end
         runState.nextOpen = now() + math.max(0.5, tonumber(Config.CrystalOpenSeconds) or 1.5)
+        M.refreshPlan(true)
+        local before = snapshot()
         local accepted = Modules.call("crystal", "open", opener.name, args, opener.method == "Invoke", 0.5)
-        if accepted then runState.pending = {before = plan.keys, sent = now()} end
+        if accepted then runState.pending = {before = before, sent = now()} end
     end
 
     function M.tick()
@@ -6813,13 +6844,13 @@ do
         h.toggle(p, "CrystalKeyMode", "Crystal Key rank-up mode",
             "Spends Crystal Keys. Pauses farming while the setup is held; stops if keys are not consumed")
         h.toolbar(p, {
-            {"1) TEACH CHEST OPEN", function()
+            {"TEACH CHEST OPEN (optional)", function()
                 local recorder = Modules.byId.recorder
                 if not recorder then return end
                 local ok, why = recorder.start(20)
                 log(ok and "Open the Crystal Chest once by hand within 20 s" or ("Recorder: " .. tostring(why)), "SYSTEM")
             end},
-            {"2) SAVE CHEST ACTION", function()
+            {"SAVE TAUGHT ACTION", function()
                 local recorder = Modules.byId.recorder
                 local capture = recorder and recorder.find({"chest", "crystal", "key"})
                 if capture and recorder.learn("crystalChest", capture) then
@@ -6841,9 +6872,9 @@ do
         end
         ui.crystalSlots.Text = "Slots  " .. (#parts > 0 and table.concat(parts, "   ") or "none")
         local opener = M.opener()
-        ui.crystalRun.Text = string.format("Mode: %s%s  |  opened %d  |  chest action: %s", runState.phase,
+        ui.crystalRun.Text = string.format("Mode: %s%s  |  opened %d  |  chest request: %s", runState.phase,
             runState.reason and runState.phase == "off" and (" (" .. runState.reason .. ")") or "", runState.opened,
-            opener and opener.name or "not taught")
+            opener == M.EVIDENCED_OPEN and "CrystalKey_Unlock() (live-confirmed)" or (opener and opener.name or "none"))
     end
     Modules.define(M)
 end)()

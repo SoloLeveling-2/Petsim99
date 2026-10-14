@@ -61,6 +61,8 @@ print("PASS test_crystal")
 run_modules(r'''
 local crystal, recorder = Modules.byId.crystal, Modules.byId.recorder
 assert(Config.CrystalKeyMode == false, "spending mode is OFF by default")
+assert(Config.CrystalKeyReserve == 100, "100-key reserve by default (VY AutoRank's protected setting)")
+Config.CrystalKeyReserve = 0
 -- World 1 map with the Castle chest pad (path from idonthaveoneatm 2025-09).
 local pad = {Name = "Pad", Parent = true, Position = Vector3.new(100, 0, 0), CFrame = CFrame.new(100, 0, 0),
   IsA = function(_, c) return c == "BasePart" end, FindFirstChild = function() return nil end}
@@ -77,15 +79,46 @@ local root = currentRoot()
 root.Position = Vector3.new(0, 0, 0)
 local plusMeta = {__add = function(a, b) return {X = a.X + b.X, Y = a.Y + b.Y, Z = a.Z + b.Z} end}
 pad.CFrame = setmetatable({X = 100, Y = 0, Z = 0}, plusMeta)
-fake.save = {Rank = 30, Goals = {[1] = {Type = 14, Amount = 70, Progress = 3}, [2] = {Type = 21, Amount = 3500, Progress = 9},
-    [3] = {Type = 9, Amount = 900, Progress = 0}}, Inventory = {Misc = {k = {id = "Crystal Key", _am = 3}}}}
+-- Save keyed by strings; Stars decides the slot.
+fake.save = {Rank = 30, RankStars = 5, Goals = {["1"] = {Type = 14, Amount = 70, Progress = 3, Stars = 1, UID = "s1"},
+    ["2"] = {Type = 21, Amount = 3500, Progress = 9, Stars = 2, UID = "s2"},
+    ["3"] = {Type = 9, Amount = 900, Progress = 0, Stars = 3, UID = "s3"}},
+    Inventory = {Misc = {k = {id = "Crystal Key", _am = 3}}}}
 state.world = {number = 1}
 state.running = true
 Config.CrystalKeyMode = true
--- Not taught yet: nothing is sent, farming is not held.
+-- Wrong world: released, no request.
+state.world = {number = 2}
 tickModule("crystal")
-assert(crystal.runState.phase == "off" and crystal.runState.reason:find("teach", 1, true) and not state.farmHold)
--- Teach: the user opens the chest by hand while recording.
+assert(crystal.runState.reason:find("World 1", 1, true) and sent("CrystalKey_Unlock") == 0 and not state.farmHold)
+state.world = {number = 1}
+-- No teaching needed: first tick moves onto the pad and holds farming.
+advance(1) tickModule("crystal")
+assert(state.farmHold == true and crystal.runState.phase == "moving to chest", crystal.runState.phase)
+root.Position = Vector3.new(100, 0, 0)
+fake.responses.CrystalKey_Unlock = true
+advance(2) tickModule("crystal")
+local r = lastRequest("CrystalKey_Unlock")
+assert(r and #r.args == 0 and r.invoke == true, "live-confirmed request: Invoke with no arguments")
+-- Replication arrives late: nothing changes for a few seconds -> still pending, no second request.
+advance(3) tickModule("crystal")
+assert(sent("CrystalKey_Unlock") == 1 and crystal.runState.pending ~= nil, "waits for replicated credit")
+-- Keys Mastery kept the key: only quest progress moves -> still confirmed.
+fake.save.Goals["1"].Progress = 5
+advance(1) tickModule("crystal")
+assert(crystal.runState.opened == 1 and Modules.stat("crystal", "open").confirmed == 1, "credit without key use counts")
+advance(2) tickModule("crystal")
+assert(sent("CrystalKey_Unlock") == 2)
+-- Key consumed, no progress yet -> confirmed by the key count.
+fake.save.Inventory.Misc.k._am = 2
+advance(1) tickModule("crystal")
+assert(crystal.runState.opened == 2)
+-- Three opens that change nothing switch the mode off and release the hold.
+for _ = 1, 3 do advance(2) tickModule("crystal") advance(11) tickModule("crystal") end
+assert(Config.CrystalKeyMode == false and state.farmHold == false, crystal.runState.reason)
+-- A taught request overrides the evidenced one.
+Config.CrystalKeyMode = true
+crystal.runState.misses = 0
 local net = {Invoke = function(name, ...) return true end}
 fake.clients.Network = net
 state.clients = fake.clients
@@ -93,37 +126,18 @@ assert(recorder.start(20))
 net.Invoke("ChestThing_Open", "k")
 recorder.stop()
 assert(recorder.learn("crystalChest", recorder.find({"chest"})))
--- Wrong world: released, no request.
-state.world = {number = 2}
-advance(1) tickModule("crystal")
-assert(crystal.runState.reason:find("World 1", 1, true) and sent("ChestThing_Open") == 0)
-state.world = {number = 1}
--- First tick moves onto the pad and holds farming.
-advance(1) tickModule("crystal")
-assert(state.farmHold == true and crystal.runState.phase == "moving to chest")
-root.Position = Vector3.new(100, 0, 0)
+assert(crystal.opener().name == "ChestThing_Open")
 fake.responses.ChestThing_Open = true
 advance(2) tickModule("crystal")
-local r = lastRequest("ChestThing_Open")
-assert(r and r.args[1] == "k" and r.invoke == true, "replays the taught request with the current key UID")
--- Key consumed -> confirmed; then the next open.
-fake.save.Inventory.Misc.k._am = 2
-advance(2) tickModule("crystal")
-assert(crystal.runState.opened == 1 and Modules.stat("crystal", "open").confirmed == 1)
-advance(2) tickModule("crystal")
-assert(sent("ChestThing_Open") == 2)
--- Three opens that consume nothing switch the mode off and release the hold.
-for _ = 1, 3 do advance(7) tickModule("crystal") advance(2) tickModule("crystal") end
-assert(Config.CrystalKeyMode == false and state.farmHold == false, crystal.runState.reason)
+local t = lastRequest("ChestThing_Open")
+assert(t and t.args[1] == "k", "taught request replayed with the current key UID")
 -- Setup lost (e.g. rank up rerolled quests): release immediately.
-Config.CrystalKeyMode = true
-crystal.runState.misses = 0
-fake.save.Goals = {[1] = {Type = 21, Amount = 2750, Progress = 0}}
-advance(10) tickModule("crystal")
-assert(state.farmHold == false and crystal.runState.reason:find("setup", 1, true))
--- Pause releases the hold too.
+fake.save.Goals = {["1"] = {Type = 21, Amount = 2750, Progress = 0, Stars = 1}}
+advance(11) tickModule("crystal")
+advance(1) tickModule("crystal")
+assert(state.farmHold == false and crystal.runState.reason:find("setup", 1, true), crystal.runState.reason)
 crystal.onPause()
 assert(crystal.runState.phase == "off")
-print("PASS crystal runner: needs taught action + World 1 + setup + keys, holds farming, confirms by key count, fail-safe off")
+print("PASS crystal runner: live-confirmed no-arg open, Stars slots, credit by key OR progress, fail-safe off, taught override")
 ''', names=["05_recorder.lua", "15_crystal.lua"], setup=SETUP, name="crystal-runner")
 print("PASS test_crystal runner")
