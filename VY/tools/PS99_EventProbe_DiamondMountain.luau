@@ -306,7 +306,16 @@ if RECORD_SECONDS > 0 then
                     end
                     if not noisy then
                         captured += 1
-                        task.defer(record, os.clock() - started, method, name, table.pack(...))
+                        -- Copy table arguments now: the game may reuse and clear one right after
+                        -- sending it. table.clone fails on a protected metatable; keep the original.
+                        local args = table.pack(...)
+                        for i = 1, args.n do
+                            if typeof(args[i]) == "table" then
+                                local okCopy, copy = pcall(table.clone, args[i])
+                                if okCopy then args[i] = copy end
+                            end
+                        end
+                        task.defer(record, os.clock() - started, method, name, args)
                     end
                 end
             end

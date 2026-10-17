@@ -2,6 +2,46 @@
 
 Newest first. Each entry: what changed, why, evidence, tests, limits, rollback.
 
+## 2026-10-17 — v1.1.9: `gcall` restores the identity it found; probe table copies; harness identity model
+
+**Why.** The user asked to fix `gcall`'s hardcoded `setthreadidentity(8)` after a review explained the nested case. A second review point: the probe recorder formats arguments one deferred step later, so a scratch table the game clears right after sending would be logged as `{}`.
+
+**Reachability check (all 46 `gcall`/`gval` call sites in v1.1.8).**
+- Only two VY closures run under `gcall`: `directoryTable` and `petEuids`. Neither makes an inner `gcall`; `logEvery` only prints.
+- The game-thread hooks (speed, magnet `GetPower`/`InstancingCmds.Get`, hatch animation) never call `gcall`.
+- So the nested case is not reachable today; the fix is hardening. Live impact only if Potassium threads start below 8; the startup log line `starting (identity N)` shows it.
+
+**Harness (mocked runtime).**
+- The harness now models per-thread identity. `setthreadidentity`/`getthreadidentity` act on the current thread. `task.spawn`/`defer`/`delay` threads inherit their creator's identity. A signal handler runs at the identity of the thread that connected it.
+- Default 8, so existing scenarios run as before.
+- New `identity.luau` has two modes:
+  - `nested`: runs the delivered `gcall` itself, cut from the file between fixed markers.
+  - `executor7`: the whole file on an executor at identity 7, recording the identity of every game-module call and every GUI write.
+
+**Red on v1.1.8.**
+- `identity-nested-gcall`: after an inner `gcall` (normal and erroring) the outer call is at 8. After the outer call the thread is at 8, not the executor's 7.
+- `identity-executor-7`: all 1,688 GUI writes ran at 8, none at 7.
+- In the same run all 1,056 game-module calls were at 2 (VY never calls the game outside `gcall`).
+
+**Change (v1.1.9).** `VY/tools/patch_v119.py`: 5 single-match edits to v1.1.8 (version, header, `gcall` reads `getthreadidentity()` first and restores it; 8 stays the fallback). Output `VY/VY_AutoRank-v1.1.9.luau`, SHA-256 `8F637EB9E367A0CB5E5A431834598F1FBE1613D6EDABA0FEB133C240B408D545`, 4,804 lines, CRLF. Two builds are byte-identical, and `patch_v118.py` still rebuilds v1.1.8 byte-identically.
+
+**Green.**
+- v1.1.9: 25/25 in two full runs.
+- v1.1.8: 23/25, exactly the two identity scenarios. v1.1.7: 14/25, exactly its 9 documented defects plus the two identity scenarios.
+- `luau-compile` OK. `luau-analyze`: the v1.1.8 diagnostics (shifted lines) plus 2 "unknown global `getthreadidentity`" (executor global). Selene: 0 errors, the same 6 warnings.
+
+**Test fix found on the way (`crystal-slow-replication`).** It failed once in a full v1.1.9 run (11 requests), then passed 12/12 on both v1.1.8 and v1.1.9.
+- Root cause: the check waited until 10 requests, then 3 virtual s, and expected still 10. The virtual clock is 40× real time, so a burst stretched past ~75 ms real by CPU load let the first 6 s credit replicate inside the wait, and VY correctly started the next burst.
+- Reproduced: with the CPU loaded, the old check failed 1/8.
+- Fix: probe at the moment of request 11 (the repo rule) and assert that credit had already replicated. The new check failed 0/8 under the same load.
+- Mutation `CrystalBurst = 12`: the new check fails (0 credit before request 11), so it still guards the burst limit.
+
+**Probes.** In the hook, table arguments are copied with `pcall(table.clone, …)` before the deferred formatting. The check uses `typeof`, so Instances are never copied; it gives the same result as `type` in real Roblox. A protected metatable makes `table.clone` fail; the original is kept and the request still goes through. Red on the previous probes: a scratch table cleared after sending showed as `{}` (event probe) or `table(0)` (general probe). Both are green now.
+
+**Limits.** Mocked runtime. Roblox's identity semantics are modelled, not measured on Potassium. The table copy is one level, which is what the report prints.
+
+**Rollback.** Install v1.1.8 again (`5E623657…2F69`). The saved-file format is unchanged.
+
 ## 2026-10-17 — Probe recorder fixes (both probes) and event-probe coverage
 
 **Why.** A review the user pasted listed five defects in `PS99_EventProbe_DiamondMountain.luau`. Each was checked against the code. Bugs 1–3 are also in `PS99_Probe.luau` (same recorder). `VY_AutoRank` has no `__namecall` hook, so bug 1 does not affect it. Its `gcall` does hardcode identity 8 on restore (bug 3 pattern); not changed here.

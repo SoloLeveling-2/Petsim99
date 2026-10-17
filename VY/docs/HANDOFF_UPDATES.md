@@ -3,8 +3,8 @@
 The permanent handoff lives on the user's PC, out of reach of this cloud session. These are the status and roadmap changes to copy into it. Statuses use the handoff taxonomy; "mocked Lune" means the real Luau VM running the whole file against a fake PS99 world (`VY/tests`), not Roblox.
 
 ## Section 2 — current status rows
-- **Delivered source:** add v1.1.8 (`VY/VY_AutoRank-v1.1.8.luau`, 4,795 lines, CRLF, built from v1.1.7 by `VY/tools/patch_v118.py`). Status: Implemented, Unverified live. Compile verified. 21/21 whole-file offline scenarios pass.
-- **Isolated behaviour suites:** add a second, independent suite. `python3 VY/tests/run_tests.py <file>` runs 21 whole-file scenarios (Verified Working, mocked Lune). It does not replace `Verify-Handoff.ps1` (254 extraction checks). Run that one on v1.1.8 with `-SourcePath`; anchors for changed functions may need updating.
+- **Delivered source:** add v1.1.9 (`VY/VY_AutoRank-v1.1.9.luau`, 4,804 lines, CRLF, SHA-256 `8F637EB9…D545`, built from v1.1.8 by `VY/tools/patch_v119.py`). Status: Implemented, Unverified live. Compile verified. 25/25 offline checks pass (`luau-compile` and 24 scenarios). It contains v1.1.8 (`VY/VY_AutoRank-v1.1.8.luau`, built from v1.1.7 by `VY/tools/patch_v118.py`) plus the `gcall` identity fix.
+- **Isolated behaviour suites:** add a second, independent suite. `python3 VY/tests/run_tests.py <file>` runs `luau-compile` and 24 scenarios (Verified Working, mocked Lune): 22 whole-file and identity scenarios plus the two probe recorders. It does not replace `Verify-Handoff.ps1` (254 extraction checks). Run that one on v1.1.9 with `-SourcePath`; anchors for changed functions (`gcall`) may need updating.
 - **Installed autoexec:** unchanged (Broken v1.1.6 per the handoff audit; not re-inspected — PC not reachable from cloud).
 
 ## Section 3 — feature records
@@ -33,11 +33,13 @@ The permanent handoff lives on the user's PC, out of reach of this cloud session
 | BUG-24 | Duplicate/early copy overwrites the account file | `Stop()` persisted before `restoreStateFile` | Fixed v1.1.8; mocked |
 | BUG-25 | Cross-world minigame visit defers before fishing | Visit budget counted from transaction start | Fixed v1.1.8; mocked |
 | BUG-26 | Bite missed when `__DEBRIS` > 256 children | Scan read the oldest 256 | Fixed v1.1.8; mocked |
+| BUG-27 | `gcall` always restored identity 8: a nested gcall left the outer call at 8; an executor below 8 was raised to 8 | Hardcoded `IDENTITY_EXEC` on restore | Fixed v1.1.9 (restores `getthreadidentity()`); mocked. No nested gcall exists in v1.1.8, so live impact only if Potassium threads start below 8 |
+| BUG-28 | Probe recorder silently dropped the game's request when an argument was an Instance | `GetFullName()` colon call inside the `__namecall` hook replaced the namecall method | Fixed in both probes (2026-10-17); mocked |
 
 ## Section 15 — tooling
 Replace the provisional table with `VY/docs/TOOLING_AUDIT.md` (cloud environment). The six skills now exist under `.claude/skills/` in the GitHub repo. Copy them into the PC project if Claude Code is used there.
 
 ## Section 17 — roadmap
-- **P0-01:** next step unchanged: user-run install + one Fishing observation. Use v1.1.8 (or v1.1.7). Procedure: `VY/docs/P0-01_DEPLOYMENT_AND_FISHING.md`.
+- **P0-01:** next step unchanged: user-run install + one Fishing observation. Use v1.1.9 (or v1.1.8). The startup console line `starting (identity N)` also tells whether BUG-27 mattered live (it did only if N is not 8). Procedure: `VY/docs/P0-01_DEPLOYMENT_AND_FISHING.md`.
 - **P1-03 Crystal:** offline acceptance done (mocked). Live: one key, then one small burst, then observe a rank-up.
-- **P1-04 build:** `VY/tools/patch_v118.py` rebuilds v1.1.8 byte-identically from the frozen v1.1.7. It is the first portable, deterministic build step.
+- **P1-04 build:** `VY/tools/patch_v118.py` rebuilds v1.1.8 byte-identically from the frozen v1.1.7, and `VY/tools/patch_v119.py` rebuilds v1.1.9 from v1.1.8. They are the portable, deterministic build steps.

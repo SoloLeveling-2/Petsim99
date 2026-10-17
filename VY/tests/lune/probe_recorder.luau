@@ -187,6 +187,17 @@ check(first ~= nil and first.args.n == 2 and first.args[1] == pet and first.args
 local okInvoke, reply = pcall(function() return remoteFn:InvokeServer(pet) end)
 check(okInvoke and reply == true, "bug 1: game's InvokeServer with an Instance argument returns the server reply")
 
+-- The game reuses one scratch table and clears it right after sending it.
+local scratch = { Wall = 3, Slot = 2 }
+remote:FireServer(scratch)
+table.clear(scratch)
+-- A table whose metatable is protected: copying it fails; the request must still go through.
+local locked = setmetatable({ Locked = 1 }, { __metatable = "locked" })
+local before0 = #M.received
+remote:FireServer(locked)
+check(#M.received == before0 + 1 and M.received[#M.received].args[1] == locked,
+    "a table argument with a protected metatable is sent unchanged")
+
 SAVE.Instances.DM.State.Deep.Progress = 2 -- a Save field changes while the user plays
 
 luneTask.wait(45 / SPEED) -- recording window (30 virtual s) is over
@@ -206,6 +217,13 @@ check(M.identity == 7, "bug 3: thread identity restored to the executor's own va
 check(report:find("DiamondMountain_SendPets(Instance<Model>Workspace.PetModel, 5)", 1, true) ~= nil,
     "recorder: the request is reported with its Instance argument path")
 check(not report:find("123456", 1, true) and not report:find("TestUser", 1, true), "report is redacted")
+-- The event probe prints a table's entries; the general probe prints its size.
+local scratchShown = KIND == "event" and (report:find("Wall=3", 1, true) and report:find("Slot=2", 1, true))
+    or report:find("DiamondMountain_SendPets(table(2))", 1, true)
+check(scratchShown ~= nil, "a scratch table cleared right after the request is reported as it was sent")
+local lockedShown = KIND == "event" and report:find("Locked=1", 1, true)
+    or report:find("DiamondMountain_SendPets(table(1))", 1, true)
+check(lockedShown ~= nil, "a protected-metatable table argument is still reported")
 
 if KIND == "event" then
     check(report:find("WallHP", 1, true) ~= nil, "bug 4: nested fields inside a matched Save table are shown")

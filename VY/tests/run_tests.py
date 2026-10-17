@@ -38,6 +38,8 @@ SCENARIOS += [
     ("fishing-cross-world", ["fishing_flow.luau", SOURCE, "travel"]),
     ("fishing-slow-travel", ["fishing_flow.luau", SOURCE, "travel", "slow"]),
     ("fishing-busy-debris", ["fishing_flow.luau", SOURCE, "debris"]),
+    ("identity-nested-gcall", ["identity.luau", SOURCE, "nested"]),
+    ("identity-executor-7", ["identity.luau", SOURCE, "executor7"]),
     # The read-only probes in VY/tools (independent of SOURCE).
     ("probe-event-recorder", ["probe_recorder.luau", "VY/tools/PS99_EventProbe_DiamondMountain.luau", "event"]),
     ("probe-general-recorder", ["probe_recorder.luau", "VY/tools/PS99_Probe.luau", "general"]),
@@ -46,6 +48,8 @@ SCENARIOS += [
 V117_KNOWN_RED = {"crystal-zero-drop-tail", "crystal-stars-complete", "crystal-travel-refused",
                   "crystal-retain-strand", "crystal-protect-setup", "crystal-rankup", "persist-race",
                   "fishing-slow-travel", "fishing-busy-debris"}
+# Scenarios added in v1.1.9 that reproduce a v1.1.8 (and v1.1.7) defect.
+V118_KNOWN_RED = {"identity-nested-gcall", "identity-executor-7"}
 
 
 def main():
@@ -77,8 +81,10 @@ def main():
         print(f"{status}  {name.ljust(width)}  {detail}")
     failed = [r for r in results if r[1] is False]
     print(f"\n{len(results) - len(failed)}/{len(results)} passed" + (" (mocked runtime, not live PS99)" if not failed else ""))
-    if failed and all(r[0] in V117_KNOWN_RED for r in failed):
-        print("all failures are the documented v1.1.7 defects fixed in v1.1.8 (red baseline)")
+    if failed and all(r[0] in V118_KNOWN_RED for r in failed):
+        print("all failures are the documented v1.1.8 defects fixed in v1.1.9 (red baseline)")
+    elif failed and all(r[0] in V117_KNOWN_RED | V118_KNOWN_RED for r in failed):
+        print("all failures are the documented v1.1.7/v1.1.8 defects fixed in v1.1.8/v1.1.9 (red baseline)")
     return 1 if failed else 0
 
 

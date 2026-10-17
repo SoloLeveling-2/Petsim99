@@ -32,12 +32,28 @@ function H.loadSource(path)
     return H.source
 end
 
+-- Thread identity, as in Roblox: each thread has its own; a new thread (task.spawn/defer/
+-- delay) starts at its creator's identity and a signal handler runs at the identity of the
+-- thread that connected it. Executor threads start at H.identity.base (default 8).
+H.identity = {base = 8, of = setmetatable({}, {__mode = "k"})}
+function H.currentIdentity() return H.identity.of[coroutine.running()] or H.identity.base end
+function H.setIdentity(n) H.identity.of[coroutine.running()] = n end
+R.getIdentity, R.setIdentity = H.currentIdentity, H.setIdentity
+local function inherit(f)
+    if type(f) ~= "function" then return f end -- a thread keeps its own identity
+    local id = H.currentIdentity()
+    return function(...)
+        H.setIdentity(id)
+        return f(...)
+    end
+end
+
 local function makeEnv(genv)
     local SPEED = R.SPEED
     local fakeTask = {
-        spawn = function(f, ...) return luneTask.spawn(f, ...) end,
-        defer = function(f, ...) return luneTask.defer(f, ...) end,
-        delay = function(t, f, ...) return luneTask.delay((t or 0) / SPEED, f, ...) end,
+        spawn = function(f, ...) return luneTask.spawn(inherit(f), ...) end,
+        defer = function(f, ...) return luneTask.defer(inherit(f), ...) end,
+        delay = function(t, f, ...) return luneTask.delay((t or 0) / SPEED, inherit(f), ...) end,
         wait = function(t) t = t or 0.03 luneTask.wait(t / SPEED) return t end,
         cancel = function(th) return luneTask.cancel(th) end,
     }
@@ -60,8 +76,8 @@ local function makeEnv(genv)
             table.insert(printed, table.concat(parts, " "))
         end,
         getgenv = function() return genv end,
-        setthreadidentity = function() end,
-        getthreadidentity = function() return 8 end,
+        setthreadidentity = function(n) H.setIdentity(n) end,
+        getthreadidentity = function() return H.currentIdentity() end,
         hookfunction = function(target) return target end,
         getsenv = function() return {} end,
         getconnections = function() return {} end,

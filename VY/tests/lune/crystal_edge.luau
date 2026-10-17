@@ -64,10 +64,23 @@ H.findButton("CrystalMode").Activated:Fire()
 local c = handle.State.crystal
 
 if scenario == "slow-replication" then
-    H.waitFor(function() return W.count("CrystalKey_Unlock") >= 10 end, 60)
-    H.wait(3) -- replication still pending (6 s)
-    H.check(W.count("CrystalKey_Unlock") == 10, "burst stops at 10 requests while credit is pending (" .. W.count("CrystalKey_Unlock") .. ")")
-    local more = H.waitFor(function() return W.count("CrystalKey_Unlock") > 10 end, 30)
+    -- Probe at the moment of each request (a fixed wait raced the 6 s replication when a
+    -- loaded machine stretched the burst): request 11 may only follow replicated credit.
+    local replicatedAtEleven = nil
+    local original = W.handlers["CrystalKey_Unlock"]
+    W.handlers["CrystalKey_Unlock"] = function(...)
+        if W.count("CrystalKey_Unlock") == 11 and replicatedAtEleven == nil then
+            replicatedAtEleven = 0
+            for _, e in ipairs(W.events) do
+                if e.kind == "crystal-replicated" then replicatedAtEleven += 1 end
+            end
+        end
+        return original(...)
+    end
+    local more = H.waitFor(function() return W.count("CrystalKey_Unlock") > 10 end, 90)
+    H.check(replicatedAtEleven ~= nil and replicatedAtEleven >= 1,
+        "burst stops at 10 requests while credit is pending (credit replicated before request 11: "
+            .. tostring(replicatedAtEleven) .. ")")
     H.check(more, "next burst starts after replicated credit")
     H.check(c.halted == nil, "slow replication does not halt the mode (" .. tostring(c.halted) .. ")")
 elseif scenario == "no-credit" then

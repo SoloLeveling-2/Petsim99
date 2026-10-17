@@ -1,6 +1,8 @@
 --!nocheck
--- Copied unchanged (apart from this header) from RankPilotX/tests/v52/lune/roblox_mock.luau
--- so the VY harness is self-contained. Fake Roblox datatypes/instances/signals only.
+-- Copied from RankPilotX/tests/v52/lune/roblox_mock.luau so the VY harness is self-contained.
+-- VY additions (2026-10-17): signal handlers run at the connector's thread identity
+-- (M.getIdentity/M.setIdentity, set by the harness) and an optional M.onWrite property hook.
+-- Fake Roblox datatypes/instances/signals only.
 -- Minimal Roblox + PS99 client mock for running the WHOLE RankPilot bundle in
 -- the real Luau VM (Lune). It fakes Instances, datatypes, services and a few
 -- PS99 client modules. Time runs SPEED times faster than real time so a few
@@ -116,7 +118,8 @@ local Signal = {}
 Signal.__index = Signal
 function Signal.new() return setmetatable({handlers = {}, __kind = "RBXScriptSignal"}, Signal) end
 function Signal:Connect(fn)
-    local entry = {fn = fn, Connected = true}
+    -- The handler runs at the identity of the connecting thread (when the harness models identity).
+    local entry = {fn = fn, Connected = true, identity = M.getIdentity and M.getIdentity() or nil}
     table.insert(self.handlers, entry)
     return {Connected = true, Disconnect = function(c) entry.Connected = false c.Connected = false end, __kind = "RBXScriptConnection"}
 end
@@ -129,7 +132,10 @@ end
 function Signal:Fire(...)
     for _, entry in ipairs(table.clone(self.handlers)) do
         if entry.Connected then
+            local firing = M.getIdentity and M.getIdentity() or nil
+            if entry.identity and M.setIdentity then M.setIdentity(entry.identity) end
             local ok, err = pcall(entry.fn, ...)
+            if firing and M.setIdentity then M.setIdentity(firing) end
             if not ok then M.recordError("signal handler: " .. tostring(err)) end
         end
     end
@@ -344,6 +350,7 @@ instanceMeta.__newindex = function(self, key, value)
         props.Position = value.Position
     end
     props[key] = value
+    if M.onWrite then M.onWrite(self, key, value) end
     local signals = rawget(self, "__propSignals")
     if signals[key] then signals[key]:Fire(value) end
 end
