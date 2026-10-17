@@ -8,8 +8,13 @@
 --    3. RECORDER: for RECORD_SECONDS it notes every request the GAME sends while YOU
 --       do the actions by hand (send pets to a wall, feed/fight the Yeti, start/claim an
 --       expedition, buy from the merchant, buy an upgrade, use a boost, teleport to a camp).
---  It sends nothing itself, never blocks or changes a request, removes its hook at the
---  end, and replaces your UserId/name with <me>. Report: PS99_EventProbe_<date>.txt
+--    4. SAVE DIFF: every Save value that changed while you did those actions, whatever
+--       its name (finds event fields stored under unexpected parents).
+--  It sends nothing itself and never blocks or changes a request. After recording, its
+--  hook stays as a pass-through until you leave the server (re-hooking could drop hooks
+--  other scripts added meanwhile). Your UserId/name become <me>. Report:
+--  PS99_EventProbe_<date>.txt. Run it once at base camp and once at the summit: far
+--  parts of the mountain may not be loaded (streaming) where you stand.
 -- =====================================================================================
 local RECORD_SECONDS = 120   -- time you have to do the actions by hand (0 = no recording)
 local KEYWORDS = { "mountain", "yeti", "camp", "rubble", "wall", "trail", "expedition", "artifact",
@@ -40,10 +45,17 @@ local function matches(name)
     for _, k in ipairs(KEYWORDS) do if l:find(k, 1, true) then return true end end
     return false
 end
+-- Game modules need identity 2; afterwards restore whatever identity this thread had.
 local function asGame(fn, ...)
-    if type(setthreadidentity) == "function" then pcall(setthreadidentity, 2) end
+    local canSet = type(setthreadidentity) == "function"
+    local prior = 8
+    if type(getthreadidentity) == "function" then
+        local ok, id = pcall(getthreadidentity)
+        if ok and type(id) == "number" then prior = id end
+    end
+    if canSet then pcall(setthreadidentity, 2) end
     local r = table.pack(pcall(fn, ...))
-    if type(setthreadidentity) == "function" then pcall(setthreadidentity, 8) end
+    if canSet then pcall(setthreadidentity, prior) end
     return table.unpack(r, 1, r.n)
 end
 local function short(v, depth)
@@ -63,6 +75,35 @@ local function short(v, depth)
         return "{" .. table.concat(parts, ", ") .. (n > 6 and (", +" .. (n - 6)) or "") .. "}"
     end
     return t
+end
+
+-- Prints a matched table's contents several levels deep (bounded).
+local function dump(t, path, depth, budget)
+    for k, v in pairs(t) do
+        if budget.n >= 400 then return end
+        local p = path .. "." .. tostring(k)
+        if type(v) == "table" and depth < 4 then
+            dump(v, p, depth + 1, budget)
+        else
+            budget.n += 1
+            line("  " .. p .. " : " .. short(v))
+        end
+    end
+end
+
+-- Flattens Save into path -> printable value, for the before/after diff.
+local function flatten(t, path, depth, acc)
+    for k, v in pairs(t) do
+        if acc.n >= 60000 then return acc end
+        local p = path .. "." .. tostring(k)
+        if type(v) == "table" then
+            if depth < 7 then flatten(v, p, depth + 1, acc) end
+        else
+            acc.n += 1
+            acc.map[p] = short(v)
+        end
+    end
+    return acc
 end
 
 line("PS99 Event Probe (Diamond Mountain) | " .. os.date("!%Y-%m-%d %H:%M:%S UTC") .. " | PlaceId " .. game.PlaceId)
@@ -121,7 +162,7 @@ if okDir and type(Dir) == "table" then
 end
 
 -- 4. Save fields ------------------------------------------------------------------------
-section("4. Event fields in Save.Get() (name matches, 3 levels deep)")
+section("4. Event fields in Save.Get() (name matches up to 5 levels deep, contents shown)")
 local client = library and library:FindFirstChild("Client")
 local saveMod = client and client:FindFirstChild("Save")
 local okSave, save = false, nil
@@ -130,15 +171,19 @@ if saveMod then
     if okReq and type(S) == "table" and type(S.Get) == "function" then okSave, save = asGame(S.Get) end
 end
 if okSave and type(save) == "table" then
-    local shown = 0
+    local budget = { n = 0 }
     local function walk(t, path, depth)
         for k, v in pairs(t) do
-            if shown > 150 then return end
+            if budget.n >= 400 then return end
             local p = path .. "." .. tostring(k)
             if matches(k) then
-                shown += 1
-                line("  " .. p .. " : " .. short(v))
-            elseif type(v) == "table" and depth < 2 and k ~= "Inventory" then
+                if type(v) == "table" then
+                    dump(v, p, 0, budget)
+                else
+                    budget.n += 1
+                    line("  " .. p .. " : " .. short(v))
+                end
+            elseif type(v) == "table" and depth < 4 and k ~= "Inventory" then
                 walk(v, p, depth + 1)
             end
         end
@@ -156,18 +201,37 @@ end
 
 -- 5. World objects ----------------------------------------------------------------------
 section("5. Event objects in the world (path, class, attributes)")
-local shown, scanned = 0, 0
+local okStream, streaming = pcall(function() return workspace.StreamingEnabled end)
+line("  StreamingEnabled: " .. (okStream and tostring(streaming) or "?") .. " (if true, only nearby parts are loaded)")
+local things = workspace:FindFirstChild("__THINGS")
+local ic = things and things:FindFirstChild("__INSTANCE_CONTAINER")
+local activeIc = ic and ic:FindFirstChild("Active")
+local activeNames = {}
+for _, c in ipairs(activeIc and activeIc:GetChildren() or {}) do activeNames[#activeNames + 1] = c.Name end
+line("  Active instance(s): " .. (#activeNames > 0 and table.concat(activeNames, ", ") or "none"))
+-- Repeats (Torch1..Torch300 in one camp) collapse into one row, so one crowded camp
+-- cannot use up the list before the summit, trails and pedestals.
+local rows, rowOf, scanned = {}, {}, 0
 for _, d in ipairs(workspace:GetDescendants()) do
     scanned += 1
     if scanned % 5000 == 0 then task.wait() end
-    if shown < 250 and matches(d.Name) and not (d.Parent and matches(d.Parent.Name) and d:IsA("BasePart")) then
-        shown += 1
-        local attrs = {}
-        for k, v in pairs(d:GetAttributes()) do attrs[#attrs + 1] = k .. "=" .. short(v) end
-        line("  " .. d:GetFullName() .. " [" .. d.ClassName .. "]" .. (#attrs > 0 and (" " .. table.concat(attrs, ", ")) or ""))
+    if matches(d.Name) and not (d.Parent and matches(d.Parent.Name) and d:IsA("BasePart")) then
+        local parentPath = d.Parent and d.Parent:GetFullName() or "?"
+        local key = parentPath .. "." .. d.Name:gsub("%d+", "#") .. "[" .. d.ClassName .. "]"
+        local row = rowOf[key]
+        if row then
+            row.count += 1
+        elseif #rows < 400 then
+            local attrs = {}
+            for k, v in pairs(d:GetAttributes()) do attrs[#attrs + 1] = k .. "=" .. short(v) end
+            row = { text = d:GetFullName() .. " [" .. d.ClassName .. "]" .. (#attrs > 0 and (" " .. table.concat(attrs, ", ")) or ""), count = 1 }
+            rowOf[key] = row
+            rows[#rows + 1] = row
+        end
     end
 end
-line("  shown " .. shown .. " (scanned " .. scanned .. " objects; stand on the mountain for best results)")
+for _, row in ipairs(rows) do line("  " .. row.text .. (row.count > 1 and ("  (x" .. row.count .. " similar)") or "")) end
+line("  shown " .. #rows .. " rows (scanned " .. scanned .. " objects)")
 
 -- 6. Recorder ---------------------------------------------------------------------------
 local function finish()
@@ -183,39 +247,78 @@ local function finish()
     if type(setclipboard) == "function" then pcall(setclipboard, text) end
 end
 
-if RECORD_SECONDS > 0 and type(hookmetamethod) == "function" and type(getnamecallmethod) == "function" then
+local function saveDiff(before)
+    section("7. Save values that changed while you played (any name)")
+    local okNow, now = false, nil
+    if saveMod then
+        local okReq, S = asGame(require, saveMod)
+        if okReq and type(S) == "table" and type(S.Get) == "function" then okNow, now = asGame(S.Get) end
+    end
+    if not (okNow and type(now) == "table") then line("  Save.Get() unavailable") return end
+    local after = flatten(now, "Save", 0, { n = 0, map = {} }).map
+    local changes = {}
+    for p, v in pairs(after) do
+        if before[p] == nil then changes[#changes + 1] = p .. " : (new) " .. v
+        elseif before[p] ~= v then changes[#changes + 1] = p .. " : " .. before[p] .. " -> " .. v end
+    end
+    for p, v in pairs(before) do
+        if after[p] == nil then changes[#changes + 1] = p .. " : " .. v .. " -> (gone)" end
+    end
+    table.sort(changes)
+    for i = 1, math.min(#changes, 300) do line("  " .. changes[i]) end
+    line("  changed: " .. #changes .. (#changes > 300 and " (first 300 shown)" or ""))
+end
+
+if RECORD_SECONDS > 0 then
+    local before = (okSave and type(save) == "table") and flatten(save, "Save", 0, { n = 0, map = {} }).map or nil
+    local canHook = type(hookmetamethod) == "function" and type(getnamecallmethod) == "function"
     section("6. Requests the game sent while you played (" .. RECORD_SECONDS .. " s)")
+    if not canHook then line("  RECORD skipped: hookmetamethod/getnamecallmethod not available in this executor") end
     print("[EventProbe] RECORDING " .. RECORD_SECONDS .. " s. Do each once, slowly: teleport to a camp, send pets to a")
     print("[EventProbe] Rubble Wall, fight the Yeti, feed ONE cheap pet, start + claim an expedition, open a trail chest,")
     print("[EventProbe] buy one merchant item, buy one mountain upgrade, use one boost, buy one camp egg.")
     local NOISE = { "Breakables_PlayerDealDamage", "Orbs", "Lootbags", "Idle", "Ping", "Mouse", "Camera", "Mark Approached" }
-    local seen, count, old = {}, 0, nil
-    old = hookmetamethod(game, "__namecall", function(self, ...)
-        local method = getnamecallmethod()
-        if (method == "FireServer" or method == "InvokeServer") and typeof(self) == "Instance" and count < 200 then
-            local name = self.Name
-            local noisy = false
-            for _, w in ipairs(NOISE) do if name:find(w, 1, true) then noisy = true break end end
-            if not noisy then
-                local args = table.pack(...)
-                local parts = {}
-                for i = 1, args.n do parts[i] = short(args[i]) end
-                local key = name .. "(" .. table.concat(parts, ", ") .. ")"
-                if not seen[key] then
-                    seen[key] = true
-                    count += 1
-                    out[#out + 1] = redact(string.format("  [+%5.1fs] %s %s", os.clock() - started, method, key))
+    local seen, count, captured, recording = {}, 0, 0, true
+    -- Formats one captured request. Runs in its own thread, outside the hook.
+    local function record(at, method, name, args)
+        if count >= 200 then return end
+        local parts = {}
+        for i = 1, args.n do parts[i] = short(args[i]) end
+        local key = name .. "(" .. table.concat(parts, ", ") .. ")"
+        if not seen[key] then
+            seen[key] = true
+            count += 1
+            out[#out + 1] = redact(string.format("  [+%5.1fs] %s %s", at, method, key))
+        end
+    end
+    if canHook then
+        local old
+        old = hookmetamethod(game, "__namecall", function(self, ...)
+            -- No colon calls on Instances in here: one would replace the namecall method
+            -- that old() dispatches the game's own request as (FireServer -> GetFullName).
+            if recording then
+                local method = getnamecallmethod()
+                if (method == "FireServer" or method == "InvokeServer") and captured < 2000 and typeof(self) == "Instance" then
+                    local name = self.Name
+                    local noisy = false
+                    for _, w in ipairs(NOISE) do
+                        if string.find(name, w, 1, true) then noisy = true break end
+                    end
+                    if not noisy then
+                        captured += 1
+                        task.defer(record, os.clock() - started, method, name, table.pack(...))
+                    end
                 end
             end
-        end
-        return old(self, ...)
-    end)
+            return old(self, ...)
+        end)
+    end
     task.delay(RECORD_SECONDS, function()
-        hookmetamethod(game, "__namecall", old)
-        if count == 0 then line("  nothing recorded") end
+        recording = false -- the hook becomes a pass-through; it is not re-hooked
+        if canHook and count == 0 then line("  nothing recorded") end
+        if before then saveDiff(before) end
         finish()
     end)
 else
-    if RECORD_SECONDS > 0 then line("RECORD skipped: hookmetamethod/getnamecallmethod not available in this executor") end
     finish()
 end

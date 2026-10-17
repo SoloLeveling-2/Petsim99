@@ -2,6 +2,38 @@
 
 Newest first. Each entry: what changed, why, evidence, tests, limits, rollback.
 
+## 2026-10-17 — Probe recorder fixes (both probes) and event-probe coverage
+
+**Why.** A review the user pasted listed five defects in `PS99_EventProbe_DiamondMountain.luau`. Each was checked against the code. Bugs 1–3 are also in `PS99_Probe.luau` (same recorder). `VY_AutoRank` has no `__namecall` hook, so bug 1 does not affect it. Its `gcall` does hardcode identity 8 on restore (bug 3 pattern); not changed here.
+
+**Verdicts.**
+- Bug 1 (real, severe). `short()` called `v:GetFullName()` inside the hook. The colon call re-enters the hook and leaves the namecall method set to `GetFullName`. `old(self, ...)` then dispatched the game's `FireServer`/`InvokeServer` as `GetFullName`. The request was silently dropped, with no error. This happened whenever an argument was an Instance.
+- Bug 2 (real). Re-hooking `old` after the window drops any `__namecall` hook another script added meanwhile.
+- Bug 3 (half). The restore to a hardcoded 8 is real. "Stuck at identity 2 after an error" is not: `pcall` always returns before the restore line.
+- Bug 4 (real limit). The name search stopped 3 levels deep, and a matched table printed only one level (`{...}`).
+- Bug 5 (real limit). One camp's repeated children could fill the 250-row cap, and streaming/instance state was not reported.
+
+**Red on the unchanged probes** (`tests/lune/probe_recorder.luau`; its mock models the namecall method register): event probe 9 FAIL, general probe 5 FAIL. Bug 1 showed as "got nothing": the server never received the request.
+
+**Change.**
+- Both probes:
+  - The hook only copies the arguments and formats them in a `task.defer` thread. It makes no colon calls on Instances and uses `string.find` for the noise filter.
+  - After the window a `recording` flag makes the hook a pass-through; it is never re-hooked.
+  - `asGame` restores the identity read from `getthreadidentity()`.
+- Event probe only:
+  - The Save name search goes 5 levels deep; matched tables are dumped 4 levels (bounded to 400 lines).
+  - New section 7: a before/after Save diff over the recording window, any field name (bounded).
+  - World rows collapse repeats (digits → `#`, same parent and class) with a count, cap 400. `StreamingEnabled` and the active instance are printed. The header says to run it at base camp and at the summit.
+
+**Green.** Both probe scenarios pass (14 and 10 checks). Both files compile (`luau-compile`). Selene: 0 errors (1 pre-existing warning, unused `HttpService` in `PS99_Probe.luau`). The full suite against v1.1.8: 23/23 (the two probe scenarios are now in `run_tests.py`). SHA-256: event probe `2A3D04A0…08461BF`, general probe `998E2696…7F52B71`.
+
+**Limits.**
+- Mocked runtime: the namecall model reproduces the documented Luau behaviour but is not Potassium.
+- The recorded arguments are formatted one deferred step later, so a table the game mutates in that instant would show its new value.
+- The pass-through hook stays until the client leaves the server.
+
+**Rollback.** `git checkout c953701 -- VY/tools/` (the probes are standalone; nothing depends on them).
+
 ## 2026-10-14 — v1.1.8: 12 reproduced fixes (Crystal, Fishing scheduling, persistence)
 
 **Why.** A five-area review workflow ran (Crystal, Fishing/P0-01, areas, consumables, lifecycle; each with two adversarial verifiers). The Crystal and Fishing reviewers finished: 6 and 7 findings, each reproduced in the reviewer's extract harness. The other agents hit the session limit and were resumed. I re-reproduced every finding I chose to fix in the **whole-file** harness before editing (red), then fixed it (green).

@@ -8,8 +8,9 @@
 --
 --  Optional RECORD mode (OFF by default): for RECORD_SECONDS seconds it notes which
 --  remotes the GAME itself fires while YOU do one action by hand (for example open one
---  chest). It records names and argument types/short values only, never changes or
---  blocks anything, and removes its hook when the time is up.
+--  chest). It records names and argument types/short values only and never changes or
+--  blocks anything. When the time is up its hook becomes a pass-through until you
+--  leave the server (re-hooking could drop hooks other scripts added meanwhile).
 -- =====================================================================================
 local RECORD_SECONDS = 0          -- 0 = off. Set to e.g. 20, run, then do ONE action by hand.
 local MAX_LINES_PER_SECTION = 400 -- keeps the report readable
@@ -35,11 +36,17 @@ local function line(...)
 end
 local function section(title) line("") line("==== " .. title .. " ====") end
 
--- Game modules need identity 2; GUI/executor work stays at 8.
+-- Game modules need identity 2; afterwards restore whatever identity this thread had.
 local function asGame(fn, ...)
-    if type(setthreadidentity) == "function" then pcall(setthreadidentity, 2) end
+    local canSet = type(setthreadidentity) == "function"
+    local prior = 8
+    if type(getthreadidentity) == "function" then
+        local ok, id = pcall(getthreadidentity)
+        if ok and type(id) == "number" then prior = id end
+    end
+    if canSet then pcall(setthreadidentity, 2) end
     local r = table.pack(pcall(fn, ...))
-    if type(setthreadidentity) == "function" then pcall(setthreadidentity, 8) end
+    if canSet then pcall(setthreadidentity, prior) end
     return table.unpack(r, 1, r.n)
 end
 
@@ -264,30 +271,41 @@ end
 if RECORD_SECONDS > 0 and type(hookmetamethod) == "function" and type(getnamecallmethod) == "function" then
     section("7. Recorded game requests (" .. RECORD_SECONDS .. " s) - do ONE action by hand now")
     print("[Probe] RECORDING for " .. RECORD_SECONDS .. " s: do ONE action by hand now")
-    local seen, count, old = {}, 0, nil
+    local seen, count, captured, recording, old = {}, 0, 0, true, nil
     local NOISE = { "Breakables_", "Orbs", "Lootbags", "Pets_", "Idle", "Ping", "Mouse", "Camera" }
+    -- Formats one captured request. Runs in its own thread, outside the hook.
+    local function record(method, name, args)
+        if count >= 60 then return end
+        local parts = {}
+        for i = 1, args.n do parts[i] = short(args[i]) end
+        local key = name .. "(" .. table.concat(parts, ", ") .. ")"
+        if not seen[key] then
+            seen[key] = true
+            count += 1
+            out[#out + 1] = redact(string.format("  %s %s  args=%d", method, key, args.n))
+        end
+    end
     old = hookmetamethod(game, "__namecall", function(self, ...)
-        local method = getnamecallmethod()
-        if (method == "FireServer" or method == "InvokeServer") and typeof(self) == "Instance" and count < 60 then
-            local name = self.Name
-            local noisy = false
-            for _, w in ipairs(NOISE) do if name:find(w, 1, true) then noisy = true break end end
-            if not noisy then
-                local args = table.pack(...)
-                local parts = {}
-                for i = 1, args.n do parts[i] = short(args[i]) end
-                local key = name .. "(" .. table.concat(parts, ", ") .. ")"
-                if not seen[key] then
-                    seen[key] = true
-                    count += 1
-                    out[#out + 1] = redact(string.format("  %s %s  args=%d", method, key, args.n))
+        -- No colon calls on Instances in here: one would replace the namecall method
+        -- that old() dispatches the game's own request as (FireServer -> GetFullName).
+        if recording then
+            local method = getnamecallmethod()
+            if (method == "FireServer" or method == "InvokeServer") and captured < 1000 and typeof(self) == "Instance" then
+                local name = self.Name
+                local noisy = false
+                for _, w in ipairs(NOISE) do
+                    if string.find(name, w, 1, true) then noisy = true break end
+                end
+                if not noisy then
+                    captured += 1
+                    task.defer(record, method, name, table.pack(...))
                 end
             end
         end
         return old(self, ...)
     end)
     task.delay(RECORD_SECONDS, function()
-        hookmetamethod(game, "__namecall", old) -- remove the observer
+        recording = false -- the hook becomes a pass-through; it is not re-hooked
         if count == 0 then line("  nothing recorded (noise filtered or no action done)") end
         save_report()
     end)

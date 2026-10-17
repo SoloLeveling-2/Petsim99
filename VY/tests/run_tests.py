@@ -38,6 +38,9 @@ SCENARIOS += [
     ("fishing-cross-world", ["fishing_flow.luau", SOURCE, "travel"]),
     ("fishing-slow-travel", ["fishing_flow.luau", SOURCE, "travel", "slow"]),
     ("fishing-busy-debris", ["fishing_flow.luau", SOURCE, "debris"]),
+    # The read-only probes in VY/tools (independent of SOURCE).
+    ("probe-event-recorder", ["probe_recorder.luau", "VY/tools/PS99_EventProbe_DiamondMountain.luau", "event"]),
+    ("probe-general-recorder", ["probe_recorder.luau", "VY/tools/PS99_Probe.luau", "general"]),
 ]
 # Scenarios added in v1.1.8 that reproduce v1.1.7 defects (expected to FAIL on v1.1.7).
 V117_KNOWN_RED = {"crystal-zero-drop-tail", "crystal-stars-complete", "crystal-travel-refused",
