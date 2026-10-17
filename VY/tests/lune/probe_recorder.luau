@@ -84,6 +84,8 @@ METHODS.FireServer = function(self, ...)
 end
 METHODS.InvokeServer = function(self, ...)
     table.insert(M.received, { method = "InvokeServer", remote = data[self].props.Name, args = table.pack(...) })
+    local action = select(2, ...)
+    if M.replies and M.replies[action] ~= nil then return M.replies[action] end
     return true
 end
 -- The game's own __namecall: dispatches on the CURRENT namecall method.
@@ -106,8 +108,14 @@ local net = new("Folder", "Network", RS)
 local remote = new("RemoteEvent", "DiamondMountain_SendPets", net)
 local remoteFn = new("RemoteFunction", "Expedition_Claim", net)
 new("RemoteEvent", "Breakables_PlayerDealDamage", net)
+local pings = new("RemoteEvent", "UnreliableRemoteEvent", net)
+local custom = new("RemoteFunction", "Instancing_InvokeCustomFromClient", net)
 local library = new("Folder", "Library", RS)
 local client = new("Folder", "Client", library)
+local dmCmds = new("ModuleScript", "DiamondMountainCmds", client)
+data[dmCmds].module = { OnJoin = function() end }
+local wallsCmds = new("ModuleScript", "Walls", dmCmds)
+data[wallsCmds].module = { FillBest = function(_wall, _all) end }
 local SAVE = {
     Rank = 3, Goals = {}, Inventory = { Pet = { a = { id = "Cat" } }, Misc = {} },
     Events = { Mountain = { Camps = { Camp1 = { WallHP = 50 } } } },
@@ -133,7 +141,11 @@ data[eggsMod].module = {
 local things = new("Folder", "__THINGS", workspace)
 local ic = new("Folder", "__INSTANCE_CONTAINER", things)
 local active = new("Folder", "Active", ic)
-new("Model", "DiamondMountain", active)
+local instances = new("Folder", "Instances", things)
+local dmState = new("Folder", "DiamondMountain", instances)
+local customEggs = new("Folder", "CustomEggs", things)
+local campEgg = new("Model", "9af55dac", customEggs)
+data[campEgg].attrs.EggId = "Trailhead Egg"
 local camp = new("Model", "Camp1", workspace)
 for i = 1, 300 do new("Model", "CampTorch" .. i, camp) end -- one camp's many matching parts
 new("Model", "YetiArena", workspace)
@@ -214,6 +226,23 @@ check(#M.received == before0 + 1 and M.received[#M.received].args[1] == locked,
 
 SAVE.Instances.DM.State.Deep.Progress = 2 -- a Save field changes while the user plays
 
+-- Run 1 lost its last 160 s: ~130 fps pings (each with a new value) filled the 200 lines.
+M.replies = { DM_Walls_Status = { Walls = { [1] = { HP = 1000000, Dealt = 5 } } } }
+luneTask.spawn(function() -- the game's own threads
+    for i = 1, 300 do pings:FireServer({ fps = 14 + i / 1000 }) end
+    custom:InvokeServer("DiamondMountain", "DM_Walls_Status")
+    custom:InvokeServer("DiamondMountain", "DM_Walls_Load", 1, { ada4 = 1 })
+end)
+-- Telemetry and the event's own Save data change; the player enters the mountain.
+SAVE.Engagement = { Stats = { ["Eggs Opened"] = { [1] = 22 } } }
+SAVE.InstanceVars = { DiamondMountain = { WallDamage = 161386 } }
+data[dmState].attrs.DM_YetiHealth = 123
+local inside = new("Model", "DiamondMountain", active)
+local camps = new("Folder", "Camps", inside)
+local wall = new("Model", "RubbleWall", new("Model", "Camp1", camps))
+data[wall].attrs.WallIndex = 1
+new("ProximityPrompt", "LoadPrompt", wall, { ActionText = "Load Pets", ObjectText = "Rubble Wall" })
+
 luneTask.wait(45 / SPEED) -- recording window (30 virtual s) is over
 local name, report = next(M.files)
 check(report ~= nil, "report file written (" .. tostring(name) .. ")")
@@ -258,6 +287,20 @@ if KIND == "event" then
     check(report:find('Directory.Boosts["Boost | DiamondMountainLuck1"]', 1, true) ~= nil, "event boost entry is shown")
     check(report:find("Garden", 1, true) == nil and report:find('"Cat Egg"', 1, true) == nil,
         "other events' entries are not listed")
+    -- Lessons from live run 1 (2026-10-17).
+    check(report:find('"DM_Walls_Load", 1', 1, true) ~= nil, "run 1: an event request after 300 fps pings is still recorded")
+    check(report:find("300  FireServer UnreliableRemoteEvent", 1, true) ~= nil, "run 1: per-remote totals include the hidden pings")
+    check(report:find("reply Instancing_InvokeCustomFromClient DM_Walls_Status", 1, true) ~= nil
+        and report:find("HP=1000000", 1, true) ~= nil, "run 1: the server's reply to a status request is recorded")
+    check(report:find("Save.Engagement.", 1, true) == nil, "run 1: telemetry is left out of the Save diff")
+    check(report:find("Save.InstanceVars.DiamondMountain.WallDamage : (new) 161386", 1, true) ~= nil,
+        "run 1: the event's own Save data is in the diff")
+    check(report:find("DM_YetiHealth=123", 1, true) ~= nil, "run 1: instance state is read again at the end")
+    check(report:find("9af55dac", 1, true) ~= nil and report:find("EggId", 1, true) ~= nil,
+        "run 1: custom egg ids (the camp egg hatch argument) are listed")
+    check(report:find("Load Pets", 1, true) ~= nil and report:find("WallIndex=1", 1, true) ~= nil,
+        "run 1: mountain objects and prompts are scanned after entering")
+    check(report:find("FillBest/2", 1, true) ~= nil, "run 1: game function argument counts are shown")
 end
 
 print(#failures == 0 and "ALL OK" or (#failures .. " FAILED"))

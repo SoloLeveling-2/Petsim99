@@ -9,9 +9,12 @@
 --    2. matching objects in the world (camps, walls, Yeti, trails, chests, merchant...);
 --    3. RECORDER: for RECORD_SECONDS it notes every request the GAME sends while YOU
 --       do the actions by hand (send pets to a wall, feed/fight the Yeti, start/claim an
---       expedition, buy from the merchant, buy an upgrade, use a boost, teleport to a camp).
+--       expedition, buy from the merchant, buy an upgrade, use a boost, teleport to a camp),
+--       a few lines per remote plus totals, and the server's reply to each request kind.
 --    4. SAVE DIFF: every Save value that changed while you did those actions, whatever
---       its name (finds event fields stored under unexpected parents).
+--       its name (finds event fields stored under unexpected parents), telemetry left out.
+--    5. At the end: the instance state again, custom egg ids, and the mountain's layout
+--       and prompts. Start the probe already ON the mountain for sections 4 and 5.
 --  It sends nothing itself and never blocks or changes a request. After recording, its
 --  hook stays as a pass-through until you leave the server (re-hooking could drop hooks
 --  other scripts added meanwhile). Your UserId/name become <me>. Report:
@@ -94,6 +97,22 @@ local function short(v, depth)
         return "{" .. table.concat(parts, ", ") .. (n > 6 and (", +" .. (n - 6)) or "") .. "}"
     end
     return t
+end
+
+-- Like short(), but 3 levels deep and up to 12 keys per table, capped at 1500 characters
+-- (server replies such as wall or expedition state).
+local function long(v, depth)
+    depth = depth or 0
+    if typeof(v) ~= "table" then return short(v) end
+    if depth >= 3 then return "{...}" end
+    local parts, n = {}, 0
+    for k, x in pairs(v) do
+        n += 1
+        if n <= 12 then parts[#parts + 1] = tostring(k) .. "=" .. long(x, depth + 1) end
+    end
+    local s = "{" .. table.concat(parts, ", ") .. (n > 12 and (", +" .. (n - 12)) or "") .. "}"
+    if #s > 1500 then s = s:sub(1, 1500) .. "...}" end
+    return s
 end
 
 -- Prints a matched table's contents several levels deep (bounded).
@@ -183,7 +202,14 @@ if library then
             local ok, mod = asGame(require, m)
             local fns = {}
             if ok and type(mod) == "table" then
-                for k, v in pairs(mod) do if type(v) == "function" then fns[#fns + 1] = tostring(k) end end
+                for k, v in pairs(mod) do
+                    if type(v) == "function" then
+                        -- name/argument count (+ = takes more), to call the game's own functions right
+                        local okInfo, nparams, vararg = pcall(debug.info, v, "a")
+                        local arity = (okInfo and type(nparams) == "number") and ("/" .. nparams .. (vararg and "+" or "")) or ""
+                        fns[#fns + 1] = tostring(k) .. arity
+                    end
+                end
                 table.sort(fns)
             end
             line("  " .. m:GetFullName() .. (ok and "" or " (require failed)") .. "\n      fns: " .. table.concat(fns, ", "))
@@ -347,17 +373,100 @@ local function saveDiff(before)
     end
     if not (okNow and type(now) == "table") then line("  Save.Get() unavailable") return end
     local after = flatten(now, "Save", 0, { n = 0, map = {} }).map
-    local changes = {}
+    -- Telemetry filled most of run 1's diff (Engagement stats, notification counters, pet XP).
+    local SKIP = { "Save.Engagement.", "Save.InventoryNotifications.", "._uq.xp" }
+    local function skipped(p)
+        for _, s in ipairs(SKIP) do if string.find(p, s, 1, true) then return true end end
+        return false
+    end
+    local changes, telemetry = {}, 0
     for p, v in pairs(after) do
-        if before[p] == nil then changes[#changes + 1] = p .. " : (new) " .. v
-        elseif before[p] ~= v then changes[#changes + 1] = p .. " : " .. before[p] .. " -> " .. v end
+        if before[p] ~= v then
+            if skipped(p) then telemetry += 1
+            elseif before[p] == nil then changes[#changes + 1] = p .. " : (new) " .. v
+            else changes[#changes + 1] = p .. " : " .. before[p] .. " -> " .. v end
+        end
     end
     for p, v in pairs(before) do
-        if after[p] == nil then changes[#changes + 1] = p .. " : " .. v .. " -> (gone)" end
+        if after[p] == nil then
+            if skipped(p) then telemetry += 1 else changes[#changes + 1] = p .. " : " .. v .. " -> (gone)" end
+        end
     end
-    table.sort(changes)
-    for i = 1, math.min(#changes, 300) do line("  " .. changes[i]) end
-    line("  changed: " .. #changes .. (#changes > 300 and " (first 300 shown)" or ""))
+    -- The event's own data first.
+    table.sort(changes, function(a, b)
+        local ea, eb = string.find(a, "DiamondMountain", 1, true) ~= nil, string.find(b, "DiamondMountain", 1, true) ~= nil
+        if ea ~= eb then return ea end
+        return a < b
+    end)
+    for i = 1, math.min(#changes, 400) do line("  " .. changes[i]) end
+    line("  changed: " .. #changes .. (#changes > 400 and " (first 400 shown)" or "")
+        .. " | telemetry left out: " .. telemetry .. " (Engagement, notifications, pet XP)")
+end
+
+-- 8. The event instance at the end: you may have entered the mountain while recording.
+local function instanceAfter()
+    section("8. Event instance at the end (state, custom eggs, layout, prompts)")
+    local thingsNow = workspace:FindFirstChild("__THINGS")
+    local instances = thingsNow and thingsNow:FindFirstChild("Instances")
+    local state = instances and instances:FindFirstChild("DiamondMountain")
+    if state then
+        local attrs = {}
+        for k, v in pairs(state:GetAttributes()) do attrs[#attrs + 1] = k .. "=" .. short(v) end
+        table.sort(attrs)
+        line("  __THINGS.Instances.DiamondMountain: " .. table.concat(attrs, ", "))
+    end
+    local kids = {}
+    for _, c in ipairs(thingsNow and thingsNow:GetChildren() or {}) do
+        kids[#kids + 1] = c.Name .. "(" .. #c:GetChildren() .. ")"
+        -- Egg folders: their children are the ids that egg hatch requests send.
+        if string.find(string.lower(c.Name), "egg", 1, true) then
+            for i, egg in ipairs(c:GetChildren()) do
+                if i > 30 then break end
+                local attrs = {}
+                for k, v in pairs(egg:GetAttributes()) do attrs[#attrs + 1] = k .. "=" .. short(v) end
+                table.sort(attrs)
+                line("  " .. egg:GetFullName() .. " [" .. egg.ClassName .. "] " .. table.concat(attrs, ", "))
+            end
+        end
+    end
+    table.sort(kids)
+    line("  __THINGS: " .. table.concat(kids, ", "))
+    local containerNow = thingsNow and thingsNow:FindFirstChild("__INSTANCE_CONTAINER")
+    local active = containerNow and containerNow:FindFirstChild("Active")
+    if not active or #active:GetChildren() == 0 then
+        line("  not inside an event instance at the end (be on the mountain when the time is up)")
+        return
+    end
+    -- Folders/models near the top, anything with attributes, and every prompt or click
+    -- detector (how players interact). Repeats collapse into one row.
+    local iRows, iRowOf, iScanned = {}, {}, 0
+    for _, d in ipairs(active:GetDescendants()) do
+        iScanned += 1
+        if iScanned % 5000 == 0 then task.wait() end
+        local depth, p = 0, d.Parent
+        while p and p ~= active do depth += 1 p = p.Parent end
+        local attrs = {}
+        for k, v in pairs(d:GetAttributes()) do attrs[#attrs + 1] = k .. "=" .. short(v) end
+        local prompt = d:IsA("ProximityPrompt") or d:IsA("ClickDetector")
+        if prompt or #attrs > 0 or (depth <= 3 and (d:IsA("Folder") or d:IsA("Model"))) then
+            local key = (d.Parent and d.Parent:GetFullName() or "?") .. "." .. d.Name:gsub("%d+", "#") .. "[" .. d.ClassName .. "]"
+            local row = iRowOf[key]
+            if row then
+                row.count += 1
+            elseif #iRows < 400 then
+                table.sort(attrs)
+                local extra = ""
+                if d:IsA("ProximityPrompt") then
+                    extra = string.format(' action="%s" object="%s" hold=%s', tostring(d.ActionText), tostring(d.ObjectText), tostring(d.HoldDuration))
+                end
+                row = { text = d:GetFullName() .. " [" .. d.ClassName .. "]" .. extra .. (#attrs > 0 and (" " .. table.concat(attrs, ", ")) or ""), count = 1 }
+                iRowOf[key] = row
+                iRows[#iRows + 1] = row
+            end
+        end
+    end
+    for _, row in ipairs(iRows) do line("  " .. row.text .. (row.count > 1 and ("  (x" .. row.count .. " similar)") or "")) end
+    line("  shown " .. #iRows .. " rows (scanned " .. iScanned .. " objects in the instance)")
 end
 
 if RECORD_SECONDS > 0 then
@@ -368,19 +477,54 @@ if RECORD_SECONDS > 0 then
     print("[EventProbe] RECORDING " .. RECORD_SECONDS .. " s. Do what you can, each once, slowly: teleport to a camp,")
     print("[EventProbe] send pets to a Rubble Wall, fight the Yeti, feed ONE cheap pet, start + claim an expedition, open")
     print("[EventProbe] a trail chest, buy one merchant item, buy one mountain upgrade, use one boost, buy one camp egg.")
-    print("[EventProbe] Skip what you can't do now; the report saves itself when the time is up.")
+    print("[EventProbe] Skip what you can't do now; stay on the mountain; the report saves itself when the time is up.")
     local NOISE = { "Breakables_PlayerDealDamage", "Orbs", "Lootbags", "Idle", "Ping", "Mouse", "Camera", "Mark Approached" }
-    local seen, count, captured, recording = {}, 0, 0, true
+    -- Each remote (each event action for Instancing_* remotes) gets its own few lines, so one
+    -- chatty remote cannot use up the report: in run 1, fps pings filled it after 138 s.
+    local PER_REMOTE, MAX_LINES = 4, 400
+    local seen, buckets, lines, captured, recording = {}, {}, 0, 0, true
+    local function bucketOf(name, args)
+        if string.sub(name, 1, 11) == "Instancing_" and type(args[2]) == "string" then return name .. " " .. args[2] end
+        return name
+    end
+    local function bucketFor(method, name, args)
+        local key = bucketOf(name, args)
+        local b = buckets[key]
+        if not b then
+            b = { key = key, method = method, calls = 0, shown = 0, replies = 0 }
+            buckets[key] = b
+        end
+        return b
+    end
     -- Formats one captured request. Runs in its own thread, outside the hook.
     local function record(at, method, name, args)
-        if count >= 200 then return end
+        local b = bucketFor(method, name, args)
+        b.calls += 1
+        if b.shown >= PER_REMOTE or lines >= MAX_LINES then return end
         local parts = {}
         for i = 1, args.n do parts[i] = short(args[i]) end
         local key = name .. "(" .. table.concat(parts, ", ") .. ")"
         if not seen[key] then
             seen[key] = true
-            count += 1
+            b.shown += 1
+            lines += 1
             out[#out + 1] = redact(string.format("  [+%5.1fs] %s %s", at, method, key))
+        end
+    end
+    local function recordReply(at, name, args, text)
+        local b = bucketFor("InvokeServer", name, args)
+        if b.replies >= 2 or lines >= MAX_LINES then return end
+        b.replies += 1
+        lines += 1
+        out[#out + 1] = redact(string.format("  [+%5.1fs]   reply %s -> %s", at, b.key, text))
+    end
+    local function totals()
+        section("6b. Request totals while recording (every remote, also those not shown above)")
+        local list = {}
+        for _, b in pairs(buckets) do list[#list + 1] = b end
+        table.sort(list, function(a, b) return a.calls > b.calls end)
+        for i = 1, math.min(#list, 150) do
+            line(string.format("  %5d  %s %s", list[i].calls, list[i].method, list[i].key))
         end
     end
     if canHook then
@@ -390,7 +534,7 @@ if RECORD_SECONDS > 0 then
             -- that old() dispatches the game's own request as (FireServer -> GetFullName).
             if recording then
                 local method = getnamecallmethod()
-                if (method == "FireServer" or method == "InvokeServer") and captured < 2000 and typeof(self) == "Instance" then
+                if (method == "FireServer" or method == "InvokeServer") and captured < 5000 and typeof(self) == "Instance" then
                     local name = self.Name
                     local noisy = false
                     for _, w in ipairs(NOISE) do
@@ -408,6 +552,21 @@ if RECORD_SECONDS > 0 then
                             end
                         end
                         task.defer(record, os.clock() - started, method, name, args)
+                        -- The server's reply (wall HP, expedition state...). Only where this thread
+                        -- may yield across our frame; otherwise pass the call straight through.
+                        if method == "InvokeServer" and coroutine.isyieldable() then
+                            local reply = table.pack(old(self, ...))
+                            -- The request has been dispatched and answered: formatting (which makes
+                            -- colon calls) can no longer change it. Errors here never reach the game.
+                            local okText, text = pcall(function()
+                                local parts = {}
+                                for i = 1, reply.n do parts[i] = long(reply[i]) end
+                                return table.concat(parts, ", ")
+                            end)
+                            if type(setnamecallmethod) == "function" then pcall(setnamecallmethod, method) end
+                            task.defer(recordReply, os.clock() - started, name, args, okText and text or "?")
+                            return table.unpack(reply, 1, reply.n)
+                        end
                     end
                 end
             end
@@ -416,8 +575,10 @@ if RECORD_SECONDS > 0 then
     end
     task.delay(RECORD_SECONDS, function()
         recording = false -- the hook becomes a pass-through; it is not re-hooked
-        if canHook and count == 0 then line("  nothing recorded") end
+        if canHook and lines == 0 then line("  nothing recorded") end
+        if canHook then totals() end
         if before then saveDiff(before) end
+        instanceAfter()
         finish()
     end)
 else

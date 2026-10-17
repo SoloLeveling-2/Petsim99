@@ -2,6 +2,45 @@
 
 Newest first. Each entry: what changed, why, evidence, tests, limits, rollback.
 
+## 2026-10-17 — Live event probe run 1; probe fixes for run 2
+
+**Evidence.** The user ran the event probe once (Potassium v2.5.3, World 2 server), entered Diamond Mountain, went through the tutorial, loaded pets on wall 1 and hatched the camp egg. The facts are in `DIAMOND_MOUNTAIN_FINDINGS.md`. Main points:
+- The event is an instance in the World 2 server.
+- All actions go through `Instancing_InvokeCustomFromClient("DiamondMountain", "DM_…")`.
+- Wall state is under `Save.InstanceVars.DiamondMountain` (5 walls).
+- Yeti health is on instance attributes.
+- Potassium's thread identity is 8, so v1.1.9's identity fix is inert live.
+
+**Defects the run exposed (data lost).**
+1. `UnreliableRemoteEvent({fps=…})` pings, each with a new value, filled the 200-line recorder at +138 s. The last 160 s are missing; for example, a Red Panda load shows in the Save diff but not in the recording.
+2. No server replies are recorded, so the wall HP from `DM_Walls_Status` is unknown.
+3. The world scan ran before the player entered the mountain.
+4. The Save diff (cap 300) was ~170 lines of `Save.Engagement.Stats` telemetry.
+
+**Red** (new checks in `probe_recorder.luau` modelled on run 1): 8 FAIL.
+
+**Change.**
+- Recorder:
+  - At most 4 lines per remote (per action for `Instancing_*`), 400 lines in all.
+  - Section 6b gives each remote's total calls.
+  - Replies to InvokeServer requests are recorded. This happens only when `coroutine.isyieldable()` (otherwise the call passes straight through as before), and is formatted after the server answered: inside `pcall`, with the namecall method restored afterwards.
+- Save diff: leaves out telemetry (counted), puts DiamondMountain first, cap 400.
+- New section 8 at the end:
+  - the instance attributes again;
+  - `__THINGS` children, plus the children of egg folders (custom egg ids);
+  - the active instance's layout: folders/models to depth 3, anything with attributes, every ProximityPrompt/ClickDetector with its action text.
+- Section 2 shows each function's argument count (`debug.info(f, "a")`).
+
+**Green.**
+- Event probe 35/35 checks, general probe 13/13.
+- Full suite on v1.1.9: 25/25.
+- Probe compile OK; Selene 0 errors, 0 warnings.
+- Probe SHA-256 `BB2D0578…DA79`.
+
+**Limits.**
+- Mocked runtime.
+- Reply capture relies on yielding inside the hook. That is the same pattern as the game's own `local r = remote:InvokeServer()`, but it is unobserved on Potassium.
+
 ## 2026-10-17 — Event probe: one run collects everything
 
 **Why.** The user asked what to execute to get all the missing facts. Before handing over the event probe, I compared its sections with the list of unknowns. Four gaps:
