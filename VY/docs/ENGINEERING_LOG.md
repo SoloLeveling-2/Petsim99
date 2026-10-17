@@ -2,6 +2,30 @@
 
 Newest first. Each entry: what changed, why, evidence, tests, limits, rollback.
 
+## 2026-10-17 — Event probe: one run collects everything
+
+**Why.** The user asked what to execute to get all the missing facts. Before handing over the event probe, I compared its sections with the list of unknowns. Four gaps:
+- Section 3 matched only table *names*, so this event's entries in tables every event shares (`Eggs`, `Pets`, `Currency`) never showed. Child-module tables that load lazily were skipped.
+- The shared `Boosts` table matches "boost", so section 3 dumped its first 30 keys (mostly other events') and could cut off the Diamond Mountain ones.
+- No executor information (functions, thread identity).
+- A 120 s window was short for ten actions, and nothing warned when VY AutoRank was running. VY's own requests would mix into the recording, and it may teleport away.
+
+**Red** (new checks in `probe_recorder.luau`, event probe): 9 FAIL.
+
+**Change.**
+- Section 0: executor name (`identifyexecutor`), thread identity, available/MISSING executor functions, and a warning if `getgenv().VyAutoRank` is alive.
+- Section 3: lists every Directory table, including child modules (read via `Directory[name]`, else `require`, at identity 2). Tables over 40 entries show only this event's keys.
+- New 3b: this event's entries in every table, matched by key or `DisplayName` with stricter event words, bounded to 300.
+- `RECORD_SECONDS` 120 → 300, and the on-screen instructions say to skip what isn't available.
+- Selene std: added `firetouchinterest` and `setnamecallmethod`.
+
+**Green.**
+- Event probe 26/26 checks, general probe 13/13.
+- Full suite on v1.1.9: 25/25.
+- Event probe Selene: 0 errors, 0 warnings. Compile OK.
+
+**Limits.** Mocked runtime. The event words were chosen from the patch notes and the public API names; an entry named with none of them is still found by the recorder and the Save diff, not by 3b.
+
 ## 2026-10-17 — v1.1.9: `gcall` restores the identity it found; probe table copies; harness identity model
 
 **Why.** The user asked to fix `gcall`'s hardcoded `setthreadidentity(8)` after a review explained the nested case. A second review point: the probe recorder formats arguments one deferred step later, so a scratch table the game clears right after sending would be logged as `{}`.

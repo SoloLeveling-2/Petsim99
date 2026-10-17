@@ -2,8 +2,10 @@
 --  PS99 Event Probe - Diamond Mountain (update 98, 2026-10-17)        READ-ONLY
 --
 --  Finds the event's real names so an event script can be built on evidence:
+--    0. the executor's name, thread identity and which executor functions exist;
 --    1. remotes, client modules (+ functions), Directory tables and Save fields whose
---       names match the event keywords;
+--       names match the event keywords, plus this event's entries inside tables every
+--       event shares (camp eggs, pets, Acorns/TrailCoins, boosts...);
 --    2. matching objects in the world (camps, walls, Yeti, trails, chests, merchant...);
 --    3. RECORDER: for RECORD_SECONDS it notes every request the GAME sends while YOU
 --       do the actions by hand (send pets to a wall, feed/fight the Yeti, start/claim an
@@ -13,12 +15,16 @@
 --  It sends nothing itself and never blocks or changes a request. After recording, its
 --  hook stays as a pass-through until you leave the server (re-hooking could drop hooks
 --  other scripts added meanwhile). Your UserId/name become <me>. Report:
---  PS99_EventProbe_<date>.txt. Run it once at base camp and once at the summit: far
---  parts of the mountain may not be loaded (streaming) where you stand.
+--  PS99_EventProbe_<date>.txt. Stop VY AutoRank first (GUI X). Run it once at base camp
+--  and once at the summit: far parts of the mountain may not be loaded where you stand.
 -- =====================================================================================
-local RECORD_SECONDS = 120   -- time you have to do the actions by hand (0 = no recording)
+local RECORD_SECONDS = 300   -- time you have to do the actions by hand (0 = no recording)
 local KEYWORDS = { "mountain", "yeti", "camp", "rubble", "wall", "trail", "expedition", "artifact",
     "acorn", "merchant", "summit", "season", "boost", "upgrade", "climb", "pedestal", "marmot", "equinox" }
+-- Stricter words for this event's own entries inside tables shared by all events
+-- (Eggs, Pets, Currency, Boosts...): "boost" or "merchant" there would list every event.
+local ENTRY_KEYWORDS = { "mountain", "yeti", "summit", "acorn", "trail", "expedition", "rubble", "camp",
+    "marmot", "markhor", "equinox", "hiker", "climber", "abominable" }
 
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
@@ -44,6 +50,19 @@ local function matches(name)
     local l = string.lower(tostring(name))
     for _, k in ipairs(KEYWORDS) do if l:find(k, 1, true) then return true end end
     return false
+end
+-- A Directory entry of this event: by its key or by its display name.
+local function entryMatches(key, value)
+    local function has(s)
+        if type(s) ~= "string" then return false end
+        s = string.lower(s)
+        for _, k in ipairs(ENTRY_KEYWORDS) do if s:find(k, 1, true) then return true end end
+        return false
+    end
+    if has(tostring(key)) then return true end
+    if type(value) ~= "table" then return false end
+    local ok, name = pcall(function() return value.DisplayName or value.name or value.Name end)
+    return ok and has(name)
 end
 -- Game modules need identity 2; afterwards restore whatever identity this thread had.
 local function asGame(fn, ...)
@@ -108,6 +127,38 @@ end
 
 line("PS99 Event Probe (Diamond Mountain) | " .. os.date("!%Y-%m-%d %H:%M:%S UTC") .. " | PlaceId " .. game.PlaceId)
 
+-- 0. Executor ---------------------------------------------------------------------------
+section("0. Executor (what an event script can use here)")
+local okExec, execName, execVersion = false, nil, nil
+if type(identifyexecutor) == "function" then okExec, execName, execVersion = pcall(identifyexecutor) end
+line("  executor: " .. (okExec and (tostring(execName) .. (execVersion ~= nil and (" " .. tostring(execVersion)) or "")) or "unknown"))
+local okIdentity, identity = false, nil
+if type(getthreadidentity) == "function" then okIdentity, identity = pcall(getthreadidentity) end
+line("  thread identity: " .. (okIdentity and tostring(identity) or "unknown"))
+local CAPS = {
+    { "checkcaller", checkcaller }, { "fireclickdetector", fireclickdetector },
+    { "fireproximityprompt", fireproximityprompt }, { "firesignal", firesignal },
+    { "firetouchinterest", firetouchinterest }, { "getconnections", getconnections }, { "getgenv", getgenv },
+    { "gethui", gethui }, { "getnamecallmethod", getnamecallmethod }, { "getsenv", getsenv },
+    { "getthreadidentity", getthreadidentity }, { "hookfunction", hookfunction }, { "hookmetamethod", hookmetamethod },
+    { "identifyexecutor", identifyexecutor }, { "isfile", isfile }, { "queue_on_teleport", queue_on_teleport },
+    { "readfile", readfile }, { "setclipboard", setclipboard }, { "setnamecallmethod", setnamecallmethod },
+    { "setthreadidentity", setthreadidentity }, { "writefile", writefile },
+}
+local available, missing = {}, {}
+for _, cap in ipairs(CAPS) do
+    if type(cap[2]) == "function" then available[#available + 1] = cap[1] else missing[#missing + 1] = cap[1] end
+end
+line("  available: " .. table.concat(available, ", "))
+line("  MISSING: " .. (#missing > 0 and table.concat(missing, ", ") or "none"))
+local okGenv, genv = pcall(function() return type(getgenv) == "function" and getgenv() or nil end)
+local vy = okGenv and type(genv) == "table" and genv.VyAutoRank or nil
+if type(vy) == "table" and type(vy.State) == "table" and vy.State.alive then
+    line("  WARNING: VY AutoRank is running - its own requests mix into section 6 and it may leave the mountain.")
+    line("           Stop it (GUI X), then run this probe again for a clean report.")
+    print("[EventProbe] VY AutoRank is running - stop it (GUI X) first for a clean recording")
+end
+
 -- 1. Remotes ---------------------------------------------------------------------------
 section("1. Event remotes (ReplicatedStorage.Network)")
 local net = RS:FindFirstChild("Network")
@@ -146,20 +197,60 @@ section("3. Event tables in Library.Directory (keys + one sample entry)")
 local dirMod = library and library:FindFirstChild("Directory")
 local okDir, Dir = false, nil
 if dirMod then okDir, Dir = asGame(require, dirMod) end
+-- Every Directory table: those already in Directory plus its child modules, which may
+-- only load when first asked for.
+local dirTables = {}
 if okDir and type(Dir) == "table" then
     for name, tbl in pairs(Dir) do
-        if matches(name) and type(tbl) == "table" then
-            local keys, sample = {}, nil
-            for k, v in pairs(tbl) do
-                keys[#keys + 1] = tostring(k)
-                sample = sample or v
-            end
-            table.sort(keys)
-            line("  Directory." .. tostring(name) .. " (" .. #keys .. "): " .. table.concat(keys, ", ", 1, math.min(#keys, 30)))
+        if type(tbl) == "table" then dirTables[tostring(name)] = tbl end
+    end
+end
+for _, child in ipairs(dirMod and dirMod:GetChildren() or {}) do
+    local childName = child.Name
+    if child:IsA("ModuleScript") and dirTables[childName] == nil then
+        local okT, tbl = false, nil
+        if okDir and type(Dir) == "table" then okT, tbl = asGame(function() return Dir[childName] end) end
+        if not (okT and type(tbl) == "table") then okT, tbl = asGame(require, child) end
+        if okT and type(tbl) == "table" then dirTables[childName] = tbl end
+    end
+end
+local dirNames = {}
+for name in pairs(dirTables) do dirNames[#dirNames + 1] = name end
+table.sort(dirNames)
+line("  tables (" .. #dirNames .. "): " .. table.concat(dirNames, ", "))
+for _, name in ipairs(dirNames) do
+    if matches(name) then
+        local keys, eventKeys, sample = {}, {}, nil
+        for k, v in pairs(dirTables[name]) do
+            keys[#keys + 1] = tostring(k)
+            if entryMatches(k, v) then eventKeys[#eventKeys + 1] = tostring(k) end
+            sample = sample or v
+        end
+        table.sort(keys)
+        table.sort(eventKeys)
+        if #keys <= 40 then
+            line("  Directory." .. name .. " (" .. #keys .. "): " .. table.concat(keys, ", "))
             line("      sample: " .. short(sample))
+        else -- a table shared by all events: only this event's keys (details in 3b)
+            line("  Directory." .. name .. " (" .. #keys .. ", shared): event keys " .. (#eventKeys > 0 and table.concat(eventKeys, ", ") or "none"))
         end
     end
 end
+
+section("3b. This event's entries in every Directory table (camp eggs, pets, currencies, boosts...)")
+local entryRows, visited = {}, 0
+for _, name in ipairs(dirNames) do
+    for k, v in pairs(dirTables[name]) do
+        visited += 1
+        if visited % 5000 == 0 then task.wait() end
+        if #entryRows < 300 and entryMatches(k, v) then
+            entryRows[#entryRows + 1] = "  Directory." .. name .. "[" .. string.format("%q", tostring(k)) .. "] = " .. short(v)
+        end
+    end
+end
+table.sort(entryRows)
+for _, r in ipairs(entryRows) do line(r) end
+line("  entries: " .. #entryRows .. (#entryRows >= 300 and " (first 300)" or "") .. " (checked " .. visited .. ")")
 
 -- 4. Save fields ------------------------------------------------------------------------
 section("4. Event fields in Save.Get() (name matches up to 5 levels deep, contents shown)")
@@ -274,9 +365,10 @@ if RECORD_SECONDS > 0 then
     local canHook = type(hookmetamethod) == "function" and type(getnamecallmethod) == "function"
     section("6. Requests the game sent while you played (" .. RECORD_SECONDS .. " s)")
     if not canHook then line("  RECORD skipped: hookmetamethod/getnamecallmethod not available in this executor") end
-    print("[EventProbe] RECORDING " .. RECORD_SECONDS .. " s. Do each once, slowly: teleport to a camp, send pets to a")
-    print("[EventProbe] Rubble Wall, fight the Yeti, feed ONE cheap pet, start + claim an expedition, open a trail chest,")
-    print("[EventProbe] buy one merchant item, buy one mountain upgrade, use one boost, buy one camp egg.")
+    print("[EventProbe] RECORDING " .. RECORD_SECONDS .. " s. Do what you can, each once, slowly: teleport to a camp,")
+    print("[EventProbe] send pets to a Rubble Wall, fight the Yeti, feed ONE cheap pet, start + claim an expedition, open")
+    print("[EventProbe] a trail chest, buy one merchant item, buy one mountain upgrade, use one boost, buy one camp egg.")
+    print("[EventProbe] Skip what you can't do now; the report saves itself when the time is up.")
     local NOISE = { "Breakables_PlayerDealDamage", "Orbs", "Lootbags", "Idle", "Ping", "Mouse", "Camera", "Mark Approached" }
     local seen, count, captured, recording = {}, 0, 0, true
     -- Formats one captured request. Runs in its own thread, outside the hook.

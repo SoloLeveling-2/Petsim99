@@ -112,6 +112,10 @@ globals:
     any: true
   fireproximityprompt:
     any: true
+  firetouchinterest:
+    any: true
+  setnamecallmethod:
+    any: true
   getfpscap:
     any: true
   setfpscap:

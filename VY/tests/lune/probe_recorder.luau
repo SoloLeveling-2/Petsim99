@@ -116,7 +116,20 @@ local SAVE = {
 local saveMod = new("ModuleScript", "Save", client)
 data[saveMod].module = { Get = function() return SAVE end }
 local dirMod = new("ModuleScript", "Directory", library)
-data[dirMod].module = { DiamondMountainCamps = { Camp1 = { Order = 1 } }, Ranks = {} }
+local boosts = { ["Boost | DiamondMountainLuck1"] = { DisplayName = "Luck Boost" } }
+for i = 1, 80 do boosts["Boost | Garden" .. i] = { DisplayName = "Garden Boost " .. i } end -- other events
+data[dirMod].module = {
+    DiamondMountainCamps = { Camp1 = { Order = 1 } }, Ranks = {},
+    Currency = { Acorns = { DisplayName = "Acorns" }, Coins = { DisplayName = "Coins" } },
+    Boosts = boosts,
+}
+-- A Directory table that is only a child module (not yet loaded into Directory).
+local eggsMod = new("ModuleScript", "Eggs", dirMod)
+data[eggsMod].module = {
+    ["Camp Egg 3"] = { DisplayName = "Camp Egg 3", Currency = "TrailCoins" },
+    ["Egg 251"] = { DisplayName = "Summit Egg" }, -- event name only in DisplayName
+    ["Cat Egg"] = { DisplayName = "Cat Egg" },
+}
 local things = new("Folder", "__THINGS", workspace)
 local ic = new("Folder", "__INSTANCE_CONTAINER", things)
 local active = new("Folder", "Active", ic)
@@ -158,7 +171,8 @@ local env = {
     end,
     writefile = function(p, c) M.files[p] = c end,
     setclipboard = function() end,
-    getgenv = function() return {} end,
+    identifyexecutor = function() return "Potassium", "1.0" end,
+    getgenv = function() return { VyAutoRank = { State = { alive = true } } } end, -- VY still running
 }
 
 local source = fs.readFile(PROBE)
@@ -231,6 +245,19 @@ if KIND == "event" then
         "bug 4: a Save change under non-keyword names is found by the before/after diff")
     check(report:find("YetiArena", 1, true) ~= nil, "bug 5: summit objects still listed after a crowded camp")
     check(report:find("Active instance", 1, true) ~= nil, "bug 5: active instance and streaming state reported")
+    -- One run collects everything the event script needs.
+    check(report:find("executor: Potassium 1.0", 1, true) ~= nil, "executor name reported")
+    check(report:find("thread identity: 7", 1, true) ~= nil, "executor thread identity reported")
+    check(report:find("MISSING: ", 1, true) ~= nil and report:find("firetouchinterest", 1, true) ~= nil,
+        "missing executor functions are listed by name")
+    check(report:find("VY AutoRank is running", 1, true) ~= nil, "warns when VY AutoRank is running during the probe")
+    check(report:find('Directory.Eggs["Camp Egg 3"]', 1, true) ~= nil,
+        "event entry in a lazily loaded Directory table (camp egg) is shown")
+    check(report:find('Directory.Eggs["Egg 251"]', 1, true) ~= nil, "event entry matched by its DisplayName is shown")
+    check(report:find('Directory.Currency["Acorns"]', 1, true) ~= nil, "event currency entry is shown")
+    check(report:find('Directory.Boosts["Boost | DiamondMountainLuck1"]', 1, true) ~= nil, "event boost entry is shown")
+    check(report:find("Garden", 1, true) == nil and report:find('"Cat Egg"', 1, true) == nil,
+        "other events' entries are not listed")
 end
 
 print(#failures == 0 and "ALL OK" or (#failures .. " FAILED"))
