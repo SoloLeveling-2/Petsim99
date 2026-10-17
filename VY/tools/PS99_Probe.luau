@@ -1,0 +1,297 @@
+-- =====================================================================================
+--  PS99 Probe v1.0 - READ-ONLY game-structure report for Pet Simulator 99 (Potassium)
+--
+--  Sends NO game requests, buys/uses nothing and changes no settings. It only reads
+--  what the client already has, then prints a report and saves it as a text file in the
+--  executor workspace folder (PS99_Probe_<date>.txt). UserId and player name are
+--  replaced with <me> in the output, so the report can be shared.
+--
+--  Optional RECORD mode (OFF by default): for RECORD_SECONDS seconds it notes which
+--  remotes the GAME itself fires while YOU do one action by hand (for example open one
+--  chest). It records names and argument types/short values only, never changes or
+--  blocks anything, and removes its hook when the time is up.
+-- =====================================================================================
+local RECORD_SECONDS = 0          -- 0 = off. Set to e.g. 20, run, then do ONE action by hand.
+local MAX_LINES_PER_SECTION = 400 -- keeps the report readable
+
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+local HttpService = game:GetService("HttpService")
+local player = Players.LocalPlayer
+local out = {}
+local me, myName = tostring(player and player.UserId or "?"), tostring(player and player.Name or "?")
+
+local function redact(s)
+    s = tostring(s)
+    local function esc(x) return (x:gsub("%p", "%%%0")) end
+    if #me > 2 then s = s:gsub(esc(me), "<me>") end
+    if #myName > 2 then s = s:gsub(esc(myName), "<me>") end
+    return s
+end
+local function line(...)
+    local parts = {}
+    for i = 1, select("#", ...) do parts[i] = tostring((select(i, ...))) end
+    out[#out + 1] = redact(table.concat(parts, " "))
+end
+local function section(title) line("") line("==== " .. title .. " ====") end
+
+-- Game modules need identity 2; GUI/executor work stays at 8.
+local function asGame(fn, ...)
+    if type(setthreadidentity) == "function" then pcall(setthreadidentity, 2) end
+    local r = table.pack(pcall(fn, ...))
+    if type(setthreadidentity) == "function" then pcall(setthreadidentity, 8) end
+    return table.unpack(r, 1, r.n)
+end
+
+local function short(v)
+    local t = typeof(v)
+    if t == "string" then return string.format("%q", #v > 40 and v:sub(1, 40) .. "..." or v) end
+    if t == "number" or t == "boolean" or t == "nil" then return tostring(v) end
+    if t == "Instance" then return "Instance<" .. v.ClassName .. ">" .. v:GetFullName() end
+    if t == "table" then
+        local n = 0
+        for _ in pairs(v) do n += 1 end
+        return "table(" .. n .. ")"
+    end
+    return t
+end
+
+-- Shape of a table: keys with value types, nested to a small depth.
+local function shape(tbl, depth, indent, budget)
+    budget = budget or { n = 0 }
+    local keys = {}
+    for k in pairs(tbl) do keys[#keys + 1] = k end
+    table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+    for _, k in ipairs(keys) do
+        budget.n += 1
+        if budget.n > MAX_LINES_PER_SECTION then line(indent .. "... (truncated)") return end
+        local v = tbl[k]
+        line(indent .. tostring(k) .. " : " .. (type(v) == "table" and short(v) or typeof(v) .. " = " .. short(v)))
+        if type(v) == "table" and depth > 0 then shape(v, depth - 1, indent .. "  ", budget) end
+    end
+end
+
+line("PS99 Probe v1.0 | " .. os.date("!%Y-%m-%d %H:%M:%S UTC") .. " | PlaceId " .. tostring(game.PlaceId))
+
+-- 1. Executor capabilities -----------------------------------------------------------
+section("1. Executor functions available")
+local caps = { getgenv = getgenv, setthreadidentity = setthreadidentity, getthreadidentity = getthreadidentity,
+    hookfunction = hookfunction, hookmetamethod = hookmetamethod, getnamecallmethod = getnamecallmethod,
+    getsenv = getsenv, getconnections = getconnections, setreadonly = setreadonly, gethui = gethui,
+    setclipboard = setclipboard, readfile = readfile, writefile = writefile, isfile = isfile,
+    makefolder = makefolder, queue_on_teleport = queue_on_teleport, loadstring = loadstring }
+local capNames = {}
+for k in pairs(caps) do capNames[#capNames + 1] = k end
+table.sort(capNames)
+for _, name in ipairs(capNames) do line(string.format("  %-20s %s", name, type(caps[name]) == "function" and "yes" or "NO")) end
+
+-- 2. Client modules and their functions ----------------------------------------------
+local library = RS:FindFirstChild("Library")
+local client = library and library:FindFirstChild("Client")
+section("2. ReplicatedStorage.Library.Client modules (functions each one exposes)")
+if not client then line("  Library.Client not found (game not loaded yet?)") else
+    local mods = client:GetChildren()
+    table.sort(mods, function(a, b) return a.Name < b.Name end)
+    for _, m in ipairs(mods) do
+        if m:IsA("ModuleScript") then
+            local ok, mod = asGame(require, m)
+            if ok and type(mod) == "table" then
+                local fns = {}
+                for k, v in pairs(mod) do if type(v) == "function" then fns[#fns + 1] = tostring(k) end end
+                table.sort(fns)
+                line("  " .. m.Name .. " (" .. #fns .. "): " .. table.concat(fns, ", "))
+            else
+                line("  " .. m.Name .. " : " .. (ok and typeof(mod) or "require failed: " .. tostring(mod)))
+            end
+        end
+    end
+end
+section("2b. Library.Util / Balancing / Modules children")
+for _, folder in ipairs({ "Util", "Balancing", "Modules" }) do
+    local f = library and library:FindFirstChild(folder)
+    if f then
+        local names = {}
+        for _, c in ipairs(f:GetChildren()) do names[#names + 1] = c.Name end
+        table.sort(names)
+        line("  " .. folder .. ": " .. table.concat(names, ", "))
+    end
+end
+
+-- 3. Remotes -------------------------------------------------------------------------
+section("3. Remotes (ReplicatedStorage.Network): name -> class")
+local net = RS:FindFirstChild("Network")
+if net then
+    local rows = {}
+    for _, r in ipairs(net:GetChildren()) do rows[#rows + 1] = string.format("  %-45s %s", r.Name, r.ClassName) end
+    table.sort(rows)
+    for _, r in ipairs(rows) do line(r) end
+    line("  total: " .. #rows)
+else line("  Network folder not found") end
+
+-- 4. Save structure ------------------------------------------------------------------
+local saveMod = client and client:FindFirstChild("Save")
+local okSave, save = false, nil
+if saveMod then
+    local okReq, S = asGame(require, saveMod)
+    if okReq and type(S) == "table" and type(S.Get) == "function" then okSave, save = asGame(S.Get) end
+end
+section("4. Save.Get(): top-level keys")
+if okSave and type(save) == "table" then
+    for k, v in pairs(save) do
+        if k ~= "Inventory" and k ~= "Goals" then line("  " .. tostring(k) .. " : " .. typeof(v) .. " = " .. short(v)) end
+    end
+    section("4b. Active rank quests (Save.Goals)")
+    for key, g in pairs(save.Goals or {}) do
+        if type(g) == "table" then
+            local f = {}
+            for k, v in pairs(g) do
+                f[#f + 1] = tostring(k) .. "=" .. (k == "UID" and "<uid>" or short(v))
+            end
+            table.sort(f)
+            line("  key " .. tostring(key) .. " (" .. typeof(key) .. "): " .. table.concat(f, ", "))
+        end
+    end
+    section("4c. Inventory: categories, stack counts, field names of one sample")
+    for cat, items in pairs(save.Inventory or {}) do
+        if type(items) == "table" then
+            local n, sample = 0, nil
+            for _, it in pairs(items) do n += 1 sample = sample or it end
+            local fields = {}
+            if type(sample) == "table" then
+                for k, v in pairs(sample) do fields[#fields + 1] = tostring(k) .. ":" .. typeof(v) end
+                table.sort(fields)
+            end
+            line(string.format("  %-12s %5d stacks | sample fields: %s | sample id: %s", tostring(cat), n,
+                table.concat(fields, ", "), type(sample) == "table" and short(sample.id) or "-"))
+        end
+    end
+    local keys = 0
+    for _, it in pairs((save.Inventory or {}).Misc or {}) do
+        if type(it) == "table" and it.id == "Crystal Key" then keys += tonumber(it._am) or 1 end
+    end
+    line("  Crystal Key (full) count: " .. keys)
+else line("  Save.Get() unavailable: " .. tostring(save)) end
+
+-- 5. Directory -----------------------------------------------------------------------
+section("5. Library.Directory tables and current rank quest pools")
+local dirMod = library and library:FindFirstChild("Directory")
+local okDir, Dir = false, nil
+if dirMod then okDir, Dir = asGame(require, dirMod) end
+if okDir and type(Dir) == "table" then
+    local names = {}
+    for k, v in pairs(Dir) do names[#names + 1] = tostring(k) .. "(" .. short(v) .. ")" end
+    table.sort(names)
+    line("  " .. table.concat(names, ", "))
+    local util = library:FindFirstChild("Util")
+    local ru = util and util:FindFirstChild("RanksUtil")
+    local okRU, RU = false, nil
+    if ru then okRU, RU = asGame(require, ru) end
+    if okRU and type(RU) == "table" and okSave and type(save) == "table" and type(RU.RankIDFromNumber) == "function" then
+        local _, id = asGame(RU.RankIDFromNumber, tonumber(save.Rank))
+        local rank = id ~= nil and type(Dir.Ranks) == "table" and Dir.Ranks[id] or nil
+        line("  current rank id: " .. tostring(id))
+        if type(rank) == "table" and type(rank.Goals) == "table" then
+            for slot, pool in pairs(rank.Goals) do
+                local entries = {}
+                for _, e in pairs(pool) do
+                    if type(e) == "table" then
+                        local extra = ""
+                        for _, f in ipairs({ "PotionTier", "EnchantTier", "BreakableType", "CurrencyID" }) do
+                            if e[f] ~= nil then extra = extra .. " " .. f .. "=" .. tostring(e[f]) end
+                        end
+                        entries[#entries + 1] = "T" .. tostring(e.Type) .. "x" .. tostring(e.Amount) .. extra
+                    end
+                end
+                line("  slot " .. tostring(slot) .. ": " .. table.concat(entries, " | "))
+            end
+        end
+    end
+else line("  Directory unavailable") end
+
+-- 6. World layout --------------------------------------------------------------------
+section("6. Workspace layout")
+local things = workspace:FindFirstChild("__THINGS")
+if things then
+    local names = {}
+    for _, c in ipairs(things:GetChildren()) do names[#names + 1] = c.Name end
+    table.sort(names)
+    line("  __THINGS: " .. table.concat(names, ", "))
+    local br = things:FindFirstChild("Breakables")
+    if br then
+        local kids = br:GetChildren()
+        line("  Breakables: " .. #kids)
+        local s = kids[1]
+        if s then
+            local attrs = {}
+            for k, v in pairs(s:GetAttributes()) do attrs[#attrs + 1] = k .. "=" .. short(v) end
+            table.sort(attrs)
+            line("  sample breakable " .. s.ClassName .. " '" .. s.Name .. "': " .. table.concat(attrs, ", "))
+        end
+    end
+    local ic = things:FindFirstChild("__INSTANCE_CONTAINER")
+    local act = ic and ic:FindFirstChild("Active")
+    if act then
+        local n = {}
+        for _, c in ipairs(act:GetChildren()) do n[#n + 1] = c.Name end
+        line("  active instance(s): " .. (#n > 0 and table.concat(n, ", ") or "none"))
+    end
+end
+local maps = {}
+for _, c in ipairs(workspace:GetChildren()) do
+    if c.Name:find("Map") then maps[#maps + 1] = c.Name .. "(" .. #c:GetChildren() .. " children)" end
+end
+line("  map folders: " .. table.concat(maps, ", "))
+local map = workspace:FindFirstChild("Map")
+local castle = map and map:FindFirstChild("3 | Castle")
+local pad = castle and castle:FindFirstChild("INTERACT") and castle.INTERACT:FindFirstChild("CrystalChest")
+pad = pad and pad:FindFirstChild("Pad")
+line("  Crystal Chest pad (Map['3 | Castle'].INTERACT.CrystalChest.Pad): " .. (pad and "FOUND" or "not loaded / not found"))
+local debris = workspace:FindFirstChild("__DEBRIS")
+line("  __DEBRIS children: " .. (debris and #debris:GetChildren() or "none"))
+
+-- 7. Optional recorder (read-only observation of the game's own requests) -------------
+local function save_report()
+    local text = table.concat(out, "\n")
+    for i = 1, #out, 60 do print(table.concat(out, "\n", i, math.min(i + 59, #out))) end
+    if type(writefile) == "function" then
+        local name = "PS99_Probe_" .. os.date("!%Y%m%d_%H%M%S") .. ".txt"
+        local ok, err = pcall(writefile, name, text)
+        print(ok and ("[Probe] saved " .. name .. " in your executor workspace folder") or ("[Probe] save failed: " .. tostring(err)))
+    end
+    if type(setclipboard) == "function" then pcall(setclipboard, text) print("[Probe] report also copied to clipboard") end
+end
+
+if RECORD_SECONDS > 0 and type(hookmetamethod) == "function" and type(getnamecallmethod) == "function" then
+    section("7. Recorded game requests (" .. RECORD_SECONDS .. " s) - do ONE action by hand now")
+    print("[Probe] RECORDING for " .. RECORD_SECONDS .. " s: do ONE action by hand now")
+    local seen, count, old = {}, 0, nil
+    local NOISE = { "Breakables_", "Orbs", "Lootbags", "Pets_", "Idle", "Ping", "Mouse", "Camera" }
+    old = hookmetamethod(game, "__namecall", function(self, ...)
+        local method = getnamecallmethod()
+        if (method == "FireServer" or method == "InvokeServer") and typeof(self) == "Instance" and count < 60 then
+            local name = self.Name
+            local noisy = false
+            for _, w in ipairs(NOISE) do if name:find(w, 1, true) then noisy = true break end end
+            if not noisy then
+                local args = table.pack(...)
+                local parts = {}
+                for i = 1, args.n do parts[i] = short(args[i]) end
+                local key = name .. "(" .. table.concat(parts, ", ") .. ")"
+                if not seen[key] then
+                    seen[key] = true
+                    count += 1
+                    out[#out + 1] = redact(string.format("  %s %s  args=%d", method, key, args.n))
+                end
+            end
+        end
+        return old(self, ...)
+    end)
+    task.delay(RECORD_SECONDS, function()
+        hookmetamethod(game, "__namecall", old) -- remove the observer
+        if count == 0 then line("  nothing recorded (noise filtered or no action done)") end
+        save_report()
+    end)
+else
+    if RECORD_SECONDS > 0 then line("  RECORD skipped: hookmetamethod/getnamecallmethod not available") end
+    save_report()
+end
