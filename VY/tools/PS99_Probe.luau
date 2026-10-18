@@ -23,14 +23,68 @@ local out = {}
 local me, myName = tostring(player and player.UserId or "?"), tostring(player and player.Name or "?")
 local myDisplay = tostring(player and player.DisplayName or "")
 
+local function esc(x) return (x:gsub("%p", "%%%0")) end
+-- Display names may contain '_'; usernames are [A-Za-z0-9_] and never start or end with '_',
+-- so for a username '_' is a boundary. Usernames are not case-sensitive.
+local WORD_START, WORD_END = "%f[%w_\128-\255]", "%f[^%w_\128-\255]"
+local NAME_START, NAME_END = "%f[%w\128-\255]", "%f[^%w\128-\255]"
+local function anyCase(name) return (esc(name):gsub("%a", function(c) return "[" .. c:lower() .. c:upper() .. "]" end)) end
+-- Other players are never named in the report: each gets an alias <p1>, <p2>... The text
+-- backstop knows only the unique ids (Name, UserId): a display name is not unique and may be
+-- a game word, so it is hidden only where a Player is printed. Names that are also Directory
+-- keys (game words) are likewise left to that structural rule.
+local aliasOf, aliasCount, playerAlias = {}, 0, setmetatable({}, { __mode = "k" })
+local knownPlayers = {} -- { text, pattern, alias, isId } per registered username and UserId
+local collisionTables, collideMemo = {}, {}
+local function register(p)
+    if typeof(p) ~= "Instance" then return "<player>" end
+    if p == player then return "<me>" end
+    local a = playerAlias[p]
+    if a then return a end
+    aliasCount += 1
+    a = "<p" .. aliasCount .. ">"
+    playerAlias[p] = a
+    pcall(function()
+        local name, id = tostring(p.Name), tostring(p.UserId)
+        if #name >= 3 and aliasOf[name] == nil then
+            aliasOf[name] = a
+            knownPlayers[#knownPlayers + 1] = { text = name, pattern = NAME_START .. anyCase(name) .. NAME_END, alias = a }
+        end
+        -- UserIds below 6 digits are the first ~100k accounts; shorter numbers are game values.
+        if #id >= 6 and id:match("^%d+$") and aliasOf[id] == nil then
+            aliasOf[id] = a
+            knownPlayers[#knownPlayers + 1] = { text = id, pattern = "%f[%d]" .. id .. "%f[%D]", alias = a, isId = true }
+        end
+    end)
+    return a
+end
+pcall(function() for _, p in ipairs(Players:GetPlayers()) do register(p) end end)
+local joinedConn = nil
+pcall(function() joinedConn = Players.PlayerAdded:Connect(register) end)
+local function collides(t)
+    local known = collideMemo[t]
+    if known ~= nil then return known end
+    local hit = rawget(collisionTables, t) ~= nil -- rawget: never run the Directory's __index
+    if not hit then
+        for _, tbl in pairs(collisionTables) do
+            if type(tbl) == "table" and rawget(tbl, t) ~= nil then hit = true break end
+        end
+    end
+    collideMemo[t] = hit
+    return hit
+end
+local myNamePattern = NAME_START .. anyCase(myName) .. NAME_END
 local function redact(s)
     s = tostring(s)
-    local function esc(x) return (x:gsub("%p", "%%%0")) end
-    if #me > 2 then s = s:gsub(esc(me), "<me>") end
-    if #myName > 2 then s = s:gsub(esc(myName), "<me>") end
+    if #me > 2 then s = s:gsub("%f[%d]" .. esc(me) .. "%f[%D]", "<me>") end
+    if #myName > 2 then s = s:gsub(myNamePattern, "<me>") end
     -- Whole words only (a display name can be a common word); bytes >= 0x80 count as letters.
-    if #myDisplay > 2 and myDisplay ~= myName then
-        s = s:gsub("%f[%w_\128-\255]" .. esc(myDisplay) .. "%f[^%w_\128-\255]", "<me>")
+    if #myDisplay > 2 and myDisplay ~= myName and not collides(myDisplay) then
+        s = s:gsub(WORD_START .. esc(myDisplay) .. WORD_END, "<me>")
+    end
+    -- Other players; names that are game words are left to the structural rule.
+    for _, o in ipairs(knownPlayers) do
+        if o.isId or not collides(o.text) then s = s:gsub(o.pattern, o.alias) end
     end
     return s
 end
@@ -55,11 +109,45 @@ local function asGame(fn, ...)
     return table.unpack(r, 1, r.n)
 end
 
+-- An Instance's path, with players and their characters as aliases, and a per-player folder
+-- (__THINGS.Hoverboards.<name>) too.
+local function pathOf(inst)
+    local ok, path = pcall(function()
+        local parts, cur, hops = {}, inst, 0
+        local thingsFolder = workspace:FindFirstChild("__THINGS")
+        while cur ~= nil and cur ~= game and hops < 60 do
+            hops += 1
+            local seg = cur.Name
+            local okOwner, owner = pcall(function() return Players:GetPlayerFromCharacter(cur) end)
+            if cur:IsA("Player") then
+                seg = register(cur)
+            elseif okOwner and owner then
+                seg = register(owner)
+            elseif aliasOf[seg] and thingsFolder and cur.Parent and cur.Parent.Parent == thingsFolder then
+                seg = aliasOf[seg]
+            end
+            table.insert(parts, 1, seg)
+            cur = cur.Parent
+        end
+        return table.concat(parts, ".")
+    end)
+    if ok then return path end
+    local okFull, fullName = pcall(function() return inst:GetFullName() end)
+    return okFull and fullName or "?"
+end
+
 local function short(v)
     local t = typeof(v)
-    if t == "string" then return string.format("%q", #v > 40 and v:sub(1, 40) .. "..." or v) end
+    if t == "string" then
+        if #v > 40 then v = redact(v) end -- before the cut, so no name is cut in two
+        return string.format("%q", #v > 40 and v:sub(1, 40) .. "..." or v)
+    end
     if t == "number" or t == "boolean" or t == "nil" then return tostring(v) end
-    if t == "Instance" then return "Instance<" .. v.ClassName .. ">" .. v:GetFullName() end
+    if t == "Instance" then
+        local okP, isPlayer = pcall(function() return v:IsA("Player") end)
+        if okP and isPlayer then return "Instance<Player>" .. register(v) end
+        return "Instance<" .. v.ClassName .. ">" .. pathOf(v)
+    end
     if t == "table" then
         local n = 0
         for _ in pairs(v) do n += 1 end
@@ -190,6 +278,8 @@ local dirMod = library and library:FindFirstChild("Directory")
 local okDir, Dir = false, nil
 if dirMod then okDir, Dir = asGame(require, dirMod) end
 if okDir and type(Dir) == "table" then
+    collisionTables = Dir
+    collideMemo = {}
     local names = {}
     for k, v in pairs(Dir) do names[#names + 1] = tostring(k) .. "(" .. short(v) .. ")" end
     table.sort(names)
@@ -263,8 +353,10 @@ line("  __DEBRIS children: " .. (debris and #debris:GetChildren() or "none"))
 
 -- 7. Optional recorder (read-only observation of the game's own requests) -------------
 local function save_report()
-    local text = table.concat(out, "\n")
-    for i = 1, #out, 60 do print(table.concat(out, "\n", i, math.min(i + 59, #out))) end
+    if joinedConn then pcall(function() joinedConn:Disconnect() end) end
+    -- Once more with every alias known now: a player who joined later may be named earlier.
+    local text = redact(table.concat(out, "\n"))
+    for i = 1, #out, 60 do print(redact(table.concat(out, "\n", i, math.min(i + 59, #out)))) end
     if type(writefile) == "function" then
         local name = "PS99_Probe_" .. os.date("!%Y%m%d_%H%M%S") .. ".txt"
         local ok, err = pcall(writefile, name, text)
@@ -287,8 +379,14 @@ if RECORD_SECONDS > 0 and type(hookmetamethod) == "function" and type(getnamecal
         for _, w in ipairs(NOISE) do
             if string.find(name, w, 1, true) then return end
         end
+        -- Mail, trade, clan, friend and invite requests carry typed player names that no
+        -- registry can know: their text arguments are not printed.
+        local hide = false
+        for _, w in ipairs({ "Mailbox", "Trad", "Clan", "Friend", "Invite" }) do
+            if string.find(name, w, 1, true) then hide = true end
+        end
         local parts = {}
-        for i = 1, args.n do parts[i] = short(args[i]) end
+        for i = 1, args.n do parts[i] = (hide and type(args[i]) == "string") and '"<text>"' or short(args[i]) end
         local key = name .. "(" .. table.concat(parts, ", ") .. ")"
         if not seen[key] then
             seen[key] = true

@@ -2,6 +2,65 @@
 
 Newest first. Each entry: what changed, why, evidence, tests, limits, rollback.
 
+## 2026-10-18 — Probe run 4: wall-HP clock model, other players redacted (probe v5.2)
+
+**Evidence.** The user sent a second recording, run 4: `PS99_EventProbe_20261018_025024.txt` (02:50–02:55 UTC, probe v5), with Wall Crew v0.3 running. A workflow ran 4 analysts and 4 skeptics; each finding was re-derived from the raw reports with python. All verified facts are in `DIAMOND_MOUNTAIN_FINDINGS.md` (run 4). The main ones:
+- **Wall 3's HP follows the clock:** `max = 5.2e9 − 90,277.78 × floor(at − 1792281600)`, i.e. 325 M per hour in 1-second steps. It fits all 8 recorded replies exactly; 3-second steps, a continuous line, per-minute steps and a link to damage dealt are all ruled out.
+- **Damage is not crew power × a fixed factor:** 2.352 in run 3, 1.3228 in run 4 (19 kinds, 4,476 pets). The cause is unknown; the reply's `stacks` should tell.
+- **Power** for Expedition Wolf (720) and Leopard (1,070), and the golden/shiny variants.
+- **Save layouts** for boosts, the merchant, potions and pass quests; Yeti max health per spawn; trail egg windows.
+- **The `[script]` traffic** (farming, a status poll every 6 s) came from another script: Wall Crew sends neither, and VY AutoRank does not farm inside instances. Wall Crew v0.3 correctly sent nothing, because every pet was already on the wall.
+- **Privacy:** the reports named 20 other players on 68 lines. They appeared in character paths, a hoverboard folder, the game's own `Get Stats(<player>)` requests with profile replies, and `DM_HypeTop`.
+
+**Change (probe v5.2; both probes where they share the code).**
+- **Other players:**
+  - Each gets an alias `<pN>`, from `GetPlayers` and `PlayerAdded`. Player instances and characters, per-player `__THINGS` folders and `Players:GetPlayerFromCharacter` owners print as aliases.
+  - Character models are counted, not listed.
+  - JSON name and id fields are scrubbed: your own entry shows `<me>`, a known player their alias, an event item keeps its name.
+  - Lua tables with a user-id field (leaderboard pages) have their name and id fields hidden.
+  - A structured reply to a request about another player (by Player, username or UserId) is replaced; plain `true`/`false`/numbers are kept.
+  - Text arguments of mail, trade, clan, friend and invite requests are not printed.
+  - The text backstop matches registered usernames case-insensitively, with `_` as a boundary, and UserIds of 6+ digits at digit edges. Display names are hidden only structurally, because they are not unique and can be game words. Names that are game words are left to the structural rules.
+  - Long strings are redacted before they are cut. The whole report is redacted once more at save time, for players who joined after a line was written.
+  - The local UserId no longer damages numbers that contain it. The local display name no longer replaces a game word.
+- **Section 6c (new):** every `DM_Walls_Status` reply as one row (section 6 keeps 2 per request), and each wall's `stacks` in full when they change. The reply is copied before the deferred thread reads it, partial saves include 6c, and dropped stack changes are counted.
+- **6b:** first-seen time per row ("not logged" when unknown). A reply whose request was not logged no longer makes a 0-call row.
+- **Section 4:**
+  - also lists Save keys named after this event's Directory entries (Hiker pets, `PurchasedEggs["Boulder Ridge Egg"]`), always shows `Save.Potions`, and skips `Engagement`/`UpgradesOwned`/`ZoneQuests`/`Achievements`/`GymUpgradeSkillMachine`;
+  - its cap is 700 lines, and it says how many fields it left out.
+
+**Review.** A second workflow (3 reviewers, 3 skeptics) checked the v5.2 change: privacy, hook safety and data integrity. All 17 findings were confirmed or partly confirmed, and all were fixed. They included:
+- the reply being read after the caller could change it;
+- partial saves without 6c;
+- display names wiping game words;
+- leaderboard records;
+- names cut in two before redaction;
+- names joined by `_`;
+- case;
+- typed mail recipients;
+- late joiners;
+- short UserIds;
+- collided names in paths;
+- the own HypeTop entry;
+- item names in JSON;
+- boolean replies;
+- the 6c stack cap;
+- the 6b first-seen time;
+- the local display name.
+
+The hook rules still hold: there are no reads before dispatch, and only pcall'd defers.
+
+**Tests.** probe_recorder gained other players, including a late joiner, a name that is a game word, a display name inside a pet name and a 6-digit UserId. It also gained a hoverboard folder, Get Stats by Player and by UserId, a leaderboard page, a long notice, joined and lower-case names, a mailbox send, live-shaped wall-status replies (40 with changing stacks), a reply the caller changes, and a one-shot defer failure. The new checks were red on the committed probes (12 in the general probe) and are green now. Each new guard was mutation-checked. The two mutants that first survived led to stronger tests. Fixture names are synthetic: no real player name from the reports is in the repo. Event probe 117 checks, general 34; full suite 49/49 three times; luau-compile OK; selene 0 errors (only the existing unused-HttpService warning).
+
+**Limits.** All offline. Live checks still needed:
+- whether `stacks` explains the damage;
+- whether wall 3's HP keeps falling after 02:54 UTC or has a floor;
+- whether the redaction misses a name source the reports have not shown yet.
+
+Other players' names could also reach the console through prints by other scripts, which the probe does not control.
+
+**Rollback.** `git checkout 2043d1b -- VY/tools/ VY/tests/lune/probe_recorder.luau` brings back probe v5.1.
+
 ## 2026-10-18 — Probe run 3 (ZapHub): Wall Crew v0.4 uses the server's fill; new Camp Eggs v0.1
 
 **Evidence.** The user ran probe v5 on the mountain with ZapHub (report `PS99_EventProbe_20261018_023610.txt`, 02:36–02:41 UTC). Facts are recorded in `DIAMOND_MOUNTAIN_FINDINGS.md` (run 3). Probe v5 worked live: replies were captured and ZapHub's requests were tagged `[script]`. The ones that mattered:

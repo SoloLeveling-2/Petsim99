@@ -1,10 +1,11 @@
 -- =====================================================================================
---  PS99 Event Probe v5.1 - Diamond Mountain (update 98, 2026-10-18)   READ-ONLY
+--  PS99 Event Probe v5.2 - Diamond Mountain (update 98, 2026-10-18)   READ-ONLY
 --  (v3 added sections 6b and 8 and server replies; v4 tags requests another executor
 --  script sends, e.g. a script hub, with [script]; v5 is safe next to a hub's hooks,
 --  counts every request and saves the report while recording; v5.1 also lists event
---  entries found only by their module's folder, e.g. camp eggs 2-5. Check the version in
---  a report's first line.)
+--  entries found only by their module's folder, e.g. camp eggs 2-5; v5.2 shows other players
+--  only as <p1>, <p2>..., lists every wall-status reply in 6c, finds Save fields named after
+--  those entries and says when section 4 is cut. Check the version in a report's first line.)
 --
 --  Finds the event's real names so an event script can be built on evidence:
 --    0. the executor's name, thread identity and which executor functions exist;
@@ -45,11 +46,75 @@ local myDisplay = tostring(player and player.DisplayName or "")
 local started = os.clock()
 
 local function esc(x) return (x:gsub("%p", "%%%0")) end
+-- Display names may contain '_'; usernames are [A-Za-z0-9_] and never start or end with '_',
+-- so for a username '_' is a boundary ("Name_board" still shows the name).
+local WORD_START, WORD_END = "%f[%w_\128-\255]", "%f[^%w_\128-\255]"
+local NAME_START, NAME_END = "%f[%w\128-\255]", "%f[^%w\128-\255]"
+-- Usernames are not case-sensitive: "testuser" is the same player.
+local function anyCase(name) return (esc(name):gsub("%a", function(c) return "[" .. c:lower() .. c:upper() .. "]" end)) end
+-- Other players are never named in the report (run 4 printed 20 of them on 68 lines): each
+-- gets an alias <p1>, <p2>... for this report. The text backstop in redact() knows only the
+-- unique ids (Name, UserId); a display name is not unique and may be a game word ("Huge"),
+-- so it is hidden only where the probe knows it prints a player. Names that are also game
+-- words ("Acorns") are likewise left to those structural rules, so the game data stays.
+local aliasOf, aliasLower, aliasCount, playerAlias = {}, {}, 0, setmetatable({}, { __mode = "k" })
+local knownPlayers = {} -- { text, pattern, alias, isId } per registered username and UserId
+local collisionNames = {} -- filled from the Directory once it is read
+local collisionTables = {} -- the Directory's tables, once loaded (section 3)
+local collideMemo = {} -- cleared whenever the two tables above change
+local eventNames = {} -- this event's Directory entry names (filled in section 3b)
+local function register(p)
+    if typeof(p) ~= "Instance" then return "<player>" end
+    if p == player then return "<me>" end
+    local a = playerAlias[p]
+    if a then return a end
+    aliasCount += 1
+    a = "<p" .. aliasCount .. ">"
+    playerAlias[p] = a
+    pcall(function()
+        local name, id = tostring(p.Name), tostring(p.UserId)
+        if #name >= 3 and aliasLower[name:lower()] == nil then
+            aliasOf[name], aliasLower[name:lower()] = a, a
+            knownPlayers[#knownPlayers + 1] = { text = name, pattern = NAME_START .. anyCase(name) .. NAME_END, alias = a }
+        end
+        -- UserIds below 6 digits are the first ~100k accounts; shorter numbers are game values.
+        if #id >= 6 and id:match("^%d+$") and aliasOf[id] == nil then
+            aliasOf[id] = a
+            knownPlayers[#knownPlayers + 1] = { text = id, pattern = "%f[%d]" .. id .. "%f[%D]", alias = a, isId = true }
+        end
+    end)
+    return a
+end
+pcall(function() for _, p in ipairs(Players:GetPlayers()) do register(p) end end)
+local joinedConn = nil
+pcall(function() joinedConn = Players.PlayerAdded:Connect(register) end)
+local function collides(t)
+    local known = collideMemo[t]
+    if known ~= nil then return known end
+    local l, hit = string.lower(t), collisionNames[t] == true
+    if not hit then
+        for _, tbl in pairs(collisionTables) do
+            -- rawget: Directory.Pets raises on unknown names
+            if type(tbl) == "table" and rawget(tbl, t) ~= nil then hit = true break end
+        end
+    end
+    for _, k in ipairs(KEYWORDS) do if l == k then hit = true end end
+    for _, k in ipairs(ENTRY_KEYWORDS) do if l == k then hit = true end end
+    collideMemo[t] = hit
+    return hit
+end
+local myNamePattern = NAME_START .. anyCase(myName) .. NAME_END
 local function redact(s)
     s = tostring(s)
-    if #me > 2 then s = s:gsub(esc(me), "<me>") end
-    if #myName > 2 then s = s:gsub(esc(myName), "<me>") end
-    if #myDisplay > 2 and myDisplay ~= myName then s = s:gsub("%f[%w_\128-\255]" .. esc(myDisplay) .. "%f[^%w_\128-\255]", "<me>") end
+    if #me > 2 then s = s:gsub("%f[%d]" .. esc(me) .. "%f[%D]", "<me>") end
+    if #myName > 2 then s = s:gsub(myNamePattern, "<me>") end
+    if #myDisplay > 2 and myDisplay ~= myName and not collides(myDisplay) then
+        s = s:gsub(WORD_START .. esc(myDisplay) .. WORD_END, "<me>")
+    end
+    -- Backstop for other players; names that are game words are left to the structural rules.
+    for _, o in ipairs(knownPlayers) do
+        if o.isId or not collides(o.text) then s = s:gsub(o.pattern, o.alias) end
+    end
     return s
 end
 local function line(...)
@@ -96,19 +161,101 @@ local function asGame(fn, ...)
     if canSet then pcall(setthreadidentity, prior) end
     return table.unpack(r, 1, r.n)
 end
-local function short(v, depth)
+-- A JSON text such as DM_HypeTop ([{"name":...,"coins":...}]) names players the probe cannot
+-- know (server-wide lists): its name and id fields are hidden before the text is cut. Your
+-- own entry becomes <me>, a known player's their alias, an event item keeps its name.
+local NAME_KEYS = { "name", "Name", "displayName", "DisplayName", "username", "userName", "Username", "UserName",
+    "player", "Player" }
+local ID_KEYS = { "userId", "UserId", "UserID", "userid", "playerId", "PlayerId", "ownerId", "OwnerId" }
+local NAME_SET, ID_SET = {}, {}
+for _, k in ipairs(NAME_KEYS) do NAME_SET[k] = true end
+for _, k in ipairs(ID_KEYS) do ID_SET[k] = true end
+local function nameText(n)
+    n = tostring(n)
+    if n:lower() == myName:lower() or (#myDisplay > 2 and n == myDisplay) then return "<me>" end
+    return aliasLower[n:lower()] or "<player>"
+end
+local function idText(n)
+    n = tostring(n)
+    if n == me then return "<me>" end
+    return aliasOf[n] or "<id>"
+end
+local function scrubJson(v)
+    if not (v:find('"', 1, true) and v:find("^%s*[%[{]")) then return v end
+    for _, k in ipairs(NAME_KEYS) do
+        v = v:gsub('("' .. k .. '"%s*:%s*)"([^"]*)"', function(pre, n)
+            if eventNames[n] then return nil end -- a game item, not a player
+            return pre .. '"' .. nameText(n) .. '"'
+        end)
+    end
+    for _, k in ipairs(ID_KEYS) do
+        v = v:gsub('("' .. k .. '"%s*:%s*)"?(%d+)"?', function(pre, n) return pre .. '"' .. idText(n) .. '"' end)
+    end
+    return v
+end
+-- A Lua table with a user id field is a player record (a leaderboard page): its name and id
+-- fields are hidden, its numbers kept.
+local function isRecord(t)
+    for _, k in ipairs(ID_KEYS) do
+        if rawget(t, k) ~= nil then return true end
+    end
+    return false
+end
+local function hiddenField(record, k, x)
+    if not record then return nil end
+    if NAME_SET[k] then return '"' .. nameText(x) .. '"' end
+    if ID_SET[k] then return idText(x) end
+    return nil
+end
+-- An Instance's path, with players and their characters as aliases, and a per-player folder
+-- (__THINGS.Hoverboards.<name>) too.
+local function pathOf(inst)
+    local ok, path = pcall(function()
+        local parts, cur, hops = {}, inst, 0
+        local thingsFolder = workspace:FindFirstChild("__THINGS")
+        while cur ~= nil and cur ~= game and hops < 60 do
+            hops += 1
+            local seg = cur.Name
+            local okOwner, owner = pcall(function() return Players:GetPlayerFromCharacter(cur) end)
+            if cur:IsA("Player") then
+                seg = register(cur)
+            elseif okOwner and owner then
+                seg = register(owner)
+            elseif aliasOf[seg] and thingsFolder and cur.Parent and cur.Parent.Parent == thingsFolder then
+                seg = aliasOf[seg]
+            end
+            table.insert(parts, 1, seg)
+            cur = cur.Parent
+        end
+        return table.concat(parts, ".")
+    end)
+    if ok then return path end
+    local okFull, fullName = pcall(function() return inst:GetFullName() end)
+    return okFull and fullName or "?"
+end
+local short
+local function keyText(k) return typeof(k) == "Instance" and short(k) or tostring(k) end
+short = function(v, depth)
     depth = depth or 0
     local t = typeof(v)
-    if t == "string" then return string.format("%q", #v > 48 and v:sub(1, 48) .. "..." or v) end
+    if t == "string" then
+        v = scrubJson(v)
+        if #v > 48 then v = redact(v) end -- before the cut, so no name is cut in two
+        return string.format("%q", #v > 48 and v:sub(1, 48) .. "..." or v)
+    end
     if t == "number" or t == "boolean" or t == "nil" then return tostring(v) end
-    if t == "Instance" then return "Instance<" .. v.ClassName .. ">" .. v:GetFullName() end
+    if t == "Instance" then
+        local okP, isPlayer = pcall(function() return v:IsA("Player") end)
+        if okP and isPlayer then return "Instance<Player>" .. register(v) end
+        return "Instance<" .. v.ClassName .. ">" .. pathOf(v)
+    end
     if t == "Vector3" or t == "CFrame" then return t end
     if t == "table" then
         if depth >= 1 then return "{...}" end
-        local parts, n = {}, 0
+        local parts, n, record = {}, 0, isRecord(v)
         for k, x in pairs(v) do
             n += 1
-            if n <= 6 then parts[#parts + 1] = tostring(k) .. "=" .. short(x, depth + 1) end
+            if n <= 6 then parts[#parts + 1] = keyText(k) .. "=" .. (hiddenField(record, k, x) or short(x, depth + 1)) end
         end
         return "{" .. table.concat(parts, ", ") .. (n > 6 and (", +" .. (n - 6)) or "") .. "}"
     end
@@ -121,26 +268,54 @@ local function long(v, depth)
     depth = depth or 0
     if typeof(v) ~= "table" then return short(v) end
     if depth >= 3 then return "{...}" end
-    local parts, n = {}, 0
+    local parts, n, record = {}, 0, isRecord(v)
     for k, x in pairs(v) do
         n += 1
-        if n <= 12 then parts[#parts + 1] = tostring(k) .. "=" .. long(x, depth + 1) end
+        if n <= 12 then parts[#parts + 1] = keyText(k) .. "=" .. (hiddenField(record, k, x) or long(x, depth + 1)) end
     end
     local s = "{" .. table.concat(parts, ", ") .. (n > 12 and (", +" .. (n - 12)) or "") .. "}"
-    if #s > 1500 then s = s:sub(1, 1500) .. "...}" end
+    if #s > 1500 then s = redact(s):sub(1, 1500) .. "...}" end
     return s
 end
 
--- Prints a matched table's contents several levels deep (bounded).
+-- Every key and value, keys sorted (so equal tables give equal text), up to `room` characters
+-- (a wall's `stacks`, which long() shows as {...}).
+local function full(v, room)
+    room = room or 4000
+    local parts, size = {}, 0
+    local function add(s)
+        if size < room then parts[#parts + 1] = s end
+        size += #s
+    end
+    local function walk(x, depth)
+        if typeof(x) ~= "table" then add(short(x)) return end
+        if depth >= 6 then add("{...}") return end
+        local keys, record = {}, isRecord(x)
+        for k in pairs(x) do keys[#keys + 1] = k end
+        table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+        add("{")
+        for i, k in ipairs(keys) do
+            add((i > 1 and ", " or "") .. keyText(k) .. "=")
+            local hidden = hiddenField(record, k, x[k])
+            if hidden then add(hidden) else walk(x[k], depth + 1) end
+        end
+        add("}")
+    end
+    walk(v, 0)
+    local s = table.concat(parts)
+    if size > room then s = redact(s):sub(1, room) .. string.format("...(+%d characters)", size - room) end
+    return s
+end
+
+-- Prints the leaves of t, up to budget.cap lines; budget.n also counts the leaves left out.
 local function dump(t, path, depth, budget)
     for k, v in pairs(t) do
-        if budget.n >= 400 then return end
         local p = path .. "." .. tostring(k)
         if type(v) == "table" and depth < 4 then
             dump(v, p, depth + 1, budget)
         else
             budget.n += 1
-            line("  " .. p .. " : " .. short(v))
+            if budget.n <= budget.cap then line("  " .. p .. " : " .. short(v)) end
         end
     end
 end
@@ -160,7 +335,7 @@ local function flatten(t, path, depth, acc)
     return acc
 end
 
-line("PS99 Event Probe v5.1 (Diamond Mountain) | " .. os.date("!%Y-%m-%d %H:%M:%S UTC") .. " | PlaceId " .. game.PlaceId)
+line("PS99 Event Probe v5.2 (Diamond Mountain) | " .. os.date("!%Y-%m-%d %H:%M:%S UTC") .. " | PlaceId " .. game.PlaceId)
 
 -- 0. Executor ---------------------------------------------------------------------------
 section("0. Executor (what an event script can use here)")
@@ -256,6 +431,8 @@ for _, child in ipairs(dirMod and dirMod:GetChildren() or {}) do
         if okT and type(tbl) == "table" then dirTables[childName] = tbl end
     end
 end
+collisionTables = dirTables
+collideMemo = {}
 local dirNames = {}
 for name in pairs(dirTables) do dirNames[#dirNames + 1] = name end
 table.sort(dirNames)
@@ -281,15 +458,23 @@ end
 
 section("3b. This event's entries in every Directory table (camp eggs, pets, currencies, boosts...)")
 local entryRows, visited = {}, 0
+-- The names of this event's eggs, pets, items... (eventNames, declared at the top): section 4
+-- also looks for them in Save ("Boulder Ridge Egg", "Hiker Raccoon" hold no keyword).
 for _, name in ipairs(dirNames) do
     for k, v in pairs(dirTables[name]) do
         visited += 1
         if visited % 5000 == 0 then task.wait() end
-        if #entryRows < 300 and entryMatches(k, v) then
-            entryRows[#entryRows + 1] = "  Directory." .. name .. "[" .. string.format("%q", tostring(k)) .. "] = " .. short(v)
+        if entryMatches(k, v) then
+            eventNames[tostring(k)] = true
+            if #entryRows < 300 then
+                entryRows[#entryRows + 1] = "  Directory." .. name .. "[" .. string.format("%q", tostring(k)) .. "] = " .. short(v)
+            end
         end
     end
 end
+for name in pairs(eventNames) do collisionNames[name] = true end
+for _, name in ipairs(dirNames) do collisionNames[name] = true end
+collideMemo = {}
 table.sort(entryRows)
 for _, r in ipairs(entryRows) do line(r) end
 line("  entries: " .. #entryRows .. (#entryRows >= 300 and " (first 300)" or "") .. " (checked " .. visited .. ")")
@@ -304,17 +489,30 @@ if saveMod then
     if okReq and type(S) == "table" and type(S.Get) == "function" then okSave, save = asGame(S.Get) end
 end
 if okSave and type(save) == "table" then
-    local budget = { n = 0 }
+    local budget = { n = 0, cap = 700 }
+    -- Not event data, though their names match a keyword (run 4: about 100 of 400 lines).
+    local NOT_EVENT = { ["Save.Engagement"] = true, ["Save.UpgradesOwned"] = true, ["Save.ZoneQuests"] = true,
+        ["Save.Achievements"] = true, ["Save.GymUpgradeSkillMachine"] = true }
+    -- Not named after the event, but they change wall damage (run 4: a Damage potion ran out).
+    local ALWAYS = { ["Save.Potions"] = true }
+    -- A keyword, an event entry's name, or an item-index key such as {"id":"Hiker Raccoon"}.
+    local function eventKey(k)
+        if matches(k) then return true end
+        if type(k) ~= "string" then return false end
+        local id = k:match('"id":"(.-)"')
+        return eventNames[k] == true or (id ~= nil and eventNames[id] == true)
+    end
     local function walk(t, path, depth)
         for k, v in pairs(t) do
-            if budget.n >= 400 then return end
             local p = path .. "." .. tostring(k)
-            if matches(k) then
+            if NOT_EVENT[p] then
+                continue
+            elseif eventKey(k) or ALWAYS[p] then
                 if type(v) == "table" then
                     dump(v, p, 0, budget)
                 else
                     budget.n += 1
-                    line("  " .. p .. " : " .. short(v))
+                    if budget.n <= budget.cap then line("  " .. p .. " : " .. short(v)) end
                 end
             elseif type(v) == "table" and depth < 4 and k ~= "Inventory" then
                 walk(v, p, depth + 1)
@@ -322,11 +520,17 @@ if okSave and type(save) == "table" then
         end
     end
     walk(save, "Save", 0)
+    if budget.n > budget.cap then
+        line(string.format("  (section 4 stopped at %d lines: %d more Save fields not shown; section 7 lists every change)",
+            budget.cap, budget.n - budget.cap))
+    end
     -- event currencies / items in the inventory
     for cat, items in pairs(save.Inventory or {}) do
         if type(items) == "table" then
             for _, it in pairs(items) do
-                if type(it) == "table" and matches(it.id) then line("  Inventory." .. tostring(cat) .. " item: " .. short(it)) end
+                if type(it) == "table" and (matches(it.id) or eventNames[tostring(it.id)]) then
+                    line("  Inventory." .. tostring(cat) .. " item: " .. short(it))
+                end
             end
         end
     end
@@ -345,10 +549,25 @@ line("  Active instance(s): " .. (#activeNames > 0 and table.concat(activeNames,
 -- Repeats (Torch1..Torch300 in one camp) collapse into one row, so one crowded camp
 -- cannot use up the list before the summit, trails and pedestals.
 local rows, rowOf, scanned = {}, {}, 0
+-- Player characters hold only Roblox's own parts ("Climbing" matched a keyword); they are
+-- counted, never listed, so no player is named by them.
+local inCharacter, characters = {}, 0
+pcall(function()
+    for _, p in ipairs(Players:GetPlayers()) do
+        local char = p.Character
+        if char then
+            characters += 1
+            inCharacter[char] = true
+            for _, x in ipairs(char:GetDescendants()) do inCharacter[x] = true end
+        end
+    end
+end)
 for _, d in ipairs(workspace:GetDescendants()) do
     scanned += 1
     if scanned % 5000 == 0 then task.wait() end
-    if matches(d.Name) and not (d.Parent and matches(d.Parent.Name) and d:IsA("BasePart")) then
+    if inCharacter[d] then
+        continue
+    elseif matches(d.Name) and not (d.Parent and matches(d.Parent.Name) and d:IsA("BasePart")) then
         local parentPath = d.Parent and d.Parent:GetFullName() or "?"
         local key = parentPath .. "." .. d.Name:gsub("%d+", "#") .. "[" .. d.ClassName .. "]"
         local row = rowOf[key]
@@ -357,14 +576,14 @@ for _, d in ipairs(workspace:GetDescendants()) do
         elseif #rows < 400 then
             local attrs = {}
             for k, v in pairs(d:GetAttributes()) do attrs[#attrs + 1] = k .. "=" .. short(v) end
-            row = { text = d:GetFullName() .. " [" .. d.ClassName .. "]" .. (#attrs > 0 and (" " .. table.concat(attrs, ", ")) or ""), count = 1 }
+            row = { text = pathOf(d) .. " [" .. d.ClassName .. "]" .. (#attrs > 0 and (" " .. table.concat(attrs, ", ")) or ""), count = 1 }
             rowOf[key] = row
             rows[#rows + 1] = row
         end
     end
 end
 for _, row in ipairs(rows) do line("  " .. row.text .. (row.count > 1 and ("  (x" .. row.count .. " similar)") or "")) end
-line("  shown " .. #rows .. " rows (scanned " .. scanned .. " objects)")
+line("  shown " .. #rows .. " rows (scanned " .. scanned .. " objects; " .. characters .. " player characters not listed)")
 
 -- 6. Recorder ---------------------------------------------------------------------------
 -- One file per run: the report so far while recording, then the final report.
@@ -375,10 +594,12 @@ local function writeReport(text)
 end
 
 local function finish()
+    if joinedConn then pcall(function() joinedConn:Disconnect() end) end
     line("")
     line("Done in " .. math.floor(os.clock() - started) .. " s.")
-    local text = table.concat(out, "\n")
-    for i = 1, #out, 60 do print(table.concat(out, "\n", i, math.min(i + 59, #out))) end
+    -- Once more with every alias known now: a player who joined later may be named earlier.
+    local text = redact(table.concat(out, "\n"))
+    for i = 1, #out, 60 do print(redact(table.concat(out, "\n", i, math.min(i + 59, #out)))) end
     if type(writefile) == "function" then
         print(writeReport(text) and ("[EventProbe] saved " .. reportName .. " in your executor workspace folder") or "[EventProbe] save failed")
     end
@@ -446,7 +667,7 @@ local function instanceAfter()
                 local attrs = {}
                 for k, v in pairs(egg:GetAttributes()) do attrs[#attrs + 1] = k .. "=" .. short(v) end
                 table.sort(attrs)
-                line("  " .. egg:GetFullName() .. " [" .. egg.ClassName .. "] " .. table.concat(attrs, ", "))
+                line("  " .. pathOf(egg) .. " [" .. egg.ClassName .. "] " .. table.concat(attrs, ", "))
             end
         end
     end
@@ -480,7 +701,7 @@ local function instanceAfter()
                 if d:IsA("ProximityPrompt") then
                     extra = string.format(' action="%s" object="%s" hold=%s', tostring(d.ActionText), tostring(d.ObjectText), tostring(d.HoldDuration))
                 end
-                row = { text = d:GetFullName() .. " [" .. d.ClassName .. "]" .. extra .. (#attrs > 0 and (" " .. table.concat(attrs, ", ")) or ""), count = 1 }
+                row = { text = pathOf(d) .. " [" .. d.ClassName .. "]" .. extra .. (#attrs > 0 and (" " .. table.concat(attrs, ", ")) or ""), count = 1 }
                 iRowOf[key] = row
                 iRows[#iRows + 1] = row
             end
@@ -551,9 +772,18 @@ if RECORD_SECONDS > 0 then
     end
     local function lineFree(b) return (pools[b.pool] or 0) < POOL_LINES end
     local function takeLine(b) pools[b.pool] = (pools[b.pool] or 0) + 1 end
+    -- Mail, trade, clan, friend and invite requests carry typed player names that no registry
+    -- can know (a recipient in another server): their text arguments are not printed.
+    local SOCIAL = { "Mailbox", "Trad", "Clan", "Friend", "Invite" }
+    local function social(name)
+        for _, w in ipairs(SOCIAL) do
+            if string.find(name, w, 1, true) then return true end
+        end
+        return false
+    end
     local function requestText(name, args)
-        local parts = {}
-        for i = 1, args.n do parts[i] = short(args[i]) end
+        local parts, hide = {}, social(name)
+        for i = 1, args.n do parts[i] = (hide and type(args[i]) == "string") and '"<text>"' or short(args[i]) end
         return name .. "(" .. table.concat(parts, ", ") .. ")"
     end
     local function nameOf(remote)
@@ -567,6 +797,7 @@ if RECORD_SECONDS > 0 then
         local name = nameOf(remote)
         local b = bucketFor(method, name, args, fromScript)
         b.calls += 1
+        b.first = b.first or at
         if noisy(name) or b.shown >= PER_REMOTE or not lineFree(b) then return end
         local text = requestText(name, args)
         if not seen[b.key .. "|" .. text] then
@@ -576,10 +807,29 @@ if RECORD_SECONDS > 0 then
             out[#out + 1] = redact(string.format("  [+%5.1fs] %s%s %s", at, b.tag, method, text))
         end
     end
+    -- A request about another player (the game's Get Stats) returns that player's profile.
+    -- (By Player, or by a known player's username or UserId.)
+    local function aboutOtherPlayer(args)
+        for i = 1, args.n do
+            local x = args[i]
+            if typeof(x) == "Instance" and x ~= player then
+                local ok, isPlayer = pcall(function() return x:IsA("Player") end)
+                if ok and isPlayer then return true end
+            elseif type(x) == "number" or type(x) == "string" then
+                local t = tostring(x)
+                if aliasOf[t] or (aliasLower[t:lower()] and not collides(t)) then return true end
+            end
+        end
+        return false
+    end
     local function recordReply(at, remote, args, text, fromScript)
         if not recording then return end -- arrived after the window: later sections follow
         local name = nameOf(remote)
-        local b = bucketFor("InvokeServer", name, args, fromScript)
+        -- nil, true/false and numbers say whether it worked; anything else is that player's data.
+        local plain = text:match("^[%w%.%+%-, ]*$") ~= nil
+        if not plain and (aboutOtherPlayer(args) or social(name)) then text = "<another player's data, not shown>" end
+        local b = buckets[(fromScript and "[script] " or "") .. bucketOf(name, args)]
+        if not b then return end -- its request was not logged (its thread could not defer)
         -- Only for a request whose line is shown; at most 2 different replies per request.
         local request = requestText(name, args)
         local count = b.replyCount[request] or 0
@@ -591,6 +841,66 @@ if RECORD_SECONDS > 0 then
         b.replyCount[request] = count + 1
         takeLine(b)
         out[#out + 1] = redact(string.format("  [+%5.1fs]   %sreply %s -> %s", at, b.tag, request, text))
+    end
+    -- Every DM_Walls_Status reply as one row (section 6 keeps only 2 per request), and each wall's
+    -- `stacks` whenever they change: what the server counts (run 4: the rate did not follow the
+    -- crew's power).
+    local wallRows, stackRows, lastStacks, wallCut, stackCut = {}, {}, {}, 0, 0
+    local WALL_ROWS, STACK_ROWS = 150, 30
+    -- Plain tables only, 6 levels and 3000 values at most (a status reply has a few hundred).
+    local function copyDeep(t)
+        local budget = 3000
+        local function copy(x, depth)
+            if type(x) ~= "table" or depth > 6 or budget <= 0 then return x end
+            local c = {}
+            for k, v in pairs(x) do
+                budget -= 1
+                c[k] = copy(v, depth + 1)
+            end
+            return c
+        end
+        return copy(t, 0)
+    end
+    local function recordWalls(at, remote, status, fromScript)
+        if not recording or type(status) ~= "table" or nameOf(remote) ~= "Instancing_InvokeCustomFromClient" then return end
+        if #wallRows >= WALL_ROWS then
+            wallCut += 1
+            return
+        end
+        local tag = fromScript and "[script] " or ""
+        local parts = { string.format("[+%5.1fs] %sat=%s total=%s slots=%s stackMax=%s cap=%s", at, tag, tostring(status.at),
+            tostring(status.total), tostring(status.slots), tostring(status.stackMax), tostring(status.cap)) }
+        local walls = type(status.walls) == "table" and status.walls or {}
+        for n = 1, 9 do
+            local w = walls[n] or walls[tostring(n)]
+            if type(w) == "table" then
+                local state = w.broken == true and "broken" or (w.open == true and "open" or "closed")
+                parts[#parts + 1] = string.format("w%d %s %s/%s rate %s", n, state, tostring(w.dealt), tostring(w.max), tostring(w.rate))
+                local okS, s = pcall(full, w.stacks)
+                if okS and w.stacks ~= nil and s ~= lastStacks[n] then
+                    lastStacks[n] = s
+                    if #stackRows < STACK_ROWS then
+                        stackRows[#stackRows + 1] = string.format("  [+%5.1fs] wall %d stacks: %s", at, n, s)
+                    else
+                        stackCut += 1
+                    end
+                end
+            end
+        end
+        wallRows[#wallRows + 1] = "  " .. table.concat(parts, " | ")
+    end
+    local function wallLines()
+        local list = {}
+        if #wallRows == 0 then list[1] = "  no DM_Walls_Status reply was seen" end
+        for _, row in ipairs(wallRows) do list[#list + 1] = row end
+        if wallCut > 0 then list[#list + 1] = "  (+" .. wallCut .. " more replies not listed)" end
+        for _, row in ipairs(stackRows) do list[#list + 1] = row end
+        if stackCut > 0 then list[#list + 1] = "  (+" .. stackCut .. " more stack changes not listed)" end
+        return list
+    end
+    local function wallSeries()
+        section("6c. Wall status over time (every DM_Walls_Status reply; stacks when they change)")
+        for _, row in ipairs(wallLines()) do line(row) end
     end
     -- 6b rows: every event remote; the 20 busiest others; the game's rare requests (calls <= 5,
     -- the likely hand actions); then the rest; 300 non-event rows at most, the rest counted.
@@ -622,7 +932,8 @@ if RECORD_SECONDS > 0 then
         for _, b in ipairs(list) do
             if not b.event then others += 1 end
             if b.event or others <= 300 then
-                totalRows[#totalRows + 1] = string.format("  %5d  %s%s %s", b.calls, b.tag, b.method, b.base)
+                totalRows[#totalRows + 1] = string.format("  %5d  %s%s %s  (first %s)", b.calls, b.tag, b.method, b.base,
+                    b.first and string.format("+%.1fs", b.first) or "not logged")
             else
                 cut += 1
             end
@@ -677,6 +988,12 @@ if RECORD_SECONDS > 0 then
                         end)
                         if type(setnamecallmethod) == "function" then pcall(setnamecallmethod, method) end
                         pcall(task.defer, recordReply, os.clock() - started, self, args, okText and text or "?", fromScript)
+                        if args[2] == "DM_Walls_Status" and type(reply[1]) == "table" then
+                            -- A copy: the caller gets the same table back and may change it
+                            -- before the deferred thread reads it.
+                            local okCopy, status = pcall(copyDeep, reply[1])
+                            pcall(task.defer, recordWalls, os.clock() - started, self, okCopy and status or reply[1], fromScript)
+                        end
                         return table.unpack(reply, 1, reply.n)
                     end
                 end
@@ -690,7 +1007,9 @@ if RECORD_SECONDS > 0 then
             task.wait(SAVE_EVERY)
             if not recording then break end
             local okTotals, snapshot = pcall(totalsLines)
-            writeReport(table.concat(out, "\n") .. "\n\n==== 6b so far ====\n" .. (okTotals and redact(table.concat(snapshot, "\n")) or "?")
+            local okWalls, walls = pcall(wallLines)
+            writeReport(redact(table.concat(out, "\n")) .. "\n\n==== 6b so far ====\n" .. (okTotals and redact(table.concat(snapshot, "\n")) or "?")
+                .. "\n\n==== 6c so far ====\n" .. (okWalls and redact(table.concat(walls, "\n")) or "?")
                 .. "\n\n(PARTIAL report: still recording; the Save diff and the end scan are added at the end)")
         end
     end)
@@ -699,7 +1018,10 @@ if RECORD_SECONDS > 0 then
         local shownLines = 0
         for _, n in pairs(pools) do shownLines += n end
         if canHook and shownLines == 0 then line("  nothing recorded") end
-        if canHook then totals() end
+        if canHook then
+            totals()
+            wallSeries()
+        end
         if before then saveDiff(before) end
         instanceAfter()
         finish()
