@@ -2,6 +2,46 @@
 
 Newest first. Each entry: what changed, why, evidence, tests, limits, rollback.
 
+## 2026-10-18 — Event probe v5 for a ZapHub test: two adversarial review rounds
+
+**Why.** The user asked about testing ZapHub's event features (ZapHub is a third-party PS99 script hub; RankPilot X's interface was modelled on it). The idea: let ZapHub run Diamond Mountain features while the probe records, to learn the requests for features the user cannot reach yet.
+
+**Research (workflow agent, sources in the run).** No public ZapHub page lists Diamond Mountain features as of 2026-10-18:
+- The ScriptBlox listing still shows the Lucky Race event tab (last updated 2026-04-10). zaphub.xyz has no feature list and says releases go to its Discord, which could not be read.
+- ZapHub is closed, remote-loaded code (Luarmor/Luraph) with auto-mail features.
+- Many "ZapHub" re-uploads load stealer-style code (hard-coded webhooks, "keyless", "self dupe"). ZapHub's own FAQ says to use an alt.
+
+**Review round 1 (3 lenses, 27 agents; each finding independently verified).** 18 confirmed, 4 refuted. Main points:
+- (high) The hook read `self.Name` before dispatch. Another script's `__index` hook that makes a colon call would change the namecall method, so the game's request went out as the wrong method (dropped in the mock).
+- (high) Calls that bypass `__namecall` (`remote.FireServer(remote, …)`, VM-obfuscated code) are invisible, and the report never said so.
+- The silent 5000-request cap; NOISE remotes missing from 6b; event lines crowded out; dedupe ignoring the tag; no partial saves; `[script]` semantics not explained.
+
+**Review round 2 (11 agents) on the v5 rewrite.** 8 confirmed, 0 refuted:
+- (high) An unprotected `task.defer` before dispatch. Roblox raises "Maximum re-entrancy depth (80) exceeded" in a thread already at that depth, so the request would be dropped.
+- The general probe's 1000 cap now also counted noise, so the one hand action could be lost.
+- The camp-egg hatch (`CustomEggs_Hatch`) was not treated as an event line.
+- Replies did not name their request.
+- A non-ASCII display name was not redacted.
+- The tests masked pre-dispatch reads, because the mock always restored the method.
+
+**Change (both probes where relevant).**
+- No Instance reads or colon calls before dispatch: name lookup, noise filtering and formatting happen in the deferred thread. The method is re-asserted before dispatch, and `pcall(task.defer, …)` is used (lost log lines are counted).
+- No capture caps; every request is counted.
+- Four line pools: event/other × game/`[script]`. Event requests are `Instancing_*`, event words, egg/hatch/unmask, or a `"DiamondMountain"` argument.
+- 6b lists event rows, then the 20 busiest, then rare game requests, with a cut marker.
+- Reply lines name their request (at most 2 distinct per request); replies after the window are dropped.
+- The report so far, with a 6b snapshot, is saved every 60 s.
+- The display name is redacted on word edges (bytes ≥ 0x80 count as letters).
+- Section 6 says what the recorder cannot see and what `[script]` means.
+
+**Tests.**
+- Every finding fixed got a failing check first. Committed v5 (`b5f1c9d`) fails the round-2 checks: 5 in the event probe and 1 in the general probe.
+- New suite entries `probe-*-recorder-nosnm` run the probes without `setnamecallmethod`, so a pre-dispatch read cannot hide behind the re-assert.
+- The partial-save check now records every write. A fixed-time poll raced the test window under load, and a mutation that removes partial saves still turns it red.
+- Suite 35/35, three consecutive runs.
+
+**Still not covered (by design).** Calls that bypass `__namecall`; the report says so. A `hookfunction` capture of `RemoteEvent.FireServer` etc. would cover them, but adds a second hook on every request; it is left for a separate change with its own live check.
+
 ## 2026-10-18 — VY Wall Crew v0.3: protected pet-list lookups
 
 **Live evidence.** v0.2 stopped at start with `ReplicatedStorage.Library.Directory.Pets:28: Unknown Directory Pets.'Nice'`. The stack went through `__index` → `add` → `addPetNames` → the egg-reading block, before any request was sent.

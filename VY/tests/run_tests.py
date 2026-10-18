@@ -43,6 +43,8 @@ SCENARIOS += [
     # The read-only probes in VY/tools (independent of SOURCE).
     ("probe-event-recorder", ["probe_recorder.luau", "VY/tools/PS99_EventProbe_DiamondMountain.luau", "event"]),
     ("probe-general-recorder", ["probe_recorder.luau", "VY/tools/PS99_Probe.luau", "general"]),
+    ("probe-event-recorder-nosnm", ["probe_recorder.luau", "VY/tools/PS99_EventProbe_DiamondMountain.luau", "event", "nosnm"]),
+    ("probe-general-recorder-nosnm", ["probe_recorder.luau", "VY/tools/PS99_Probe.luau", "general", "nosnm"]),
 ]
 # VY Wall Crew (Diamond Mountain), also independent of SOURCE.
 for case in ["dry-run", "load", "wall-break", "new-hatch", "not-inside", "refused", "stop", "no-egg-data"]:

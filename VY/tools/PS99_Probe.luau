@@ -21,12 +21,17 @@ local HttpService = game:GetService("HttpService")
 local player = Players.LocalPlayer
 local out = {}
 local me, myName = tostring(player and player.UserId or "?"), tostring(player and player.Name or "?")
+local myDisplay = tostring(player and player.DisplayName or "")
 
 local function redact(s)
     s = tostring(s)
     local function esc(x) return (x:gsub("%p", "%%%0")) end
     if #me > 2 then s = s:gsub(esc(me), "<me>") end
     if #myName > 2 then s = s:gsub(esc(myName), "<me>") end
+    -- Whole words only (a display name can be a common word); bytes >= 0x80 count as letters.
+    if #myDisplay > 2 and myDisplay ~= myName then
+        s = s:gsub("%f[%w_\128-\255]" .. esc(myDisplay) .. "%f[^%w_\128-\255]", "<me>")
+    end
     return s
 end
 local function line(...)
@@ -271,7 +276,7 @@ end
 if RECORD_SECONDS > 0 and type(hookmetamethod) == "function" and type(getnamecallmethod) == "function" then
     section("7. Recorded game requests (" .. RECORD_SECONDS .. " s) - do ONE action by hand now")
     print("[Probe] RECORDING for " .. RECORD_SECONDS .. " s: do ONE action by hand now")
-    local seen, count, captured, recording, old = {}, 0, 0, true, nil
+    local seen, count, recording, old = {}, 0, true, nil
     local NOISE = { "Breakables_", "Orbs", "Lootbags", "Pets_", "Idle", "Ping", "Mouse", "Camera" }
     -- Formats one request in its own thread, after it was sent: the remote's Name is read
     -- here, never in the hook, so no other script's __index hook runs before dispatch.
@@ -297,8 +302,7 @@ if RECORD_SECONDS > 0 and type(hookmetamethod) == "function" and type(getnamecal
         -- (another script's __index hook may make a colon call).
         if recording then
             local method = getnamecallmethod()
-            if (method == "FireServer" or method == "InvokeServer") and captured < 1000 and typeof(self) == "Instance" then
-                captured += 1
+            if (method == "FireServer" or method == "InvokeServer") and typeof(self) == "Instance" then
                 -- Copy table arguments now: the game may reuse and clear one right after
                 -- sending it. table.clone fails on a protected metatable; keep the original.
                 local args = table.pack(...)
@@ -308,7 +312,9 @@ if RECORD_SECONDS > 0 and type(hookmetamethod) == "function" and type(getnamecal
                         if okCopy then args[i] = copy end
                     end
                 end
-                task.defer(record, method, self, args)
+                -- task.defer raises in a thread already at Roblox's re-entrancy limit: then only
+                -- this log line is lost, never the request.
+                pcall(task.defer, record, method, self, args)
                 if type(setnamecallmethod) == "function" then pcall(setnamecallmethod, method) end
             end
         end

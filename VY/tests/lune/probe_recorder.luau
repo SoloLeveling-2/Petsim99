@@ -1,6 +1,6 @@
 --!nocheck
 -- Offline checks for the read-only probes in VY/tools (mocked runtime, not live PS99).
---   lune run probe_recorder.luau <probe.luau> <event|general>
+--   lune run probe_recorder.luau <probe.luau> <event|general> [nosnm]
 -- The mock models the one Roblox detail the recorder depends on: a `obj:Method()` call
 -- on an Instance sets the thread's namecall method and runs the (possibly hooked)
 -- __namecall handler, which reads that method when it dispatches. A colon call made
@@ -101,7 +101,7 @@ NC = original
 -- Fake PS99 world ----------------------------------------------------------------------
 local game = new("DataModel", "Game", nil, { PlaceId = 8737899170 })
 local players = new("Players", "Players", game)
-local lp = new("Player", "TestUser", players, { UserId = 123456, DisplayName = "ShownName123" })
+local lp = new("Player", "TestUser", players, { UserId = 123456, DisplayName = "ÉloïseShown" })
 data[players].props.LocalPlayer = lp
 local RS = new("ReplicatedStorage", "ReplicatedStorage", game)
 local workspace = new("Workspace", "Workspace", game, { StreamingEnabled = true })
@@ -111,6 +111,7 @@ local remote = new("RemoteEvent", "DiamondMountain_SendPets", net)
 local remoteFn = new("RemoteFunction", "Expedition_Claim", net)
 local dmg = new("RemoteEvent", "Breakables_PlayerDealDamage", net)
 local chat = new("RemoteEvent", "Chat_Say", net)
+local hatch = new("RemoteFunction", "CustomEggs_Hatch", net)
 local others = {}
 for i = 1, 420 do others[i] = new("RemoteEvent", "Other_" .. i, net) end
 local pings = new("RemoteEvent", "UnreliableRemoteEvent", net)
@@ -163,7 +164,12 @@ local env = {
     task = {
         wait = function(t) luneTask.wait((t or 0.03) / SPEED) return t end,
         delay = function(t, f, ...) return luneTask.delay((t or 0) / SPEED, f, ...) end,
-        defer = function(f, ...) return luneTask.defer(f, ...) end,
+        defer = function(f, ...)
+            -- Roblox raises "Maximum re-entrancy depth (80) exceeded calling task.defer" in a thread
+            -- that is already 80 deferrals deep (v5 review); M.deferLimit models that thread.
+            if M.deferLimit then error("Maximum re-entrancy depth (80) exceeded calling task.defer") end
+            return luneTask.defer(f, ...)
+        end,
         spawn = function(f, ...) return luneTask.spawn(f, ...) end,
     },
     print = function(...)
@@ -180,14 +186,20 @@ local env = {
     getthreadidentity = function() return M.identity end,
     getnamecallmethod = function() return M.atom end,
     checkcaller = function() return M.fromScript == true end, -- true: an executor script called
-    setnamecallmethod = function(m) M.atom = m end,
+    -- "nosnm": an executor without setnamecallmethod, so the probe's re-assert cannot hide a
+    -- property read or colon call before dispatch.
+    setnamecallmethod = (process.env.PROBE_NO_SNM ~= "1" and process.args[3] ~= "nosnm") and function(m) M.atom = m end or nil,
     hookmetamethod = function(_, name, fn)
         assert(name == "__namecall", "only __namecall is modelled")
         local prev = NC
         NC = fn
         return prev
     end,
-    writefile = function(p, c) M.files[p] = c end,
+    writefile = function(p, c)
+        M.files[p] = c
+        M.writes = M.writes or {}
+        table.insert(M.writes, c) -- every save, so a partial one is seen even if the final replaces it
+    end,
     setclipboard = function() end,
     identifyexecutor = function() return "Potassium", "1.0" end,
     getgenv = function() return { VyAutoRank = { State = { alive = true } } } end, -- VY still running
@@ -247,6 +259,10 @@ end)
 -- ZapHub-test review (2026-10-18): a hub's hooks, heavy traffic, identical requests.
 local hookedFire = nil
 luneTask.spawn(function()
+    if KIND == "general" then -- heavy farming noise, then the one action the user does by hand
+        for _ = 1, 1000 do dmg:FireServer({ x = 1 }) end
+        chat:FireServer("the one action")
+    end
     M.indexHook = function(inst) inst:IsA("Model") end
     remote:FireServer(pet, 7)
     hookedFire = M.received[#M.received]
@@ -256,12 +272,24 @@ luneTask.spawn(function()
     M.fromScript = true
     custom:InvokeServer("DiamondMountain", "DM_Walls_Load", 1, { ada4 = 1 })
     M.fromScript = false
-    chat:FireServer("hello ShownName123")
+    chat:FireServer("hello ÉloïseShown")
     for i = 1, 420 do others[i]:FireServer(i) end
     custom:InvokeServer("DiamondMountain", "DM_Expedition_Start", 1)
+    hatch:InvokeServer("9af55dac", 3)
     M.replies.DM_Walls_Status = { Walls = { [2] = { HP = 2000000 } } }
     custom:InvokeServer("DiamondMountain", "DM_Walls_Status")
     custom:InvokeServer("DiamondMountain", "DM_Walls_Status")
+end)
+-- A game thread already at Roblox's task.defer re-entrancy limit sends a request.
+local limitFire, limitInvoke = nil, nil
+luneTask.spawn(function()
+    local before = #M.received
+    M.deferLimit = true
+    local okF = pcall(function() remote:FireServer(pet, 9) end)
+    local okI, r = pcall(function() return remoteFn:InvokeServer(pet) end)
+    M.deferLimit = false
+    limitFire = okF and #M.received >= before + 1
+    limitInvoke = okI and r == true
 end)
 -- Telemetry and the event's own Save data change; the player enters the mountain.
 SAVE.Engagement = { Stats = { ["Eggs Opened"] = { [1] = 22 } } }
@@ -273,10 +301,11 @@ local wall = new("Model", "RubbleWall", new("Model", "Camp1", camps))
 data[wall].attrs.WallIndex = 1
 new("ProximityPrompt", "LoadPrompt", wall, { ActionText = "Load Pets", ObjectText = "Rubble Wall" })
 
-luneTask.wait(15 / SPEED) -- mid-recording: a partial report must already be on disk
-local _, partial = next(M.files)
-local partialSaved = partial ~= nil and partial:find("PARTIAL report", 1, true) ~= nil
-luneTask.wait(30 / SPEED) -- recording window (30 virtual s) is over
+luneTask.wait(45 / SPEED) -- recording window (30 virtual s) is over
+local partialSaved = false
+for i = 1, #(M.writes or {}) - 1 do -- any save before the final one
+    if M.writes[i]:find("PARTIAL report", 1, true) then partialSaved = true end
+end
 local name, report = next(M.files)
 check(report ~= nil, "report file written (" .. tostring(name) .. ")")
 report = report or ""
@@ -293,6 +322,12 @@ check(M.identity == 7, "bug 3: thread identity restored to the executor's own va
 check(report:find("DiamondMountain_SendPets(Instance<Model>Workspace.PetModel, 5)", 1, true) ~= nil,
     "recorder: the request is reported with its Instance argument path")
 check(not report:find("123456", 1, true) and not report:find("TestUser", 1, true), "report is redacted")
+check(limitFire == true and limitInvoke == true,
+    "a request from a thread at the task.defer limit is still sent and answered (only its log line may be lost)")
+check(not report:find("Breakables_PlayerDealDamage({x=1})", 1, true), "noise remotes get no lines")
+if KIND == "general" then
+    check(report:find('Chat_Say("the one action")', 1, true) ~= nil, "general probe: 1000 noise requests do not hide the one action")
+end
 check(hookedFire ~= nil and hookedFire.method == "FireServer" and hookedFire.remote == "DiamondMountain_SendPets"
     and hookedFire.args[2] == 7, "a hub's __index hook (colon call on .Name) cannot change how the game's request is sent")
 -- The event probe prints a table's entries; the general probe prints its size.
@@ -328,8 +363,10 @@ if KIND == "event" then
     check(report:find("    5  FireServer Breakables_PlayerDealDamage", 1, true) ~= nil, "noise remotes are counted in 6b (not shown)")
     check(report:find('[script] InvokeServer Instancing_InvokeCustomFromClient("DiamondMountain", "DM_Walls_Load", 1, {ada4=1})', 1, true) ~= nil,
         "a hub request identical to an earlier game request still gets its [script] line")
-    check(not report:find("ShownName123", 1, true), "the display name is redacted too")
+    check(not report:find("ÉloïseShown", 1, true), "the display name is redacted too (also when it starts with a non-ASCII letter)")
     check(report:find('"DM_Expedition_Start", 1', 1, true) ~= nil, "event lines are not crowded out by 420 other remotes")
+    check(report:find('CustomEggs_Hatch("9af55dac", 3)', 1, true) ~= nil, "the camp-egg hatch is an event line, not crowded out either")
+    check(report:find('reply CustomEggs_Hatch("9af55dac", 3) -> true', 1, true) ~= nil, "a reply line names the request it answers")
     check(report:find("more remotes not listed", 1, true) ~= nil, "6b says when its list is cut")
     local _, hp2 = report:gsub("HP=2000000", "")
     check(hp2 == 1, "an identical reply is shown once (" .. hp2 .. ")")
@@ -337,7 +374,7 @@ if KIND == "event" then
     check(report:find("PARTIAL report", 1, true) == nil, "the final report replaces the partial one")
     check(report:find("only remote:FireServer", 1, true) ~= nil and report:find("untagged", 1, true) ~= nil,
         "section 6 explains what it cannot see and what [script] means")
-    check(report:find("reply Instancing_InvokeCustomFromClient DM_Walls_Status", 1, true) ~= nil
+    check(report:find('reply Instancing_InvokeCustomFromClient("DiamondMountain", "DM_Walls_Status") ->', 1, true) ~= nil
         and report:find("HP=1000000", 1, true) ~= nil, "run 1: the server's reply to a status request is recorded")
     check(report:find("Save.Engagement.", 1, true) == nil, "run 1: telemetry is left out of the Save diff")
     check(report:find("Save.InstanceVars.DiamondMountain.WallDamage : (new) 161386", 1, true) ~= nil,

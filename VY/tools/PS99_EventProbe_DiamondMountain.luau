@@ -31,6 +31,7 @@ local KEYWORDS = { "mountain", "yeti", "camp", "rubble", "wall", "trail", "exped
     "acorn", "merchant", "summit", "season", "boost", "upgrade", "climb", "pedestal", "marmot", "equinox" }
 -- Stricter words for this event's own entries inside tables shared by all events
 -- (Eggs, Pets, Currency, Boosts...): "boost" or "merchant" there would list every event.
+local INSTANCE_NAME = "DiamondMountain" -- the event instance's id in Instancing_* requests
 local ENTRY_KEYWORDS = { "mountain", "yeti", "summit", "acorn", "trail", "expedition", "rubble", "camp",
     "marmot", "markhor", "equinox", "hiker", "climber", "abominable" }
 
@@ -47,7 +48,7 @@ local function redact(s)
     s = tostring(s)
     if #me > 2 then s = s:gsub(esc(me), "<me>") end
     if #myName > 2 then s = s:gsub(esc(myName), "<me>") end
-    if #myDisplay > 2 and myDisplay ~= myName then s = s:gsub("%f[%w_]" .. esc(myDisplay) .. "%f[^%w_]", "<me>") end
+    if #myDisplay > 2 and myDisplay ~= myName then s = s:gsub("%f[%w_\128-\255]" .. esc(myDisplay) .. "%f[^%w_\128-\255]", "<me>") end
     return s
 end
 local function line(...)
@@ -494,12 +495,15 @@ if RECORD_SECONDS > 0 then
     line("  another way leaves no line here; look for its effects in sections 7 and 8.")
     line("  [script] = sent from an executor script's thread (e.g. a hub). Requests left untagged can still")
     line("  be caused by a script (prompts, touches, signals it fires), so do nothing by hand while testing one.")
+    line("  Replies: InvokeServer only, when the calling thread can wait; each reply line names its request.")
     local NOISE = { "Breakables_PlayerDealDamage", "Orbs", "Lootbags", "Idle", "Ping", "Mouse", "Camera", "Mark Approached" }
     -- Each remote (each event action for Instancing_* remotes) gets PER_REMOTE lines, so one chatty
     -- remote cannot use up the report (run 1: fps pings filled it after 138 s). Event remotes have
     -- their own line budget, so other traffic cannot crowd them out.
-    local PER_REMOTE, MAX_LINES, MAX_EVENT_LINES = 4, 400, 400
-    local seen, buckets, lines, eventLines, recording = {}, {}, 0, 0, true
+    -- Four line pools (event / other x game / [script]), so a hub's traffic can never use up
+    -- the lines of the game's own requests, and other traffic never the event lines.
+    local PER_REMOTE, POOL_LINES = 4, 300
+    local seen, buckets, pools, recording, lostDefers = {}, {}, {}, true, 0
     local function noisy(name)
         for _, w in ipairs(NOISE) do
             if string.find(name, w, 1, true) then return true end
@@ -510,24 +514,39 @@ if RECORD_SECONDS > 0 then
         if string.sub(name, 1, 11) == "Instancing_" and type(args[2]) == "string" then return name .. " " .. args[2] end
         return name
     end
+    -- An event request: Instancing_* remotes, event words in the remote's name (camp eggs are
+    -- hatched through CustomEggs_Hatch), or "DiamondMountain" among its arguments.
+    local function isEvent(name, args)
+        local lower = string.lower(name)
+        if string.sub(name, 1, 11) == "Instancing_" or matches(name) or string.find(lower, "egg", 1, true)
+            or string.find(lower, "hatch", 1, true) or string.find(lower, "unmask", 1, true) then
+            return true
+        end
+        for i = 1, args.n do
+            if args[i] == INSTANCE_NAME then return true end
+        end
+        return false
+    end
     -- fromScript: sent by an executor script (checkcaller), e.g. a script hub, not the game.
     local function bucketFor(method, name, args, fromScript)
         local base = bucketOf(name, args)
         local key = (fromScript and "[script] " or "") .. base
         local b = buckets[key]
         if not b then
+            local event = isEvent(name, args)
             b = { key = key, base = base, tag = fromScript and "[script] " or "", method = method, calls = 0, shown = 0,
-                replies = {}, replyCount = 0, event = string.sub(name, 1, 11) == "Instancing_" or matches(name) }
+                replies = {}, replyCount = {}, event = event,
+                pool = (event and "event" or "other") .. (fromScript and ":script" or ":game") }
             buckets[key] = b
         end
         return b
     end
-    local function lineFree(b)
-        if b.event then return eventLines < MAX_EVENT_LINES end
-        return lines < MAX_LINES
-    end
-    local function takeLine(b)
-        if b.event then eventLines += 1 else lines += 1 end
+    local function lineFree(b) return (pools[b.pool] or 0) < POOL_LINES end
+    local function takeLine(b) pools[b.pool] = (pools[b.pool] or 0) + 1 end
+    local function requestText(name, args)
+        local parts = {}
+        for i = 1, args.n do parts[i] = short(args[i]) end
+        return name .. "(" .. table.concat(parts, ", ") .. ")"
     end
     local function nameOf(remote)
         local ok, name = pcall(function() return remote.Name end)
@@ -541,9 +560,7 @@ if RECORD_SECONDS > 0 then
         local b = bucketFor(method, name, args, fromScript)
         b.calls += 1
         if noisy(name) or b.shown >= PER_REMOTE or not lineFree(b) then return end
-        local parts = {}
-        for i = 1, args.n do parts[i] = short(args[i]) end
-        local text = name .. "(" .. table.concat(parts, ", ") .. ")"
+        local text = requestText(name, args)
         if not seen[b.key .. "|" .. text] then
             seen[b.key .. "|" .. text] = true
             b.shown += 1
@@ -555,32 +572,59 @@ if RECORD_SECONDS > 0 then
         if not recording then return end -- arrived after the window: later sections follow
         local name = nameOf(remote)
         local b = bucketFor("InvokeServer", name, args, fromScript)
-        if noisy(name) or b.replyCount >= 3 or b.replies[text] or not lineFree(b) then return end
-        b.replies[text] = true
-        b.replyCount += 1
+        -- Only for a request whose line is shown; at most 2 different replies per request.
+        local request = requestText(name, args)
+        local count = b.replyCount[request] or 0
+        if noisy(name) or not seen[b.key .. "|" .. request] or count >= 2 or b.replies[request .. "|" .. text]
+            or not lineFree(b) then
+            return
+        end
+        b.replies[request .. "|" .. text] = true
+        b.replyCount[request] = count + 1
         takeLine(b)
-        out[#out + 1] = redact(string.format("  [+%5.1fs]   %sreply %s -> %s", at, b.tag, b.base, text))
+        out[#out + 1] = redact(string.format("  [+%5.1fs]   %sreply %s -> %s", at, b.tag, request, text))
     end
-    local function totals()
-        section("6b. Request totals while recording (every remote, also those not shown above)")
-        -- Event remotes first and all of them; then the busiest other remotes, up to 150.
-        local list = {}
-        for _, b in pairs(buckets) do list[#list + 1] = b end
+    -- 6b rows: every event remote; the 20 busiest others; the game's rare requests (calls <= 5,
+    -- the likely hand actions); then the rest; 300 non-event rows at most, the rest counted.
+    local function totalsLines()
+        local totalRows = {}
+        if lostDefers > 0 then
+            totalRows[#totalRows + 1] = "  (" .. lostDefers .. " requests were sent but not logged: their thread could not defer)"
+        end
+        local list, busiest = {}, {}
+        for _, b in pairs(buckets) do
+            list[#list + 1] = b
+            if not b.event then busiest[#busiest + 1] = b end
+        end
+        table.sort(busiest, function(a, b) return a.calls > b.calls end)
+        local top = {}
+        for i = 1, math.min(#busiest, 20) do top[busiest[i]] = true end
+        local function rank(b)
+            if b.event then return 1 end
+            if top[b] then return 2 end
+            if b.tag == "" and b.calls <= 5 then return 3 end
+            return 4
+        end
         table.sort(list, function(a, b)
-            if a.event ~= b.event then return a.event end
+            if rank(a) ~= rank(b) then return rank(a) < rank(b) end
             if a.calls ~= b.calls then return a.calls > b.calls end
             return a.key < b.key
         end)
         local others, cut = 0, 0
         for _, b in ipairs(list) do
             if not b.event then others += 1 end
-            if b.event or others <= 150 then
-                line(string.format("  %5d  %s%s %s", b.calls, b.tag, b.method, b.base))
+            if b.event or others <= 300 then
+                totalRows[#totalRows + 1] = string.format("  %5d  %s%s %s", b.calls, b.tag, b.method, b.base)
             else
                 cut += 1
             end
         end
-        if cut > 0 then line("  (+" .. cut .. " more remotes not listed)") end
+        if cut > 0 then totalRows[#totalRows + 1] = "  (+" .. cut .. " more remotes not listed)" end
+        return totalRows
+    end
+    local function totals()
+        section("6b. Request totals while recording (every remote, also those not shown above)")
+        for _, row in ipairs(totalsLines()) do line(row) end
     end
     if canHook then
         local old
@@ -606,7 +650,11 @@ if RECORD_SECONDS > 0 then
                             if okCopy then args[i] = copy end
                         end
                     end
-                    task.defer(record, os.clock() - started, method, self, args, fromScript)
+                    -- task.defer raises in a thread already at Roblox's re-entrancy limit: then only
+                    -- this log line is lost, never the request.
+                    if not pcall(task.defer, record, os.clock() - started, method, self, args, fromScript) then
+                        lostDefers += 1
+                    end
                     if type(setnamecallmethod) == "function" then pcall(setnamecallmethod, method) end
                     -- The server's reply (wall HP, expedition state...). Only where this thread
                     -- may yield across our frame; otherwise pass the call straight through.
@@ -620,7 +668,7 @@ if RECORD_SECONDS > 0 then
                             return table.concat(parts, ", ")
                         end)
                         if type(setnamecallmethod) == "function" then pcall(setnamecallmethod, method) end
-                        task.defer(recordReply, os.clock() - started, self, args, okText and text or "?", fromScript)
+                        pcall(task.defer, recordReply, os.clock() - started, self, args, okText and text or "?", fromScript)
                         return table.unpack(reply, 1, reply.n)
                     end
                 end
@@ -633,12 +681,16 @@ if RECORD_SECONDS > 0 then
         while recording do
             task.wait(SAVE_EVERY)
             if not recording then break end
-            writeReport(table.concat(out, "\n") .. "\n\n(PARTIAL report: still recording; totals, Save diff and the end scan are added at the end)")
+            local okTotals, snapshot = pcall(totalsLines)
+            writeReport(table.concat(out, "\n") .. "\n\n==== 6b so far ====\n" .. (okTotals and redact(table.concat(snapshot, "\n")) or "?")
+                .. "\n\n(PARTIAL report: still recording; the Save diff and the end scan are added at the end)")
         end
     end)
     task.delay(RECORD_SECONDS, function()
         recording = false -- the hook becomes a pass-through; it is not re-hooked
-        if canHook and lines + eventLines == 0 then line("  nothing recorded") end
+        local shownLines = 0
+        for _, n in pairs(pools) do shownLines += n end
+        if canHook and shownLines == 0 then line("  nothing recorded") end
         if canHook then totals() end
         if before then saveDiff(before) end
         instanceAfter()
