@@ -1,5 +1,7 @@
 -- =====================================================================================
---  PS99 Event Probe - Diamond Mountain (update 98, 2026-10-17)        READ-ONLY
+--  PS99 Event Probe v3 - Diamond Mountain (update 98, 2026-10-18)     READ-ONLY
+--  (v3 adds sections 6b and 8 and server replies; a report without "v3" in its first
+--  line came from an older copy)
 --
 --  Finds the event's real names so an event script can be built on evidence:
 --    0. the executor's name, thread identity and which executor functions exist;
@@ -144,7 +146,7 @@ local function flatten(t, path, depth, acc)
     return acc
 end
 
-line("PS99 Event Probe (Diamond Mountain) | " .. os.date("!%Y-%m-%d %H:%M:%S UTC") .. " | PlaceId " .. game.PlaceId)
+line("PS99 Event Probe v3 (Diamond Mountain) | " .. os.date("!%Y-%m-%d %H:%M:%S UTC") .. " | PlaceId " .. game.PlaceId)
 
 -- 0. Executor ---------------------------------------------------------------------------
 section("0. Executor (what an event script can use here)")

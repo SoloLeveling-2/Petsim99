@@ -2,6 +2,42 @@
 
 Newest first. Each entry: what changed, why, evidence, tests, limits, rollback.
 
+## 2026-10-18 — Live run 2; VY Wall Crew v0.1 (first Diamond Mountain automation)
+
+**Evidence (run 2).** The user redid run 1 at 120 FPS with the previous probe copy, whose recorder filled at +29 s; the Save diff is complete (222 changes). Facts are in `DIAMOND_MOUNTAIN_FINDINGS.md` ("Walls (run 2)"):
+- Wall 1 has 130,000,000 HP.
+- A broken wall releases its crew.
+- Pets on a wall stay in the inventory, and there is no crew limit (642 pets).
+- Per-pet power is listed per kind (golden ×1.5, shiny ×1.75).
+- Camp 2's egg is `Russet Falls Egg`.
+- Falling diamonds paid 418,506 in 5 min.
+
+**Why a separate script.** The wall action is one known request (`DM_Walls_Load`, 3 live samples in run 1), and its effect is visible in the Save. Inside VY it would compete with VY's travel and farming. A small standalone script is easier to verify live first.
+
+**Change.** New `VY/VY_WallCrew-v0.1.luau`:
+- Each check (15 s), while on the mountain, it finds the first unbroken wall whose camp is unlocked.
+- It compares the owned event pets (Directory `fromZoneNumber` 279, never Huge/Titanic/Gargantuan) with that wall's `WallCrew` count per kind, and loads only the missing count, one stack per request.
+- Requests are 1.5 s apart, at most 8 per check.
+- Each load is confirmed by the Save (the crew count grows) and the server's reply is printed.
+- It stops after two unconfirmed loads in a row. A wall breaking during a load is not counted as a failure.
+- `DRY_RUN = true` by default.
+- Re-running replaces the running copy; `getgenv().VyWallCrew.Stop()`.
+- Probe: the header says "v3", so reports show which copy ran.
+
+**Red → green.**
+- `dm_wallcrew.luau` (7 scenarios, fake server modelled on the live runs) failed against an empty script and passes on v0.1.
+- While writing it, the wall-break scenario exposed a real flaw: a wall breaking right after a load was logged as "did not show" and counted toward the stop. The new check failed first, then passed; it held in 5 repeats.
+
+**Green.**
+- Full suite on v1.1.9: 32/32.
+- Wall Crew: compile OK; Selene 0 errors, 1 warning (the same `_G` fallback warning VY has).
+
+**Limits.**
+- Mocked runtime only.
+- Live unknowns: the server's reply to `DM_Walls_Load`; whether a load of a part-loaded kind is additive for big counts (run 1 showed 2+1 = 3); whether `GetInstanceID()` returns "DiamondMountain" (with a fallback on the active instance container).
+
+**Rollback.** Stop it (`getgenv().VyWallCrew.Stop()`) and don't run it; it changes nothing else.
+
 ## 2026-10-17 — Live event probe run 1; probe fixes for run 2
 
 **Evidence.** The user ran the event probe once (Potassium v2.5.3, World 2 server), entered Diamond Mountain, went through the tutorial, loaded pets on wall 1 and hatched the camp egg. The facts are in `DIAMOND_MOUNTAIN_FINDINGS.md`. Main points:
