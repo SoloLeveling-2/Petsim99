@@ -1,7 +1,7 @@
 --!nocheck
 -- VY Wall Crew (Diamond Mountain) offline scenarios (mocked runtime, not live PS99).
 -- Usage: lune run VY/tests/lune/dm_wallcrew.luau <script.luau> <scenario>
--- scenarios: dry-run | load | wall-break | new-hatch | not-inside | refused | stop
+-- scenarios: dry-run | load | wall-break | new-hatch | not-inside | refused | stop | no-egg-data
 -- The fake server follows the two live probe runs (2026-10-17/18): DM_Walls_Load adds
 -- `count` pets of one stack to the wall's crew (keyed "id|pt|sh"), capped at what the
 -- player owns; pets stay in the inventory; a broken wall's crew is released.
@@ -28,14 +28,42 @@ dir.Pets = {
     ["Hiker Raccoon"] = { fromZoneNumber = 279 },
     ["Climber Goat"] = { fromZoneNumber = 279 },
     ["Huge Marmot"] = { fromZoneNumber = 279, huge = true },
+    -- Other events' pets share zone 279: the live v0.1 dry run (2026-10-18) planned
+    -- 13,343 Stitched Cats and 94 Mothmen for the wall.
+    ["Stitched Cat"] = { fromZoneNumber = 279 },
+    Mothman = { fromZoneNumber = 279 },
     Cat = { fromZoneNumber = 5 },
 }
+-- Directory.Eggs: this event's camp eggs are modules under Eggs.Events.DiamondMountain
+-- (live `_script` paths); another event's egg sits beside them.
+local function child(class, name, parent)
+    local x = R.Instance.new(class)
+    x.Name = name
+    x.Parent = parent
+    return x
+end
+local events = child("Folder", "Events", child("Folder", "Eggs", W.rs))
+local dmEggs, otherEggs = child("Folder", "DiamondMountain", events), child("Folder", "BloodMoon", events)
+dir.Eggs = {
+    ["Trailhead Egg"] = { _script = child("ModuleScript", "1 | Trailhead Egg", dmEggs),
+        pets = { { "Marmot", 60 }, { "Hiker Raccoon", 40 } } },
+    -- The live pet-list format is unknown: three plausible shapes.
+    ["Russet Falls Egg"] = { _script = child("ModuleScript", "2 | Russet Falls Egg", dmEggs),
+        pets = { ["Climber Goat"] = 50, ["Huge Marmot"] = 0.01 } },
+    ["Summit Test Egg"] = { _script = child("ModuleScript", "3 | Summit Test Egg", dmEggs),
+        pets = { { name = "Marmot", rarity = "Common" } } },
+    ["Stitched Egg"] = { _script = child("ModuleScript", "Stitched Egg", otherEggs),
+        pets = { { "Stitched Cat", 90 }, { "Mothman", 10 } } },
+}
+if scenario == "no-egg-data" then dir.Eggs = {} end
 local inv = W.save.Inventory.Pet
 inv.m1 = { id = "Marmot", _am = 331 }
 inv.m2 = { id = "Marmot", sh = true }
 inv.r1 = { id = "Hiker Raccoon", _am = 254 }
 inv.g1 = { id = "Climber Goat", _am = 10, pt = 1 }
 inv.h1 = { id = "Huge Marmot" }
+inv.s1 = { id = "Stitched Cat", _am = 13343 }
+inv.mo1 = { id = "Mothman", _am = 94 }
 -- p1 (Cat x40) comes from the fake world.
 local dm = {
     Walls = { Broken = { true, false, false, false, false }, Dealt = { 130000000, 0, 0, 0, 0 } },
@@ -91,7 +119,7 @@ local function everyEventPetOn(wall)
 end
 local function nothingWrongSent()
     for _, l in ipairs(loads) do
-        if l.map.h1 or l.map.p1 then return false end
+        if l.map.h1 or l.map.p1 or l.map.s1 or l.map.mo1 then return false end
     end
     return true
 end
@@ -108,6 +136,9 @@ if scenario == "dry-run" then
     H.check(said("would load 76 x Hiker Raccoon onto wall 2"), "dry run counts only the 76 Raccoons not yet on the wall")
     H.check(said("would load 10 x Climber Goat (golden)"), "dry run names the golden Goats")
     H.check(not said("Huge Marmot") and not said("x Cat"), "dry run never plans Huge or non-event pets")
+    H.check(not said("Stitched Cat") and not said("Mothman"), "dry run never plans other events' pets that share zone 279")
+    H.check(said("event pets (from 3 Diamond Mountain eggs): Climber Goat, Hiker Raccoon, Marmot"),
+        "dry run lists the event pets it found, from the camp eggs")
 elseif scenario == "load" then
     H.waitFor(function() return everyEventPetOn(2) end, 120)
     H.check(everyEventPetOn(2), "every event pet is on wall 2 (Marmot 331+1, Raccoon 254, golden Goat 10)")
@@ -119,6 +150,7 @@ elseif scenario == "load" then
     local mark = #loads
     H.wait(60)
     H.check(#loads == mark, "no further loads once every pet is on the wall (" .. (#loads - mark) .. ")")
+    H.check(nothingWrongSent(), "a minute later, still no other-event, Huge or non-event pet was sent")
     local gap = math.huge
     for i = 2, #loads do gap = math.min(gap, loads[i].t - loads[i - 1].t) end
     H.check(gap >= 1.4 / R.SPEED, "loads are at least 1.5 virtual s apart")
@@ -158,6 +190,12 @@ elseif scenario == "refused" then
     H.check(#loads == 2, "stops after two loads the wall did not show (" .. #loads .. ")")
     H.check(said("Wall is busy"), "the server's reply is printed")
     H.check(genv.VyWallCrew == nil, "the script stopped itself")
+elseif scenario == "no-egg-data" then
+    -- Without the eggs' pet lists it only tops up kinds the wall already accepted.
+    H.wait(60)
+    H.check(said("could not read"), "says it could not read the camp eggs' pet lists")
+    H.check(#loads == 1 and loads[1].map.r1 == 76, "only the Raccoons already on the wall are topped up (" .. #loads .. " loads)")
+    H.check(nothingWrongSent(), "no Huge, non-event or other-event pet was sent")
 elseif scenario == "stop" then
     H.wait(1)
     handle.Stop()

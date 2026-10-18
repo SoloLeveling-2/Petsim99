@@ -2,6 +2,28 @@
 
 Newest first. Each entry: what changed, why, evidence, tests, limits, rollback.
 
+## 2026-10-18 — VY Wall Crew v0.2: event pets from the camp eggs
+
+**Live evidence.** The user's first live run of v0.1 (DRY_RUN, nothing sent) planned the genuine wall pets (5 Climber Goat, 76 + 4 golden Hiker Raccoon, 25 Hiker Red Panda). It also planned other events' pets: 13,343 + 421 golden + 23 shiny Stitched Cat, 613 Stitched Dragon, 94 Mothman, Lucky Stacked Bunny/Capybara/Elephant, Lucky Surprise Ducky. Cause: v0.1 took `Directory.Pets[id].fromZoneNumber == 279` as "Diamond Mountain pet", and other events' pets share that zone. Without DRY_RUN, the server would probably have refused them (v0.1 then stops after two refusals); either way it was wrong.
+
+**Red.** `dm_wallcrew.luau` now has other-event pets in zone 279, Diamond Mountain egg modules and another event's egg, plus a `no-egg-data` scenario. Against v0.1:
+- `dry-run` 2 FAIL (it planned Stitched Cat/Mothman);
+- `load` 1 FAIL (it sent them after the event pets);
+- `no-egg-data` 3 FAIL.
+
+**Change (v0.2, file renamed).**
+- Event pets are the pets named in eggs whose module sits in the Directory's `Eggs.Events.DiamondMountain` folder (live `_script` paths), plus any kind a wall's crew has held this session.
+- The pet-list reader accepts strings, `{name, weight}` pairs, `{name = …}` tables and `{[name] = weight}` maps, keeping only names that exist in `Directory.Pets`.
+- Huge/Titanic/Gargantuan are still never loaded.
+- If no egg list can be read, it says so and only tops up kinds already on a wall (fail closed).
+- The pet list it found is printed once, so a dry run shows it.
+
+**Green.**
+- 8 Wall Crew scenarios pass (three egg formats in the fixture).
+- Compile OK; Selene 0 errors, 1 warning (`_G` fallback, as in VY).
+
+**Limits.** The real format of `Directory.Eggs[...].pets` is still unseen live. The printed list of event pets is the check.
+
 ## 2026-10-18 — Live run 2; VY Wall Crew v0.1 (first Diamond Mountain automation)
 
 **Evidence (run 2).** The user redid run 1 at 120 FPS with the previous probe copy, whose recorder filled at +29 s; the Save diff is complete (222 changes). Facts are in `DIAMOND_MOUNTAIN_FINDINGS.md` ("Walls (run 2)"):

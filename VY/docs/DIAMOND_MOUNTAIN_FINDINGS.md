@@ -70,7 +70,9 @@ Camp egg: `CustomEggs_Hatch("<egg uid>", 3)` and `(…, 1)` (InvokeServer). Then
 - Boosts: `DiamondMountainCoins1/2` (Acorns), `DiamondMountainDamage1/2`, `DiamondMountainLuck1/2`.
 - Merchant `DiamondMountainMerchant`. Its offers come from a function. Candidate remotes: `TravelingMerchant_GetState`, `TravelingMerchant_RequestPurchase`. The client util `DiamondMountainMerchant` has `CampOf`, `VisitAt`, `NextVisitAt`, `MoveSeconds`, so the wagon's schedule is computable.
 - Leaderboard `DiamondMountainYetiPoints` ends **Fri 2026-10-23 16:00 UTC**.
-- Event pets (zone 279): Marmot, Hiker Raccoon, Hiker Red Panda, Climber Goat, Climber Bear, Expedition Wolf/Leopard/Dog, Equinox Fox/Deer, Amber Markhor, Abominable Yeti.
+- Event pets: Marmot, Hiker Raccoon, Hiker Red Panda, Climber Goat, Climber Bear, Expedition Wolf/Leopard/Dog, Equinox Fox/Deer, Amber Markhor, Abominable Yeti.
+  - **Zone 279 does not identify them.** The Wall Crew v0.1 dry run (2026-10-18) found other events' pets in that zone too: Stitched Cat/Dragon, Mothman, Lucky Stacked Bunny/Capybara/Elephant, Lucky Surprise Ducky.
+  - The reliable source is the camp eggs' modules in the Directory's `Eggs.Events.DiamondMountain` folder.
 
 ## Client code worth calling or reading
 - `Library.Client.DiamondMountainCmds`, with children:

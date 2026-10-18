@@ -1,12 +1,15 @@
 -- =====================================================================================
---  VY Wall Crew v0.1 - Pet Simulator 99, Diamond Mountain (update 98)       2026-10-18
---  Status: tested offline (mocked Lune runtime); not yet run live.
+--  VY Wall Crew v0.2 - Pet Simulator 99, Diamond Mountain (update 98)       2026-10-18
+--  Status: tested offline (mocked Lune runtime); live: v0.1 dry run only.
 --
 --  Keeps every event pet you own on the Rubble Wall you are smashing:
 --    * event pets you hatch are added to the wall's crew;
 --    * when a wall breaks (its crew is released), they all go onto the next wall.
 --  Pets stay in your inventory (the wall only counts them), so nothing is spent.
+--  Event pets = the pets in Diamond Mountain's own eggs, plus kinds a wall already took.
 --  Huge, Titanic and Gargantuan pets are never loaded.
+--  v0.2: v0.1 took every pet from game zone 279 for an event pet; its first live dry run
+--  showed other events' pets share that zone (it planned 13,343 Stitched Cats).
 --
 --  DRY_RUN = true (the default) only prints what it WOULD load and sends nothing.
 --  Check the console (F9), then set DRY_RUN = false below and run it again.
@@ -25,9 +28,8 @@ local CONFIG = {
     REQUEST_GAP = 1.5,        -- seconds between two load requests
     MAX_LOADS_PER_CHECK = 8,  -- load requests per check, at most
     CONFIRM_SECONDS = 6,      -- how long to wait for the wall's crew to show a load
-    EVENT_PET_ZONE = 279,     -- Directory.Pets[id].fromZoneNumber of this event's pets
 }
-local VERSION = "0.1"
+local VERSION = "0.2"
 local INSTANCE = "DiamondMountain"
 local TAG = "[WallCrew] "
 
@@ -91,19 +93,70 @@ end
 local okPets, Pets = gcall(function() return Directory.Pets end)
 if not (okPets and type(Pets) == "table") then Pets = module("Directory", "Pets") end
 
--- This event's pets: Directory.Pets[id].fromZoneNumber == 279, never Huge/Titanic/Gargantuan.
-local eventPet = {}
-local function isEventPet(id)
-    if eventPet[id] == nil then
-        local ok, yes = pcall(function()
-            local entry = type(Pets) == "table" and Pets[id] or nil
-            if type(entry) ~= "table" or entry.huge or entry.titanic or entry.gargantuan then return false end
-            if id:find("^Huge ") or id:find("^Titanic ") or id:find("^Gargantuan ") then return false end
-            return tonumber(entry.fromZoneNumber) == CONFIG.EVENT_PET_ZONE
-        end)
-        eventPet[id] = ok and yes == true
+local function isBig(id)
+    local entry = type(Pets) == "table" and Pets[id] or nil
+    if type(entry) == "table" and (entry.huge or entry.titanic or entry.gargantuan) then return true end
+    return id:find("^Huge ") ~= nil or id:find("^Titanic ") ~= nil or id:find("^Gargantuan ") ~= nil
+end
+
+-- This event's pets: the pets in Diamond Mountain's eggs (the egg modules sit in the
+-- Directory's Eggs.Events.DiamondMountain folder), plus any kind a wall has accepted.
+-- Not Directory.Pets[...].fromZoneNumber: other events' pets share zone 279.
+local eggPets, eggCount = {}, 0
+-- An egg's pet entry may be "Marmot", {"Marmot", 60}, {name = "Marmot", ...} or a
+-- { Marmot = 60 } pair; take every string and keep only real pet names.
+local function addPetNames(key, entry)
+    local function add(name)
+        if type(name) == "string" and (type(Pets) ~= "table" or Pets[name] ~= nil) and not isBig(name) then
+            eggPets[name] = true
+        end
     end
-    return eventPet[id]
+    add(key)
+    add(entry)
+    if type(entry) == "table" then
+        for _, v in pairs(entry) do add(v) end
+    end
+end
+do
+    local okEggs, eggs = gcall(function() return Directory.Eggs end)
+    if not (okEggs and type(eggs) == "table") then eggs = module("Directory", "Eggs") end
+    for _, egg in pairs(type(eggs) == "table" and eggs or {}) do
+        local okDm, fromMountain = pcall(function()
+            local script = type(egg) == "table" and egg._script or nil
+            return typeof(script) == "Instance" and script.Parent ~= nil and script.Parent.Name == INSTANCE
+        end)
+        if okDm and fromMountain then
+            eggCount += 1
+            for key, entry in pairs(type(egg.pets) == "table" and egg.pets or {}) do
+                addPetNames(key, entry)
+            end
+        end
+    end
+end
+local accepted = {} -- pet ids a wall's crew has held: the server took them
+local function isEventPet(id)
+    return (eggPets[id] == true or accepted[id] == true) and not isBig(id)
+end
+local function learnAccepted(dm)
+    for _, crew in pairs(type(dm.WallCrew) == "table" and dm.WallCrew or {}) do
+        for kind, entry in pairs(type(crew) == "table" and crew or {}) do
+            local id = type(entry) == "table" and entry.id or (type(kind) == "string" and kind:match("^(.-)|")) or nil
+            if type(id) == "string" then accepted[id] = true end
+        end
+    end
+end
+local announced = false
+local function announce()
+    if announced then return end
+    announced = true
+    local names = {}
+    for name in pairs(eggPets) do names[#names + 1] = name end
+    table.sort(names)
+    if #names > 0 then
+        log("event pets (from %d Diamond Mountain eggs): %s", eggCount, table.concat(names, ", "))
+    else
+        log("could not read the Diamond Mountain eggs' pet lists; only pet kinds already on a wall are topped up")
+    end
 end
 
 local function getSave()
@@ -217,6 +270,8 @@ local function tick()
         status("waiting: no Diamond Mountain data in your save yet")
         return
     end
+    announce()
+    learnAccepted(dm)
     local wall, why = activeWall(dm)
     if not wall then
         status("waiting: %s", why)
