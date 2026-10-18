@@ -174,6 +174,7 @@ local env = {
     setthreadidentity = function(n) M.identity = n end,
     getthreadidentity = function() return M.identity end,
     getnamecallmethod = function() return M.atom end,
+    checkcaller = function() return M.fromScript == true end, -- true: an executor script called
     setnamecallmethod = function(m) M.atom = m end,
     hookmetamethod = function(_, name, fn)
         assert(name == "__namecall", "only __namecall is modelled")
@@ -232,6 +233,10 @@ luneTask.spawn(function() -- the game's own threads
     for i = 1, 300 do pings:FireServer({ fps = 14 + i / 1000 }) end
     custom:InvokeServer("DiamondMountain", "DM_Walls_Status")
     custom:InvokeServer("DiamondMountain", "DM_Walls_Load", 1, { ada4 = 1 })
+    -- Another executor script (e.g. a script hub) sends an event action.
+    M.fromScript = true
+    custom:InvokeServer("DiamondMountain", "DM_Yeti_Feed", { y1 = 1 })
+    M.fromScript = false
 end)
 -- Telemetry and the event's own Save data change; the player enters the mountain.
 SAVE.Engagement = { Stats = { ["Eggs Opened"] = { [1] = 22 } } }
@@ -301,6 +306,14 @@ if KIND == "event" then
     check(report:find("Load Pets", 1, true) ~= nil and report:find("WallIndex=1", 1, true) ~= nil,
         "run 1: mountain objects and prompts are scanned after entering")
     check(report:find("FillBest/2", 1, true) ~= nil, "run 1: game function argument counts are shown")
+    -- Script-hub test: requests from executor scripts are told apart from the game's.
+    check(report:find('[script] InvokeServer Instancing_InvokeCustomFromClient("DiamondMountain", "DM_Yeti_Feed"', 1, true) ~= nil,
+        "a request from an executor script is tagged [script]")
+    check(report:find("1  [script] InvokeServer Instancing_InvokeCustomFromClient DM_Yeti_Feed", 1, true) ~= nil,
+        "script requests have their own totals row")
+    check(report:find('] InvokeServer Instancing_InvokeCustomFromClient("DiamondMountain", "DM_Walls_Load"', 1, true) ~= nil
+        and report:find('[script] InvokeServer Instancing_InvokeCustomFromClient("DiamondMountain", "DM_Walls_Load"', 1, true) == nil,
+        "the game's own requests stay untagged")
 end
 
 print(#failures == 0 and "ALL OK" or (#failures .. " FAILED"))

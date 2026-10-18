@@ -1,7 +1,8 @@
 -- =====================================================================================
---  PS99 Event Probe v3 - Diamond Mountain (update 98, 2026-10-18)     READ-ONLY
---  (v3 adds sections 6b and 8 and server replies; a report without "v3" in its first
---  line came from an older copy)
+--  PS99 Event Probe v4 - Diamond Mountain (update 98, 2026-10-18)     READ-ONLY
+--  (v3 added sections 6b and 8 and server replies; v4 tags requests that another
+--  executor script sends, e.g. a script hub, with [script]. Check the version in a
+--  report's first line.)
 --
 --  Finds the event's real names so an event script can be built on evidence:
 --    0. the executor's name, thread identity and which executor functions exist;
@@ -146,7 +147,7 @@ local function flatten(t, path, depth, acc)
     return acc
 end
 
-line("PS99 Event Probe v3 (Diamond Mountain) | " .. os.date("!%Y-%m-%d %H:%M:%S UTC") .. " | PlaceId " .. game.PlaceId)
+line("PS99 Event Probe v4 (Diamond Mountain) | " .. os.date("!%Y-%m-%d %H:%M:%S UTC") .. " | PlaceId " .. game.PlaceId)
 
 -- 0. Executor ---------------------------------------------------------------------------
 section("0. Executor (what an event script can use here)")
@@ -489,18 +490,20 @@ if RECORD_SECONDS > 0 then
         if string.sub(name, 1, 11) == "Instancing_" and type(args[2]) == "string" then return name .. " " .. args[2] end
         return name
     end
-    local function bucketFor(method, name, args)
-        local key = bucketOf(name, args)
+    -- fromScript: sent by an executor script (checkcaller), e.g. a script hub, not the game.
+    local function bucketFor(method, name, args, fromScript)
+        local base = bucketOf(name, args)
+        local key = (fromScript and "[script] " or "") .. base
         local b = buckets[key]
         if not b then
-            b = { key = key, method = method, calls = 0, shown = 0, replies = 0 }
+            b = { key = key, base = base, tag = fromScript and "[script] " or "", method = method, calls = 0, shown = 0, replies = 0 }
             buckets[key] = b
         end
         return b
     end
     -- Formats one captured request. Runs in its own thread, outside the hook.
-    local function record(at, method, name, args)
-        local b = bucketFor(method, name, args)
+    local function record(at, method, name, args, fromScript)
+        local b = bucketFor(method, name, args, fromScript)
         b.calls += 1
         if b.shown >= PER_REMOTE or lines >= MAX_LINES then return end
         local parts = {}
@@ -510,15 +513,15 @@ if RECORD_SECONDS > 0 then
             seen[key] = true
             b.shown += 1
             lines += 1
-            out[#out + 1] = redact(string.format("  [+%5.1fs] %s %s", at, method, key))
+            out[#out + 1] = redact(string.format("  [+%5.1fs] %s%s %s", at, fromScript and "[script] " or "", method, key))
         end
     end
-    local function recordReply(at, name, args, text)
-        local b = bucketFor("InvokeServer", name, args)
+    local function recordReply(at, name, args, text, fromScript)
+        local b = bucketFor("InvokeServer", name, args, fromScript)
         if b.replies >= 2 or lines >= MAX_LINES then return end
         b.replies += 1
         lines += 1
-        out[#out + 1] = redact(string.format("  [+%5.1fs]   reply %s -> %s", at, b.key, text))
+        out[#out + 1] = redact(string.format("  [+%5.1fs]   %sreply %s -> %s", at, b.tag, b.base, text))
     end
     local function totals()
         section("6b. Request totals while recording (every remote, also those not shown above)")
@@ -526,7 +529,7 @@ if RECORD_SECONDS > 0 then
         for _, b in pairs(buckets) do list[#list + 1] = b end
         table.sort(list, function(a, b) return a.calls > b.calls end)
         for i = 1, math.min(#list, 150) do
-            line(string.format("  %5d  %s %s", list[i].calls, list[i].method, list[i].key))
+            line(string.format("  %5d  %s%s %s", list[i].calls, list[i].tag, list[i].method, list[i].base))
         end
     end
     if canHook then
@@ -544,6 +547,11 @@ if RECORD_SECONDS > 0 then
                     end
                     if not noisy then
                         captured += 1
+                        local fromScript = false
+                        if type(checkcaller) == "function" then
+                            local okCaller, caller = pcall(checkcaller)
+                            fromScript = okCaller and caller == true
+                        end
                         -- Copy table arguments now: the game may reuse and clear one right after
                         -- sending it. table.clone fails on a protected metatable; keep the original.
                         local args = table.pack(...)
@@ -553,7 +561,7 @@ if RECORD_SECONDS > 0 then
                                 if okCopy then args[i] = copy end
                             end
                         end
-                        task.defer(record, os.clock() - started, method, name, args)
+                        task.defer(record, os.clock() - started, method, name, args, fromScript)
                         -- The server's reply (wall HP, expedition state...). Only where this thread
                         -- may yield across our frame; otherwise pass the call straight through.
                         if method == "InvokeServer" and coroutine.isyieldable() then
@@ -566,7 +574,7 @@ if RECORD_SECONDS > 0 then
                                 return table.concat(parts, ", ")
                             end)
                             if type(setnamecallmethod) == "function" then pcall(setnamecallmethod, method) end
-                            task.defer(recordReply, os.clock() - started, name, args, okText and text or "?")
+                            task.defer(recordReply, os.clock() - started, name, args, okText and text or "?", fromScript)
                             return table.unpack(reply, 1, reply.n)
                         end
                     end
