@@ -273,9 +273,15 @@ if RECORD_SECONDS > 0 and type(hookmetamethod) == "function" and type(getnamecal
     print("[Probe] RECORDING for " .. RECORD_SECONDS .. " s: do ONE action by hand now")
     local seen, count, captured, recording, old = {}, 0, 0, true, nil
     local NOISE = { "Breakables_", "Orbs", "Lootbags", "Pets_", "Idle", "Ping", "Mouse", "Camera" }
-    -- Formats one captured request. Runs in its own thread, outside the hook.
-    local function record(method, name, args)
+    -- Formats one request in its own thread, after it was sent: the remote's Name is read
+    -- here, never in the hook, so no other script's __index hook runs before dispatch.
+    local function record(method, remote, args)
         if count >= 60 then return end
+        local okName, name = pcall(function() return remote.Name end)
+        name = okName and tostring(name) or "?"
+        for _, w in ipairs(NOISE) do
+            if string.find(name, w, 1, true) then return end
+        end
         local parts = {}
         for i = 1, args.n do parts[i] = short(args[i]) end
         local key = name .. "(" .. table.concat(parts, ", ") .. ")"
@@ -286,29 +292,24 @@ if RECORD_SECONDS > 0 and type(hookmetamethod) == "function" and type(getnamecal
         end
     end
     old = hookmetamethod(game, "__namecall", function(self, ...)
-        -- No colon calls on Instances in here: one would replace the namecall method
-        -- that old() dispatches the game's own request as (FireServer -> GetFullName).
+        -- Before old() dispatches the request nothing here may run other code that could
+        -- change the namecall method: no colon calls and no property reads on Instances
+        -- (another script's __index hook may make a colon call).
         if recording then
             local method = getnamecallmethod()
             if (method == "FireServer" or method == "InvokeServer") and captured < 1000 and typeof(self) == "Instance" then
-                local name = self.Name
-                local noisy = false
-                for _, w in ipairs(NOISE) do
-                    if string.find(name, w, 1, true) then noisy = true break end
-                end
-                if not noisy then
-                    captured += 1
-                    -- Copy table arguments now: the game may reuse and clear one right after
-                    -- sending it. table.clone fails on a protected metatable; keep the original.
-                    local args = table.pack(...)
-                    for i = 1, args.n do
-                        if typeof(args[i]) == "table" then
-                            local okCopy, copy = pcall(table.clone, args[i])
-                            if okCopy then args[i] = copy end
-                        end
+                captured += 1
+                -- Copy table arguments now: the game may reuse and clear one right after
+                -- sending it. table.clone fails on a protected metatable; keep the original.
+                local args = table.pack(...)
+                for i = 1, args.n do
+                    if typeof(args[i]) == "table" then
+                        local okCopy, copy = pcall(table.clone, args[i])
+                        if okCopy then args[i] = copy end
                     end
-                    task.defer(record, method, name, args)
                 end
+                task.defer(record, method, self, args)
+                if type(setnamecallmethod) == "function" then pcall(setnamecallmethod, method) end
             end
         end
         return old(self, ...)

@@ -1,7 +1,8 @@
 -- =====================================================================================
---  PS99 Event Probe v4 - Diamond Mountain (update 98, 2026-10-18)     READ-ONLY
---  (v3 added sections 6b and 8 and server replies; v4 tags requests that another
---  executor script sends, e.g. a script hub, with [script]. Check the version in a
+--  PS99 Event Probe v5 - Diamond Mountain (update 98, 2026-10-18)     READ-ONLY
+--  (v3 added sections 6b and 8 and server replies; v4 tags requests another executor
+--  script sends, e.g. a script hub, with [script]; v5 is safe next to a hub's hooks,
+--  counts every request and saves the report while recording. Check the version in a
 --  report's first line.)
 --
 --  Finds the event's real names so an event script can be built on evidence:
@@ -25,6 +26,7 @@
 --  and once at the summit: far parts of the mountain may not be loaded where you stand.
 -- =====================================================================================
 local RECORD_SECONDS = 300   -- time you have to do the actions by hand (0 = no recording)
+local SAVE_EVERY = 60        -- while recording, the report so far is saved every SAVE_EVERY s
 local KEYWORDS = { "mountain", "yeti", "camp", "rubble", "wall", "trail", "expedition", "artifact",
     "acorn", "merchant", "summit", "season", "boost", "upgrade", "climb", "pedestal", "marmot", "equinox" }
 -- Stricter words for this event's own entries inside tables shared by all events
@@ -37,6 +39,7 @@ local RS = game:GetService("ReplicatedStorage")
 local player = Players.LocalPlayer
 local out = {}
 local me, myName = tostring(player and player.UserId or "?"), tostring(player and player.Name or "?")
+local myDisplay = tostring(player and player.DisplayName or "")
 local started = os.clock()
 
 local function esc(x) return (x:gsub("%p", "%%%0")) end
@@ -44,6 +47,7 @@ local function redact(s)
     s = tostring(s)
     if #me > 2 then s = s:gsub(esc(me), "<me>") end
     if #myName > 2 then s = s:gsub(esc(myName), "<me>") end
+    if #myDisplay > 2 and myDisplay ~= myName then s = s:gsub("%f[%w_]" .. esc(myDisplay) .. "%f[^%w_]", "<me>") end
     return s
 end
 local function line(...)
@@ -147,7 +151,7 @@ local function flatten(t, path, depth, acc)
     return acc
 end
 
-line("PS99 Event Probe v4 (Diamond Mountain) | " .. os.date("!%Y-%m-%d %H:%M:%S UTC") .. " | PlaceId " .. game.PlaceId)
+line("PS99 Event Probe v5 (Diamond Mountain) | " .. os.date("!%Y-%m-%d %H:%M:%S UTC") .. " | PlaceId " .. game.PlaceId)
 
 -- 0. Executor ---------------------------------------------------------------------------
 section("0. Executor (what an event script can use here)")
@@ -354,15 +358,20 @@ for _, row in ipairs(rows) do line("  " .. row.text .. (row.count > 1 and ("  (x
 line("  shown " .. #rows .. " rows (scanned " .. scanned .. " objects)")
 
 -- 6. Recorder ---------------------------------------------------------------------------
+-- One file per run: the report so far while recording, then the final report.
+local reportName = "PS99_EventProbe_" .. os.date("!%Y%m%d_%H%M%S") .. ".txt"
+local function writeReport(text)
+    if type(writefile) ~= "function" then return false end
+    return (pcall(writefile, reportName, text))
+end
+
 local function finish()
     line("")
     line("Done in " .. math.floor(os.clock() - started) .. " s.")
     local text = table.concat(out, "\n")
     for i = 1, #out, 60 do print(table.concat(out, "\n", i, math.min(i + 59, #out))) end
     if type(writefile) == "function" then
-        local name = "PS99_EventProbe_" .. os.date("!%Y%m%d_%H%M%S") .. ".txt"
-        local ok = pcall(writefile, name, text)
-        print(ok and ("[EventProbe] saved " .. name .. " in your executor workspace folder") or "[EventProbe] save failed")
+        print(writeReport(text) and ("[EventProbe] saved " .. reportName .. " in your executor workspace folder") or "[EventProbe] save failed")
     end
     if type(setclipboard) == "function" then pcall(setclipboard, text) end
 end
@@ -481,11 +490,22 @@ if RECORD_SECONDS > 0 then
     print("[EventProbe] send pets to a Rubble Wall, fight the Yeti, feed ONE cheap pet, start + claim an expedition, open")
     print("[EventProbe] a trail chest, buy one merchant item, buy one mountain upgrade, use one boost, buy one camp egg.")
     print("[EventProbe] Skip what you can't do now; stay on the mountain; the report saves itself when the time is up.")
+    line("  Seen: only remote:FireServer() / remote:InvokeServer() calls. A script that calls a remote")
+    line("  another way leaves no line here; look for its effects in sections 7 and 8.")
+    line("  [script] = sent from an executor script's thread (e.g. a hub). Requests left untagged can still")
+    line("  be caused by a script (prompts, touches, signals it fires), so do nothing by hand while testing one.")
     local NOISE = { "Breakables_PlayerDealDamage", "Orbs", "Lootbags", "Idle", "Ping", "Mouse", "Camera", "Mark Approached" }
-    -- Each remote (each event action for Instancing_* remotes) gets its own few lines, so one
-    -- chatty remote cannot use up the report: in run 1, fps pings filled it after 138 s.
-    local PER_REMOTE, MAX_LINES = 4, 400
-    local seen, buckets, lines, captured, recording = {}, {}, 0, 0, true
+    -- Each remote (each event action for Instancing_* remotes) gets PER_REMOTE lines, so one chatty
+    -- remote cannot use up the report (run 1: fps pings filled it after 138 s). Event remotes have
+    -- their own line budget, so other traffic cannot crowd them out.
+    local PER_REMOTE, MAX_LINES, MAX_EVENT_LINES = 4, 400, 400
+    local seen, buckets, lines, eventLines, recording = {}, {}, 0, 0, true
+    local function noisy(name)
+        for _, w in ipairs(NOISE) do
+            if string.find(name, w, 1, true) then return true end
+        end
+        return false
+    end
     local function bucketOf(name, args)
         if string.sub(name, 1, 11) == "Instancing_" and type(args[2]) == "string" then return name .. " " .. args[2] end
         return name
@@ -496,96 +516,129 @@ if RECORD_SECONDS > 0 then
         local key = (fromScript and "[script] " or "") .. base
         local b = buckets[key]
         if not b then
-            b = { key = key, base = base, tag = fromScript and "[script] " or "", method = method, calls = 0, shown = 0, replies = 0 }
+            b = { key = key, base = base, tag = fromScript and "[script] " or "", method = method, calls = 0, shown = 0,
+                replies = {}, replyCount = 0, event = string.sub(name, 1, 11) == "Instancing_" or matches(name) }
             buckets[key] = b
         end
         return b
     end
-    -- Formats one captured request. Runs in its own thread, outside the hook.
-    local function record(at, method, name, args, fromScript)
+    local function lineFree(b)
+        if b.event then return eventLines < MAX_EVENT_LINES end
+        return lines < MAX_LINES
+    end
+    local function takeLine(b)
+        if b.event then eventLines += 1 else lines += 1 end
+    end
+    local function nameOf(remote)
+        local ok, name = pcall(function() return remote.Name end)
+        return ok and tostring(name) or "?"
+    end
+    -- Formats one request in its own thread, after it was sent: the remote's Name is read here,
+    -- never in the hook, so no other script's __index hook runs between the call and its dispatch.
+    local function record(at, method, remote, args, fromScript)
+        if not recording then return end
+        local name = nameOf(remote)
         local b = bucketFor(method, name, args, fromScript)
         b.calls += 1
-        if b.shown >= PER_REMOTE or lines >= MAX_LINES then return end
+        if noisy(name) or b.shown >= PER_REMOTE or not lineFree(b) then return end
         local parts = {}
         for i = 1, args.n do parts[i] = short(args[i]) end
-        local key = name .. "(" .. table.concat(parts, ", ") .. ")"
-        if not seen[key] then
-            seen[key] = true
+        local text = name .. "(" .. table.concat(parts, ", ") .. ")"
+        if not seen[b.key .. "|" .. text] then
+            seen[b.key .. "|" .. text] = true
             b.shown += 1
-            lines += 1
-            out[#out + 1] = redact(string.format("  [+%5.1fs] %s%s %s", at, fromScript and "[script] " or "", method, key))
+            takeLine(b)
+            out[#out + 1] = redact(string.format("  [+%5.1fs] %s%s %s", at, b.tag, method, text))
         end
     end
-    local function recordReply(at, name, args, text, fromScript)
+    local function recordReply(at, remote, args, text, fromScript)
+        if not recording then return end -- arrived after the window: later sections follow
+        local name = nameOf(remote)
         local b = bucketFor("InvokeServer", name, args, fromScript)
-        if b.replies >= 2 or lines >= MAX_LINES then return end
-        b.replies += 1
-        lines += 1
+        if noisy(name) or b.replyCount >= 3 or b.replies[text] or not lineFree(b) then return end
+        b.replies[text] = true
+        b.replyCount += 1
+        takeLine(b)
         out[#out + 1] = redact(string.format("  [+%5.1fs]   %sreply %s -> %s", at, b.tag, b.base, text))
     end
     local function totals()
         section("6b. Request totals while recording (every remote, also those not shown above)")
+        -- Event remotes first and all of them; then the busiest other remotes, up to 150.
         local list = {}
         for _, b in pairs(buckets) do list[#list + 1] = b end
-        table.sort(list, function(a, b) return a.calls > b.calls end)
-        for i = 1, math.min(#list, 150) do
-            line(string.format("  %5d  %s%s %s", list[i].calls, list[i].tag, list[i].method, list[i].base))
+        table.sort(list, function(a, b)
+            if a.event ~= b.event then return a.event end
+            if a.calls ~= b.calls then return a.calls > b.calls end
+            return a.key < b.key
+        end)
+        local others, cut = 0, 0
+        for _, b in ipairs(list) do
+            if not b.event then others += 1 end
+            if b.event or others <= 150 then
+                line(string.format("  %5d  %s%s %s", b.calls, b.tag, b.method, b.base))
+            else
+                cut += 1
+            end
         end
+        if cut > 0 then line("  (+" .. cut .. " more remotes not listed)") end
     end
     if canHook then
         local old
         old = hookmetamethod(game, "__namecall", function(self, ...)
-            -- No colon calls on Instances in here: one would replace the namecall method
-            -- that old() dispatches the game's own request as (FireServer -> GetFullName).
+            -- Before old() dispatches the request nothing here may run other code that could
+            -- change the namecall method: no colon calls and no property reads on Instances
+            -- (another script's __index hook may make a colon call). Name lookup and formatting
+            -- happen in the deferred record thread.
             if recording then
                 local method = getnamecallmethod()
-                if (method == "FireServer" or method == "InvokeServer") and captured < 5000 and typeof(self) == "Instance" then
-                    local name = self.Name
-                    local noisy = false
-                    for _, w in ipairs(NOISE) do
-                        if string.find(name, w, 1, true) then noisy = true break end
+                if (method == "FireServer" or method == "InvokeServer") and typeof(self) == "Instance" then
+                    local fromScript = false
+                    if type(checkcaller) == "function" then
+                        local okCaller, caller = pcall(checkcaller)
+                        fromScript = okCaller and caller == true
                     end
-                    if not noisy then
-                        captured += 1
-                        local fromScript = false
-                        if type(checkcaller) == "function" then
-                            local okCaller, caller = pcall(checkcaller)
-                            fromScript = okCaller and caller == true
+                    -- Copy table arguments now: the game may reuse and clear one right after
+                    -- sending it. table.clone fails on a protected metatable; keep the original.
+                    local args = table.pack(...)
+                    for i = 1, args.n do
+                        if typeof(args[i]) == "table" then
+                            local okCopy, copy = pcall(table.clone, args[i])
+                            if okCopy then args[i] = copy end
                         end
-                        -- Copy table arguments now: the game may reuse and clear one right after
-                        -- sending it. table.clone fails on a protected metatable; keep the original.
-                        local args = table.pack(...)
-                        for i = 1, args.n do
-                            if typeof(args[i]) == "table" then
-                                local okCopy, copy = pcall(table.clone, args[i])
-                                if okCopy then args[i] = copy end
-                            end
-                        end
-                        task.defer(record, os.clock() - started, method, name, args, fromScript)
-                        -- The server's reply (wall HP, expedition state...). Only where this thread
-                        -- may yield across our frame; otherwise pass the call straight through.
-                        if method == "InvokeServer" and coroutine.isyieldable() then
-                            local reply = table.pack(old(self, ...))
-                            -- The request has been dispatched and answered: formatting (which makes
-                            -- colon calls) can no longer change it. Errors here never reach the game.
-                            local okText, text = pcall(function()
-                                local parts = {}
-                                for i = 1, reply.n do parts[i] = long(reply[i]) end
-                                return table.concat(parts, ", ")
-                            end)
-                            if type(setnamecallmethod) == "function" then pcall(setnamecallmethod, method) end
-                            task.defer(recordReply, os.clock() - started, name, args, okText and text or "?", fromScript)
-                            return table.unpack(reply, 1, reply.n)
-                        end
+                    end
+                    task.defer(record, os.clock() - started, method, self, args, fromScript)
+                    if type(setnamecallmethod) == "function" then pcall(setnamecallmethod, method) end
+                    -- The server's reply (wall HP, expedition state...). Only where this thread
+                    -- may yield across our frame; otherwise pass the call straight through.
+                    if method == "InvokeServer" and coroutine.isyieldable() then
+                        local reply = table.pack(old(self, ...))
+                        -- The request has been dispatched and answered: formatting (which makes
+                        -- colon calls) can no longer change it. Errors here never reach the game.
+                        local okText, text = pcall(function()
+                            local parts = {}
+                            for i = 1, reply.n do parts[i] = long(reply[i]) end
+                            return table.concat(parts, ", ")
+                        end)
+                        if type(setnamecallmethod) == "function" then pcall(setnamecallmethod, method) end
+                        task.defer(recordReply, os.clock() - started, self, args, okText and text or "?", fromScript)
+                        return table.unpack(reply, 1, reply.n)
                     end
                 end
             end
             return old(self, ...)
         end)
     end
+    -- The report so far, every SAVE_EVERY s: a kick or server hop keeps what was recorded.
+    task.spawn(function()
+        while recording do
+            task.wait(SAVE_EVERY)
+            if not recording then break end
+            writeReport(table.concat(out, "\n") .. "\n\n(PARTIAL report: still recording; totals, Save diff and the end scan are added at the end)")
+        end
+    end)
     task.delay(RECORD_SECONDS, function()
         recording = false -- the hook becomes a pass-through; it is not re-hooked
-        if canHook and lines == 0 then line("  nothing recorded") end
+        if canHook and lines + eventLines == 0 then line("  nothing recorded") end
         if canHook then totals() end
         if before then saveDiff(before) end
         instanceAfter()

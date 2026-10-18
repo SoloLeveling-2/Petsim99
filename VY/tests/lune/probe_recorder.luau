@@ -26,6 +26,8 @@ local METHODS = {}
 local NC -- current __namecall handler (hookmetamethod replaces it)
 local mt = {}
 mt.__index = function(self, k)
+    -- Another script's __index hook that makes a colon call (seen in public hub code).
+    if M.indexHook and k == "Name" then M.indexHook(self) end
     local d = data[self]
     if d.props[k] ~= nil then return d.props[k] end
     if METHODS[k] then
@@ -99,7 +101,7 @@ NC = original
 -- Fake PS99 world ----------------------------------------------------------------------
 local game = new("DataModel", "Game", nil, { PlaceId = 8737899170 })
 local players = new("Players", "Players", game)
-local lp = new("Player", "TestUser", players, { UserId = 123456 })
+local lp = new("Player", "TestUser", players, { UserId = 123456, DisplayName = "ShownName123" })
 data[players].props.LocalPlayer = lp
 local RS = new("ReplicatedStorage", "ReplicatedStorage", game)
 local workspace = new("Workspace", "Workspace", game, { StreamingEnabled = true })
@@ -107,7 +109,10 @@ new("HttpService", "HttpService", game)
 local net = new("Folder", "Network", RS)
 local remote = new("RemoteEvent", "DiamondMountain_SendPets", net)
 local remoteFn = new("RemoteFunction", "Expedition_Claim", net)
-new("RemoteEvent", "Breakables_PlayerDealDamage", net)
+local dmg = new("RemoteEvent", "Breakables_PlayerDealDamage", net)
+local chat = new("RemoteEvent", "Chat_Say", net)
+local others = {}
+for i = 1, 420 do others[i] = new("RemoteEvent", "Other_" .. i, net) end
 local pings = new("RemoteEvent", "UnreliableRemoteEvent", net)
 local custom = new("RemoteFunction", "Instancing_InvokeCustomFromClient", net)
 local library = new("Folder", "Library", RS)
@@ -191,6 +196,7 @@ local env = {
 local source = fs.readFile(PROBE)
 -- Shorten the recording window (the general probe ships with recording OFF).
 source = source:gsub("local RECORD_SECONDS = %d+", "local RECORD_SECONDS = 30", 1)
+source = source:gsub("local SAVE_EVERY = %d+", "local SAVE_EVERY = 10", 1) -- partial saves at 10 and 20 s
 local fn = luau.load(source, { debugName = "probe", environment = env })
 local ran, err = pcall(fn)
 check(ran, "probe runs to the end of its main chunk (" .. tostring(err) .. ")")
@@ -238,6 +244,25 @@ luneTask.spawn(function() -- the game's own threads
     custom:InvokeServer("DiamondMountain", "DM_Yeti_Feed", { y1 = 1 })
     M.fromScript = false
 end)
+-- ZapHub-test review (2026-10-18): a hub's hooks, heavy traffic, identical requests.
+local hookedFire = nil
+luneTask.spawn(function()
+    M.indexHook = function(inst) inst:IsA("Model") end
+    remote:FireServer(pet, 7)
+    hookedFire = M.received[#M.received]
+    M.indexHook = nil
+    for _ = 1, 5 do dmg:FireServer({ x = 1 }) end
+    for i = 1, 6000 do pings:FireServer({ fps = 120 + i / 1000 }) end
+    M.fromScript = true
+    custom:InvokeServer("DiamondMountain", "DM_Walls_Load", 1, { ada4 = 1 })
+    M.fromScript = false
+    chat:FireServer("hello ShownName123")
+    for i = 1, 420 do others[i]:FireServer(i) end
+    custom:InvokeServer("DiamondMountain", "DM_Expedition_Start", 1)
+    M.replies.DM_Walls_Status = { Walls = { [2] = { HP = 2000000 } } }
+    custom:InvokeServer("DiamondMountain", "DM_Walls_Status")
+    custom:InvokeServer("DiamondMountain", "DM_Walls_Status")
+end)
 -- Telemetry and the event's own Save data change; the player enters the mountain.
 SAVE.Engagement = { Stats = { ["Eggs Opened"] = { [1] = 22 } } }
 SAVE.InstanceVars = { DiamondMountain = { WallDamage = 161386 } }
@@ -248,7 +273,10 @@ local wall = new("Model", "RubbleWall", new("Model", "Camp1", camps))
 data[wall].attrs.WallIndex = 1
 new("ProximityPrompt", "LoadPrompt", wall, { ActionText = "Load Pets", ObjectText = "Rubble Wall" })
 
-luneTask.wait(45 / SPEED) -- recording window (30 virtual s) is over
+luneTask.wait(15 / SPEED) -- mid-recording: a partial report must already be on disk
+local _, partial = next(M.files)
+local partialSaved = partial ~= nil and partial:find("PARTIAL report", 1, true) ~= nil
+luneTask.wait(30 / SPEED) -- recording window (30 virtual s) is over
 local name, report = next(M.files)
 check(report ~= nil, "report file written (" .. tostring(name) .. ")")
 report = report or ""
@@ -265,6 +293,8 @@ check(M.identity == 7, "bug 3: thread identity restored to the executor's own va
 check(report:find("DiamondMountain_SendPets(Instance<Model>Workspace.PetModel, 5)", 1, true) ~= nil,
     "recorder: the request is reported with its Instance argument path")
 check(not report:find("123456", 1, true) and not report:find("TestUser", 1, true), "report is redacted")
+check(hookedFire ~= nil and hookedFire.method == "FireServer" and hookedFire.remote == "DiamondMountain_SendPets"
+    and hookedFire.args[2] == 7, "a hub's __index hook (colon call on .Name) cannot change how the game's request is sent")
 -- The event probe prints a table's entries; the general probe prints its size.
 local scratchShown = KIND == "event" and (report:find("Wall=3", 1, true) and report:find("Slot=2", 1, true))
     or report:find("DiamondMountain_SendPets(table(2))", 1, true)
@@ -294,7 +324,19 @@ if KIND == "event" then
         "other events' entries are not listed")
     -- Lessons from live run 1 (2026-10-17).
     check(report:find('"DM_Walls_Load", 1', 1, true) ~= nil, "run 1: an event request after 300 fps pings is still recorded")
-    check(report:find("300  FireServer UnreliableRemoteEvent", 1, true) ~= nil, "run 1: per-remote totals include the hidden pings")
+    check(report:find(" 6300  FireServer UnreliableRemoteEvent", 1, true) ~= nil, "every request is counted, also past 5000")
+    check(report:find("    5  FireServer Breakables_PlayerDealDamage", 1, true) ~= nil, "noise remotes are counted in 6b (not shown)")
+    check(report:find('[script] InvokeServer Instancing_InvokeCustomFromClient("DiamondMountain", "DM_Walls_Load", 1, {ada4=1})', 1, true) ~= nil,
+        "a hub request identical to an earlier game request still gets its [script] line")
+    check(not report:find("ShownName123", 1, true), "the display name is redacted too")
+    check(report:find('"DM_Expedition_Start", 1', 1, true) ~= nil, "event lines are not crowded out by 420 other remotes")
+    check(report:find("more remotes not listed", 1, true) ~= nil, "6b says when its list is cut")
+    local _, hp2 = report:gsub("HP=2000000", "")
+    check(hp2 == 1, "an identical reply is shown once (" .. hp2 .. ")")
+    check(partialSaved, "the report so far is saved while recording (a kick keeps it)")
+    check(report:find("PARTIAL report", 1, true) == nil, "the final report replaces the partial one")
+    check(report:find("only remote:FireServer", 1, true) ~= nil and report:find("untagged", 1, true) ~= nil,
+        "section 6 explains what it cannot see and what [script] means")
     check(report:find("reply Instancing_InvokeCustomFromClient DM_Walls_Status", 1, true) ~= nil
         and report:find("HP=1000000", 1, true) ~= nil, "run 1: the server's reply to a status request is recorded")
     check(report:find("Save.Engagement.", 1, true) == nil, "run 1: telemetry is left out of the Save diff")
@@ -311,8 +353,7 @@ if KIND == "event" then
         "a request from an executor script is tagged [script]")
     check(report:find("1  [script] InvokeServer Instancing_InvokeCustomFromClient DM_Yeti_Feed", 1, true) ~= nil,
         "script requests have their own totals row")
-    check(report:find('] InvokeServer Instancing_InvokeCustomFromClient("DiamondMountain", "DM_Walls_Load"', 1, true) ~= nil
-        and report:find('[script] InvokeServer Instancing_InvokeCustomFromClient("DiamondMountain", "DM_Walls_Load"', 1, true) == nil,
+    check(report:find('s] InvokeServer Instancing_InvokeCustomFromClient("DiamondMountain", "DM_Walls_Load"', 1, true) ~= nil,
         "the game's own requests stay untagged")
 end
 
