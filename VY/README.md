@@ -5,7 +5,8 @@ This folder holds VY AutoRank work done from Claude Code cloud sessions. The use
 | Path | What it is |
 | :--- | :--- |
 | `VY_AutoRank-v1.1.9.luau` | Current build: v1.1.8 plus the `gcall` identity fix (see `docs/VY_AUTORANK_v1.1.9_NOTES.md`). Rebuild it byte-identically with `python3 VY/tools/patch_v119.py VY/VY_AutoRank-v1.1.8.luau out.luau`. |
-| `VY_WallCrew-v0.3.luau` | Diamond Mountain helper (separate from VY AutoRank). It keeps every event pet you own on the current Rubble Wall and moves them to the next wall when one breaks. Event pets come from Diamond Mountain's own eggs. It starts in DRY_RUN (prints only). Facts: `docs/DIAMOND_MOUNTAIN_FINDINGS.md`. |
+| `VY_WallCrew-v0.4.luau` | Diamond Mountain helper (separate from VY AutoRank). It keeps every event pet you own on the current Rubble Wall by asking the server to fill it (`DM_Walls_FillBest`, seen working live). It asks only when something changed, and moves your pets to the next wall when one breaks. It starts in DRY_RUN (prints only). Facts: `docs/DIAMOND_MOUNTAIN_FINDINGS.md`. |
+| `VY_CampEggs-v0.1.luau` | Diamond Mountain helper. It hatches the camp egg you stand next to at your max hatch, waits when you cannot pay, and keeps an optional TrailCoins reserve (`KEEP_COINS`). Trail eggs and other events' eggs are never hatched. It starts in DRY_RUN. Run it with Wall Crew so the new pets go on the wall. |
 | `VY_AutoRank-v1.1.8.luau` | Previous build: v1.1.7 plus 12 reproduced fixes (see `docs/VY_AUTORANK_v1.1.8_NOTES.md`). Rebuild it byte-identically with `python3 VY/tools/patch_v118.py VY/source/VY_AutoRank-v1.1.7.luau out.luau`. |
 | `source/VY_AutoRank-v1.1.7.luau` | Frozen baseline, byte-identical to the handoff source (CRLF, 4,700 lines, SHA-256 `CDE5F944688D9722B677755A88708001FFB56F329964BFE2A46B7BE61D6D51FC`). `.gitattributes` keeps it binary-exact. Never edit it. |
 | `tests/run_tests.py` | Runs every offline scenario against one source file: `LUNE=/path/to/lune python3 VY/tests/run_tests.py <file.luau> [version]` |
@@ -16,7 +17,17 @@ This folder holds VY AutoRank work done from Claude Code cloud sessions. The use
 | `../.claude/skills/` | The six project skills required by the handoff |
 
 ## Offline scenarios (mocked runtime — not live PS99)
-32 scenarios (the runner adds a `luau-compile` row, so it reports 33): `smoke` (start, ordinary work, same-VM re-execution, GUI X/Stop, quiet after Stop); Crystal: `crystal-flow`, `crystal-travel` (World 2 → 1 → 2), `crystal-rankup`, and the edge cases slow-replication, no-credit, refused, not-ready, stars-keys, zero-drop-tail, stars-complete, travel-refused, retain-strand, protect-setup; `persist-race`; Fishing: current prompt, legacy GameBar, cross-world, slow travel, busy `__DEBRIS`; identity: nested `gcall`, executor at identity 7; the two read-only probes' recorders; the Wall Crew (dry run, load, wall break, new hatch, not inside, refused, stop, no egg data). The harness models per-thread identity (new threads inherit it, signal handlers run at the connector's). The runner marks which failures are the documented v1.1.7 and v1.1.8 defects.
+48 scenarios (the runner adds a `luau-compile` row, so it reports 49):
+- `smoke`: start, ordinary work, same-VM re-execution, GUI X/Stop, quiet after Stop.
+- Crystal: `crystal-flow`, `crystal-travel` (World 2 → 1 → 2), `crystal-rankup`, and the edge cases slow-replication, no-credit, refused, not-ready, stars-keys, zero-drop-tail, stars-complete, travel-refused, retain-strand, protect-setup.
+- `persist-race`.
+- Fishing: current prompt, legacy GameBar, cross-world, slow travel, busy `__DEBRIS`.
+- Identity: nested `gcall`, executor at identity 7.
+- The two read-only probes' recorders, with and without `setnamecallmethod`.
+- Wall Crew (11): dry run, load, wall break, new hatch, unknown kind, no spare, not inside, refused, no effect, stop, no egg data.
+- Camp Eggs (11): dry run, hatch, nearest, trail egg, far, keep coins, out of coins, refused, no effect, not inside, stop.
+
+The harness models per-thread identity (new threads inherit it, signal handlers run at the connector's). The runner marks which failures are the documented v1.1.7 and v1.1.8 defects.
 
 The fakes follow VY's own protocol assumptions where the live game is only partly observed (handoff F16 and F14). A green run therefore means "the script keeps its invariants against these fakes". It does not mean the live server accepts the requests. Live acceptance still uses the user-run procedures in `docs/`.
 

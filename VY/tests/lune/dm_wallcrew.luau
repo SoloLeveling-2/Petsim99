@@ -1,10 +1,13 @@
 --!nocheck
 -- VY Wall Crew (Diamond Mountain) offline scenarios (mocked runtime, not live PS99).
 -- Usage: lune run VY/tests/lune/dm_wallcrew.luau <script.luau> <scenario>
--- scenarios: dry-run | load | wall-break | new-hatch | not-inside | refused | stop | no-egg-data
--- The fake server follows the two live probe runs (2026-10-17/18): DM_Walls_Load adds
--- `count` pets of one stack to the wall's crew (keyed "id|pt|sh"), capped at what the
--- player owns; pets stay in the inventory; a broken wall's crew is released.
+-- scenarios: dry-run | load | wall-break | new-hatch | unknown-kind | no-spare | not-inside
+--            refused | no-effect | stop | no-egg-data
+-- The fake server follows the live probe runs (2026-10-17/18). Run 3 (ZapHub) showed
+-- DM_Walls_FillBest(wall): the server puts every spare event pet on the wall (crew keyed
+-- "id|pt|sh", capped at what the player owns) and answers `true, nil`, or
+-- `false, "No spare pets to send!"`. Pets stay in the inventory; a broken wall's crew is
+-- released.
 local process = require("@lune/process")
 local luneTask = require("@lune/task")
 local R = require("./roblox_mock")
@@ -72,6 +75,12 @@ local dm = {
     InstanceZones = { __Zone_1 = true, __Zone_2 = true },
     WallCrew = { [2] = { ["Hiker Raccoon|0|0"] = { count = 178, id = "Hiker Raccoon", power = 150 } } },
 }
+if scenario == "no-spare" then
+    dm.WallCrew[2] = {
+        ["Marmot|0|0"] = { count = 331, id = "Marmot" }, ["Marmot|0|1"] = { count = 1, id = "Marmot" },
+        ["Hiker Raccoon|0|0"] = { count = 254, id = "Hiker Raccoon" },
+    }
+end
 W.save.InstanceVars = { DiamondMountain = dm }
 
 local function key(item) return item.id .. "|" .. (tonumber(item.pt) or 0) .. "|" .. (item.sh and 1 or 0) end
@@ -84,47 +93,56 @@ local function activeWall()
     for n = 1, 5 do if not dm.Walls.Broken[n] then return n end end
     return nil
 end
-local EVENT = { Marmot = true, ["Hiker Raccoon"] = true, ["Climber Goat"] = true }
-local loads, refused = {}, scenario == "refused"
-W.handlers["Instancing_InvokeCustomFromClient"] = function(instance, action, wall, map)
-    if instance ~= "DiamondMountain" or action ~= "DM_Walls_Load" then return true end
-    table.insert(loads, { wall = wall, map = map, t = os.clock(), inside = W.instance })
-    if W.instance ~= "DiamondMountain" then return false, "Not in instance" end
-    if refused then return false, "Wall is busy" end
-    if wall ~= activeWall() then return false, "Wrong wall" end
-    for uid, n in pairs(map) do
-        local item = inv[uid]
-        if not item or not EVENT[item.id] then return false, "Not an event pet" end
-        local k = key(item)
-        luneTask.delay(0.5 / R.SPEED, function() -- replication delay (0.5 virtual s)
-            dm.WallCrew[wall] = dm.WallCrew[wall] or {}
-            local e = dm.WallCrew[wall][k] or { count = 0, id = item.id }
-            e.count = math.min(owned(k), e.count + n)
-            dm.WallCrew[wall][k] = e
-        end)
+-- The server's own list of event pets. Expedition Wolf is in none of the fake eggs' pet
+-- lists, so the script cannot tell it is an event pet; only the server can.
+local EVENT = { Marmot = true, ["Hiker Raccoon"] = true, ["Climber Goat"] = true, ["Expedition Wolf"] = true }
+if scenario == "no-spare" then EVENT["Climber Goat"] = nil end -- e.g. busy elsewhere: the server keeps them
+local fills, other = {}, {}
+W.handlers["Instancing_InvokeCustomFromClient"] = function(instance, action, ...)
+    if instance ~= "DiamondMountain" or action ~= "DM_Walls_FillBest" then
+        table.insert(other, action)
+        return true
     end
-    return true
+    local wall = ...
+    table.insert(fills, { wall = wall, n = select("#", ...), t = os.clock(), inside = W.instance })
+    if W.instance ~= "DiamondMountain" then return false, "Not in instance" end
+    if scenario == "refused" then return false, "Wall is busy" end
+    if scenario == "no-effect" then return true, nil end
+    if wall ~= activeWall() then return false, "Wrong wall" end
+    local added = false
+    for _, item in pairs(inv) do
+        local k = key(item)
+        local onIt = (dm.WallCrew[wall] and dm.WallCrew[wall][k] and dm.WallCrew[wall][k].count) or 0
+        if EVENT[item.id] and owned(k) > onIt then
+            added = true
+            luneTask.delay(0.5 / R.SPEED, function() -- replication delay (0.5 virtual s)
+                dm.WallCrew[wall] = dm.WallCrew[wall] or {}
+                local e = dm.WallCrew[wall][k] or { count = 0, id = item.id }
+                e.count = owned(k)
+                dm.WallCrew[wall][k] = e
+            end)
+        end
+    end
+    if not added then return false, "No spare pets to send!" end
+    return true, nil
 end
 
 local function crewCount(wall, k)
     local c = dm.WallCrew[wall]
     return c and c[k] and c[k].count or 0
 end
-local function loadsOf(uid)
-    local n = 0
-    for _, l in ipairs(loads) do if l.map[uid] then n += 1 end end
-    return n
-end
 local function everyEventPetOn(wall)
     return crewCount(wall, "Marmot|0|0") == 331 and crewCount(wall, "Marmot|0|1") == 1
         and crewCount(wall, "Hiker Raccoon|0|0") == 254 and crewCount(wall, "Climber Goat|1|0") == 10
 end
-local function nothingWrongSent()
-    for _, l in ipairs(loads) do
-        if l.map.h1 or l.map.p1 or l.map.s1 or l.map.mo1 then return false end
+-- FillBest names only the wall; the server picks the pets.
+local function onlyWallSent()
+    for _, f in ipairs(fills) do
+        if f.n ~= 1 or type(f.wall) ~= "number" then return false end
     end
     return true
 end
+local function noOtherRequests() return #other == 0 end
 
 local genv = H.newVM("wall crew")
 local handle = genv.VyWallCrew
@@ -132,30 +150,25 @@ H.check(handle ~= nil and type(handle.Stop) == "function", "global handle with S
 
 if scenario == "dry-run" then
     H.wait(40)
-    H.check(#loads == 0, "dry run sends no load (" .. #loads .. ")")
-    H.check(said("would load 331 x Marmot onto wall 2"), "dry run names the Marmots for wall 2")
-    H.check(said("would load 1 x Marmot (shiny)"), "dry run names the shiny Marmot")
-    H.check(said("would load 76 x Hiker Raccoon onto wall 2"), "dry run counts only the 76 Raccoons not yet on the wall")
-    H.check(said("would load 10 x Climber Goat (golden)"), "dry run names the golden Goats")
-    H.check(not said("Huge Marmot") and not said("x Cat"), "dry run never plans Huge or non-event pets")
-    H.check(not said("Stitched Cat") and not said("Mothman"), "dry run never plans other events' pets that share zone 279")
+    H.check(#fills == 0 and noOtherRequests(), "dry run sends nothing (" .. #fills .. " fills)")
+    H.check(said("would ask the server to fill wall 2"), "dry run names the wall it would fill")
+    H.check(said("331 x Marmot") and said("1 x Marmot (shiny)"), "dry run lists the Marmots not on the wall")
+    H.check(said("76 x Hiker Raccoon"), "dry run counts only the 76 Raccoons not yet on the wall")
+    H.check(said("10 x Climber Goat (golden)"), "dry run lists the golden Goats")
+    H.check(not said("Huge Marmot") and not said("x Cat"), "dry run never lists Huge or non-event pets")
+    H.check(not said("Stitched Cat") and not said("Mothman"), "dry run never lists other events' pets that share zone 279")
     H.check(said("event pets (from 3 Diamond Mountain eggs): Climber Goat, Hiker Raccoon, Marmot"),
         "dry run lists the event pets it found, from the camp eggs")
+    H.check(#H.console("would ask the server") == 1, "the dry-run plan is printed once, not every check")
 elseif scenario == "load" then
     H.waitFor(function() return everyEventPetOn(2) end, 120)
     H.check(everyEventPetOn(2), "every event pet is on wall 2 (Marmot 331+1, Raccoon 254, golden Goat 10)")
-    H.check(nothingWrongSent(), "no Huge or non-event pet was sent")
-    H.check(loadsOf("r1") == 1, "the Raccoon stack needed one load of the missing 76 (" .. loadsOf("r1") .. ")")
-    local r1 = nil
-    for _, l in ipairs(loads) do if l.map.r1 then r1 = l.map.r1 end end
-    H.check(r1 == 76, "Raccoon load asked for exactly the missing 76 (" .. tostring(r1) .. ")")
-    local mark = #loads
+    H.check(#fills == 1 and fills[1].wall == 2, "one FillBest for wall 2 did it (" .. #fills .. ")")
+    H.check(onlyWallSent() and noOtherRequests(), "FillBest names only the wall; nothing else is sent")
+    local mark = #fills
     H.wait(60)
-    H.check(#loads == mark, "no further loads once every pet is on the wall (" .. (#loads - mark) .. ")")
-    H.check(nothingWrongSent(), "a minute later, still no other-event, Huge or non-event pet was sent")
-    local gap = math.huge
-    for i = 2, #loads do gap = math.min(gap, loads[i].t - loads[i - 1].t) end
-    H.check(gap >= 1.4 / R.SPEED, "loads are at least 1.5 virtual s apart")
+    H.check(#fills == mark, "nothing more is sent while nothing changes (" .. (#fills - mark) .. ")")
+    H.check(said("wall 2: +418 pets (now 596 on the wall)"), "the gain on the wall is printed")
     H.check(inv.m1._am == 331 and inv.r1._am == 254, "inventory unchanged (pets stay owned)")
 elseif scenario == "wall-break" then
     H.waitFor(function() return everyEventPetOn(2) end, 120)
@@ -164,46 +177,77 @@ elseif scenario == "wall-break" then
     dm.WallCrew[2] = nil
     dm.InstanceZones.__Zone_3 = true
     H.waitFor(function() return everyEventPetOn(3) end, 120)
-    H.check(everyEventPetOn(3), "after wall 2 breaks, every event pet is loaded onto wall 3")
-    H.check(not said("did not show on the wall"), "a wall breaking during a load is not counted as a failed load")
-    H.check(nothingWrongSent(), "no Huge or non-event pet was sent")
+    H.check(everyEventPetOn(3), "after wall 2 breaks, every event pet goes onto wall 3")
+    H.check(fills[#fills].wall == 3, "the fill names wall 3")
+    H.check(not said("did not reach the wall"), "a wall break is not counted as a failed fill")
     dm.Walls.Broken[3] = true
     dm.WallCrew[3] = nil
-    local mark = #loads
+    local mark = #fills
     H.wait(60)
-    H.check(#loads == mark, "camp 4 not unlocked: nothing is sent to wall 4 (" .. (#loads - mark) .. ")")
+    H.check(#fills == mark, "camp 4 not unlocked: nothing is sent to wall 4 (" .. (#fills - mark) .. ")")
     H.check(said("camp 4 is not unlocked"), "status says camp 4 is not unlocked")
 elseif scenario == "new-hatch" then
     H.waitFor(function() return everyEventPetOn(2) end, 120)
+    local mark = #fills
     inv.r1._am = 264 -- 10 more Raccoons hatched
     H.waitFor(function() return crewCount(2, "Hiker Raccoon|0|0") == 264 end, 60)
     H.check(crewCount(2, "Hiker Raccoon|0|0") == 264, "10 newly hatched Raccoons are added to the wall")
-    local last = loads[#loads]
-    H.check(last and last.map.r1 == 10, "the top-up asked for exactly 10 (" .. tostring(last and last.map.r1) .. ")")
+    H.check(#fills == mark + 1, "one more fill for the new pets (" .. (#fills - mark) .. ")")
+elseif scenario == "unknown-kind" then
+    -- A kind no fake egg lists: only the server knows it is an event pet. Any change in the
+    -- pets you own makes the script ask once.
+    H.waitFor(function() return everyEventPetOn(2) end, 120)
+    inv.w1 = { id = "Expedition Wolf", _am = 5 }
+    H.waitFor(function() return crewCount(2, "Expedition Wolf|0|0") == 5 end, 60)
+    H.check(crewCount(2, "Expedition Wolf|0|0") == 5, "a new pet kind the script cannot identify still reaches the wall")
+    local mark = #fills
+    H.wait(60)
+    H.check(#fills == mark, "then nothing more is sent (" .. (#fills - mark) .. ")")
+elseif scenario == "no-spare" then
+    -- Everything the server counts is already on the wall; it keeps the golden Goats off
+    -- (EVENT above), while the script's own list says they are missing.
+    H.waitFor(function() return #fills >= 1 end, 60)
+    H.check(said("No spare pets to send!"), "the server's answer is printed")
+    H.check(said("not on it: 10 x Climber Goat (golden)"), "it names the pets the server did not take")
+    local mark = #fills
+    H.wait(90)
+    H.check(#fills == mark, "after 'No spare pets to send!' the same request is not repeated (" .. (#fills - mark) .. ")")
+    H.check(genv.VyWallCrew ~= nil, "'No spare pets' is not a failure: the script keeps running")
+    inv.r1._am = 260 -- new pets: worth asking again
+    H.waitFor(function() return crewCount(2, "Hiker Raccoon|0|0") == 260 end, 60)
+    H.check(crewCount(2, "Hiker Raccoon|0|0") == 260, "after a hatch it asks again")
+    mark = #fills
+    H.wait(60)
+    H.check(#fills == mark, "the Goats the server kept off are not asked about again (" .. (#fills - mark) .. ")")
 elseif scenario == "not-inside" then
     H.wait(60)
-    H.check(#loads == 0, "not on Diamond Mountain: nothing is sent (" .. #loads .. ")")
+    H.check(#fills == 0, "not on Diamond Mountain: nothing is sent (" .. #fills .. ")")
     H.check(said("not on Diamond Mountain"), "status says it waits for Diamond Mountain")
     W.instance = "DiamondMountain" -- the player enters
     H.waitFor(function() return everyEventPetOn(2) end, 120)
     H.check(everyEventPetOn(2), "after entering, every event pet is loaded")
 elseif scenario == "refused" then
     H.wait(80)
-    H.check(#loads == 2, "stops after two loads the wall did not show (" .. #loads .. ")")
+    H.check(#fills == 2, "stops after two refused fills (" .. #fills .. ")")
     H.check(said("Wall is busy"), "the server's reply is printed")
     H.check(genv.VyWallCrew == nil, "the script stopped itself")
+elseif scenario == "no-effect" then
+    -- The server says yes but the wall's crew never changes.
+    H.wait(80)
+    H.check(#fills == 2, "stops after two fills that did not reach the wall (" .. #fills .. ")")
+    H.check(said("did not reach the wall"), "says the fill did not reach the wall")
+    H.check(genv.VyWallCrew == nil, "the script stopped itself")
 elseif scenario == "no-egg-data" then
-    -- Without the eggs' pet lists it only tops up kinds the wall already accepted.
-    H.wait(60)
+    -- Without the eggs' pet lists the server still knows the event pets: one fill does it.
+    H.waitFor(function() return everyEventPetOn(2) end, 120)
     H.check(said("could not read"), "says it could not read the camp eggs' pet lists")
-    H.check(#loads == 1 and loads[1].map.r1 == 76, "only the Raccoons already on the wall are topped up (" .. #loads .. " loads)")
-    H.check(nothingWrongSent(), "no Huge, non-event or other-event pet was sent")
+    H.check(everyEventPetOn(2) and #fills == 1, "one fill still puts every event pet on the wall (" .. #fills .. ")")
 elseif scenario == "stop" then
     H.wait(1)
     handle.Stop()
-    local mark = #loads
+    local mark = #fills
     H.wait(60)
-    H.check(#loads == mark, "no requests after Stop (" .. (#loads - mark) .. ")")
+    H.check(#fills == mark, "no requests after Stop (" .. (#fills - mark) .. ")")
     H.check(genv.VyWallCrew == nil, "Stop removes the global handle")
     -- Re-running replaces a running copy.
     H.runIn(genv, "second run")

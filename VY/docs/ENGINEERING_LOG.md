@@ -2,6 +2,40 @@
 
 Newest first. Each entry: what changed, why, evidence, tests, limits, rollback.
 
+## 2026-10-18 — Probe run 3 (ZapHub): Wall Crew v0.4 uses the server's fill; new Camp Eggs v0.1
+
+**Evidence.** The user ran probe v5 on the mountain with ZapHub (report `PS99_EventProbe_20261018_023610.txt`, 02:36–02:41 UTC). Facts are recorded in `DIAMOND_MOUNTAIN_FINDINGS.md` (run 3). Probe v5 worked live: replies were captured and ZapHub's requests were tagged `[script]`. The ones that mattered:
+- `DM_Walls_FillBest(3)` → `true, nil`. The Save diff shows every spare event pet joined wall 3 (crew 768 → 957). A second call → `false, "No spare pets to send!"`. The client code has the same function (`DiamondMountainCmds.Walls.FillBest/1`), so the server chooses the pets.
+- `CustomEggs_Hatch("<model name>", 63)` ×23 → `true, nil`; 1,449 Boulder Ridge Eggs for 43.2 M TrailCoins. The uid is a `Workspace.__THINGS.CustomEggs` model with `DM_EggId`. Trail eggs also carry `DM_TrailEgg`.
+- `DM_Walls_Status` gives every wall's HP: 130 M, 760 M, ~4.35 B, 34 B, 250 B. Damage per second is crew power × 2.352 for this account.
+
+**Change.**
+- `VY_WallCrew-v0.4.luau` (renamed from v0.3):
+  - Sends `DM_Walls_FillBest(wall)` instead of per-stack `DM_Walls_Load` maps, and only when the picture changes: event pets not on the wall (by its egg-based list), a change in the inventory's total pet count, or another wall. The count trigger means kinds it cannot identify (e.g. Expedition Wolf, if an egg list cannot be read) still get loaded.
+  - "No spare pets to send!" is normal and is not repeated for the same picture. A fill counts only when the Save crew grows; two misses in a row stop the script.
+  - DRY_RUN is still the default. Huge pets are no longer the script's choice, since the server picks; the header says so.
+- `VY_CampEggs-v0.1.luau` (new):
+  - Hatches the nearest camp egg within 40 studs (a CustomEggs model with `DM_EggId`, never a trail egg or another event's egg), at your max hatch (`EggCmds.GetMaxHatch`), every 2 s.
+  - It learns the price from its own hatches (the median of the last 5, so one hatch that overlaps another purchase does not stall it). When you cannot pay, it waits instead of stopping.
+  - `KEEP_COINS` is a TrailCoins reserve; with one set, the first hatch is 1 egg, to learn the price.
+  - A hatch counts only when `PurchasedEggs[<egg>]` grows; three misses in a row stop it. DRY_RUN is the default.
+- Event probe v5.1: section 3b also lists entries whose module sits in a `DiamondMountain` folder, because run 3's 3b missed camp eggs 2–5 (names without an event word).
+
+**Tests.**
+- Probe: a new check for an egg found only by its module folder, red before the fix.
+- Wall Crew: 11 scenarios, rewritten for FillBest. New ones are `unknown-kind`, `no-spare` and `no-effect`. They were red on the v0.3 code.
+- Camp Eggs: 11 new scenarios: dry-run, hatch, nearest, trail-egg, far, keep-coins, out-of-coins, refused, no-effect, not-inside, stop.
+  - `out-of-coins` (and a price spike inside `hatch`) came from my own review of the first draft. The draft stopped itself after three "not enough" refusals, and with the dearest-hatch price it stalled after one dear-looking hatch. Both were red before the fix.
+- Mutation check: removing each guard turns its scenario red. Camp Eggs: trail filter, reserve, gap, nearest, range, stop-after-misses, confirm, median price, affordability, progress-log rate. Wall Crew: count trigger, no-spare handling, no-repeat, wall break, always-ask, stop-after-misses.
+- Full suite 49/49 (mocked runtime), three runs in a row. luau-compile OK; selene 0 errors (only the existing `_G` fallback warning).
+
+**Limits.** None of this has run live as VY code; only the requests have, sent by ZapHub. Unknown live:
+- whether a camp egg must be near you to hatch (v0.1 asks you to stand there);
+- whether FillBest ever puts an event Huge on a wall;
+- what `slots` = 17 and `stackMax` = 100 in the status reply limit.
+
+**Rollback.** `git checkout aa2bb7f -- VY/` brings back Wall Crew v0.3 and probe v5 (Camp Eggs did not exist).
+
 ## 2026-10-18 — Event probe v5 for a ZapHub test: two adversarial review rounds
 
 **Why.** The user asked about testing ZapHub's event features (ZapHub is a third-party PS99 script hub; RankPilot X's interface was modelled on it). The idea: let ZapHub run Diamond Mountain features while the probe records, to learn the requests for features the user cannot reach yet.

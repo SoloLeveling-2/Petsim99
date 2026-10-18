@@ -1,9 +1,10 @@
 -- =====================================================================================
---  PS99 Event Probe v5 - Diamond Mountain (update 98, 2026-10-18)     READ-ONLY
+--  PS99 Event Probe v5.1 - Diamond Mountain (update 98, 2026-10-18)   READ-ONLY
 --  (v3 added sections 6b and 8 and server replies; v4 tags requests another executor
 --  script sends, e.g. a script hub, with [script]; v5 is safe next to a hub's hooks,
---  counts every request and saves the report while recording. Check the version in a
---  report's first line.)
+--  counts every request and saves the report while recording; v5.1 also lists event
+--  entries found only by their module's folder, e.g. camp eggs 2-5. Check the version in
+--  a report's first line.)
 --
 --  Finds the event's real names so an event script can be built on evidence:
 --    0. the executor's name, thread identity and which executor functions exist;
@@ -73,7 +74,14 @@ local function entryMatches(key, value)
     if has(tostring(key)) then return true end
     if type(value) ~= "table" then return false end
     local ok, name = pcall(function() return value.DisplayName or value.name or value.Name end)
-    return ok and has(name)
+    if ok and has(name) then return true end
+    -- Or its module sits in this event's folder: camp eggs 2-5 ("Boulder Ridge Egg") have no
+    -- event word in their name, only Eggs.Events.DiamondMountain in their module's path.
+    local okPath, path = pcall(function()
+        local s = value._script
+        return typeof(s) == "Instance" and s:GetFullName() or nil
+    end)
+    return okPath and type(path) == "string" and path:find(INSTANCE_NAME, 1, true) ~= nil
 end
 -- Game modules need identity 2; afterwards restore whatever identity this thread had.
 local function asGame(fn, ...)
@@ -152,7 +160,7 @@ local function flatten(t, path, depth, acc)
     return acc
 end
 
-line("PS99 Event Probe v5 (Diamond Mountain) | " .. os.date("!%Y-%m-%d %H:%M:%S UTC") .. " | PlaceId " .. game.PlaceId)
+line("PS99 Event Probe v5.1 (Diamond Mountain) | " .. os.date("!%Y-%m-%d %H:%M:%S UTC") .. " | PlaceId " .. game.PlaceId)
 
 -- 0. Executor ---------------------------------------------------------------------------
 section("0. Executor (what an event script can use here)")

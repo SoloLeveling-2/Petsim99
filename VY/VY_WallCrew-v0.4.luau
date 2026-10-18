@@ -1,37 +1,36 @@
 -- =====================================================================================
---  VY Wall Crew v0.3 - Pet Simulator 99, Diamond Mountain (update 98)       2026-10-18
---  Status: tested offline (mocked Lune runtime); live: v0.1 dry run, v0.2 start-up crash.
+--  VY Wall Crew v0.4 - Pet Simulator 99, Diamond Mountain (update 98)       2026-10-18
+--  Status: tested offline (mocked Lune runtime). Its request was seen working live
+--  (probe run 3, sent by ZapHub); v0.4 itself has not run live yet.
 --
 --  Keeps every event pet you own on the Rubble Wall you are smashing:
 --    * event pets you hatch are added to the wall's crew;
 --    * when a wall breaks (its crew is released), they all go onto the next wall.
 --  Pets stay in your inventory (the wall only counts them), so nothing is spent.
---  Event pets = the pets in Diamond Mountain's own eggs, plus kinds a wall already took.
---  Huge, Titanic and Gargantuan pets are never loaded.
---  v0.2: v0.1 took every pet from game zone 279 for an event pet; its first live dry run
---  showed other events' pets share that zone (it planned 13,343 Stitched Cats).
---  v0.3: v0.2 crashed at start: Directory.Pets raises on a name that is not a pet
---  ("Unknown Directory Pets.'Nice'"), and an egg's pet list holds such words.
+--  v0.4 asks the server to fill the wall ("DM_Walls_FillBest", the request behind the
+--  game's own DiamondMountainCmds.Walls.FillBest). The SERVER picks the pets, so it is
+--  only sent when something changed: event pets not on the wall yet, new pets in your
+--  inventory, or a new wall. v0.1-v0.3 loaded stack by stack ("DM_Walls_Load").
+--  Event pets (for the "not on the wall yet" list) = the pets in Diamond Mountain's own
+--  eggs, plus kinds a wall already took; Huge, Titanic and Gargantuan are never listed.
 --
---  DRY_RUN = true (the default) only prints what it WOULD load and sends nothing.
+--  DRY_RUN = true (the default) only prints what it WOULD ask for and sends nothing.
 --  Check the console (F9), then set DRY_RUN = false below and run it again.
 --  Run it while you are on Diamond Mountain, with VY AutoRank stopped (VY teleports away).
 --  Stop: getgenv().VyWallCrew.Stop()   Running it again also replaces a running copy.
 --
---  Built from two live probe runs (VY/docs/DIAMOND_MOUNTAIN_FINDINGS.md):
---    request  Instancing_InvokeCustomFromClient("DiamondMountain", "DM_Walls_Load",
---             wall, { [pet stack uid] = count })   adds `count` pets of that stack
+--  Built from three live probe runs (VY/docs/DIAMOND_MOUNTAIN_FINDINGS.md):
+--    request  Instancing_InvokeCustomFromClient("DiamondMountain", "DM_Walls_FillBest", wall)
+--             -> true, nil  (the crew grew)  |  false, "No spare pets to send!"
 --    state    Save.InstanceVars.DiamondMountain: Walls.Broken[n], InstanceZones.__Zone_n,
 --             WallCrew[n]["<id>|<pt>|<sh>"].count
 -- =====================================================================================
 local CONFIG = {
-    DRY_RUN = true,           -- true: print the plan only; false: send the loads
-    CHECK_EVERY = 15,         -- seconds between checks
-    REQUEST_GAP = 1.5,        -- seconds between two load requests
-    MAX_LOADS_PER_CHECK = 8,  -- load requests per check, at most
-    CONFIRM_SECONDS = 6,      -- how long to wait for the wall's crew to show a load
+    DRY_RUN = true,           -- true: print the plan only; false: send the fills
+    CHECK_EVERY = 15,         -- seconds between checks (at most one request per check)
+    CONFIRM_SECONDS = 6,      -- how long to wait for the wall's crew to show a fill
 }
-local VERSION = "0.3"
+local VERSION = "0.4"
 local INSTANCE = "DiamondMountain"
 local TAG = "[WallCrew] "
 
@@ -210,6 +209,22 @@ local function onWall(dm, wall, kind)
     local entry = type(crew) == "table" and crew[kind] or nil
     return tonumber(type(entry) == "table" and entry.count) or 0
 end
+local function crewTotal(dm, wall)
+    local n = 0
+    for _, entry in pairs(type(at(dm.WallCrew, wall)) == "table" and at(dm.WallCrew, wall) or {}) do
+        n += tonumber(type(entry) == "table" and entry.count) or 0
+    end
+    return n
+end
+-- Every pet you own, as one number: it changes when you hatch (or lose) any pet, also a
+-- kind this script cannot tell is an event pet.
+local function petTotal(save)
+    local n = 0
+    for _, item in pairs(type(save.Inventory) == "table" and type(save.Inventory.Pet) == "table" and save.Inventory.Pet or {}) do
+        if type(item) == "table" then n += math.max(1, math.floor(tonumber(item._am) or 1)) end
+    end
+    return n
+end
 
 -- The wall being smashed: the first one not broken, if its camp is unlocked.
 local function activeWall(dm)
@@ -229,7 +244,7 @@ local function activeWall(dm)
     return nil, "every wall is broken"
 end
 
--- Event pets not yet on the wall, one entry per inventory stack.
+-- Event pets not yet on the wall (by this script's list), one entry per inventory stack.
 local function plan(save, dm, wall)
     local inventory = type(save.Inventory) == "table" and save.Inventory.Pet or nil
     local stacks = {}
@@ -257,6 +272,8 @@ local function plan(save, dm, wall)
 end
 
 local lastStatus, lastPlan, misses = nil, nil, 0
+-- What the last fill (or "No spare pets") saw; the same picture is not asked about again.
+local asked = nil -- { wall = n, pets = petTotal, plan = text }
 local function status(f, ...)
     local ok, s = pcall(string.format, f, ...)
     s = ok and s or tostring(f)
@@ -264,6 +281,15 @@ local function status(f, ...)
         lastStatus = s
         log("%s", s)
     end
+end
+local function describe(todo)
+    local parts = {}
+    for _, p in ipairs(todo) do parts[#parts + 1] = string.format("%d x %s", p.count, label(p.id, p.kind)) end
+    return table.concat(parts, ", ")
+end
+local function replyText(ok, a, b)
+    if not ok then return "error: " .. tostring(a) end
+    return tostring(a) .. (b ~= nil and (", " .. tostring(b)) or "")
 end
 
 -- On the mountain: the game says so, or the mountain is the active instance in the world.
@@ -295,56 +321,63 @@ local function tick()
         return
     end
     local todo = plan(save, dm, wall)
-    if #todo == 0 then
-        status("wall %d: every event pet you own is on it", wall)
+    local missing, pets = describe(todo), petTotal(save)
+    -- Ask only about a new picture: another wall, pets you did not have, or event pets
+    -- the wall lacks that the server has not already refused.
+    local fresh = asked == nil or asked.wall ~= wall or asked.pets ~= pets
+    if not fresh and (#todo == 0 or missing == asked.plan) then
+        if #todo == 0 then
+            status("wall %d: every event pet you own is on it (%d)", wall, crewTotal(dm, wall))
+        else
+            status("wall %d: the server did not take %s; it asks again when your pets change", wall, missing)
+        end
         return
     end
     lastStatus = nil
     if CONFIG.DRY_RUN then
-        local lines = {}
-        for _, p in ipairs(todo) do
-            lines[#lines + 1] = string.format("would load %d x %s onto wall %d", p.count, label(p.id, p.kind), wall)
-        end
-        local text = table.concat(lines, "\n")
+        local text = string.format("would ask the server to fill wall %d with your event pets (DM_Walls_FillBest)%s",
+            wall, #todo > 0 and ("; not on it yet: " .. missing) or "")
         if text ~= lastPlan then
             lastPlan = text
-            for _, l in ipairs(lines) do log("DRY RUN: %s", l) end
+            log("DRY RUN: %s", text)
             log("DRY RUN: nothing was sent. Set DRY_RUN = false at the top and run the script again.")
         end
         return
     end
-    for i = 1, math.min(#todo, CONFIG.MAX_LOADS_PER_CHECK) do
-        if not alive then return end
-        local p = todo[i]
-        local before = onWall(mountain(getSave()) or dm, wall, p.kind)
-        local ok, a, b = gcall(Network.Invoke, "Instancing_InvokeCustomFromClient", INSTANCE, "DM_Walls_Load", wall, { [p.uid] = p.count })
-        local reply = ok and (tostring(a) .. (b ~= nil and (", " .. tostring(b)) or "")) or ("error: " .. tostring(a))
-        -- Confirmed by the save, not the reply: the wall's count of this kind must grow.
-        local deadline, now, broke = os.clock() + CONFIG.CONFIRM_SECONDS, before, false
-        while alive and now <= before and os.clock() < deadline do
-            task.wait(0.5)
-            local fresh = mountain(getSave()) or dm
-            now = onWall(fresh, wall, p.kind)
-            broke = at(type(fresh.Walls) == "table" and fresh.Walls.Broken or nil, wall) == true
-            if broke then break end
-        end
-        if not alive then return end
-        if broke then -- its crew was released; not a failed load
-            log("wall %d broke; the next check loads the next wall", wall)
-            return
-        end
-        if now > before then
-            misses = 0
-            log("wall %d: +%d %s (now %d on the wall) | reply: %s", wall, now - before, label(p.id, p.kind), now, reply)
-        else
-            misses += 1
-            log("wall %d: loading %d x %s did not show on the wall | reply: %s", wall, p.count, label(p.id, p.kind), reply)
-            if misses >= 2 then
-                Stop("two loads in a row did not reach the wall, so nothing more is sent. Copy the lines above for the next fix.")
-                return
-            end
-        end
-        task.wait(CONFIG.REQUEST_GAP)
+    local before = crewTotal(dm, wall)
+    local ok, a, b = gcall(Network.Invoke, "Instancing_InvokeCustomFromClient", INSTANCE, "DM_Walls_FillBest", wall)
+    local reply = replyText(ok, a, b)
+    if ok and a == false and type(b) == "string" and b:lower():find("no spare", 1, true) then
+        -- Nothing the server would add: normal, not a failure. Wait for a new picture.
+        misses = 0
+        asked = { wall = wall, pets = pets, plan = missing }
+        log("wall %d: %s%s", wall, b, #todo > 0 and (" (not on it: " .. missing .. ")") or "")
+        return
+    end
+    -- Confirmed by the save, not the reply: the wall's crew must grow.
+    local deadline, now, broke = os.clock() + CONFIG.CONFIRM_SECONDS, before, false
+    while ok and a ~= false and alive and now <= before and os.clock() < deadline do
+        task.wait(0.5)
+        local latest = mountain(getSave()) or dm
+        now = crewTotal(latest, wall)
+        broke = at(type(latest.Walls) == "table" and latest.Walls.Broken or nil, wall) == true
+        if broke then break end
+    end
+    if not alive then return end
+    if broke then -- its crew was released; not a failed fill
+        log("wall %d broke; the next check fills the next wall", wall)
+        return
+    end
+    if now > before then
+        misses = 0
+        asked = { wall = wall, pets = pets, plan = describe(plan(getSave() or save, mountain(getSave()) or dm, wall)) }
+        log("wall %d: +%d pets (now %d on the wall) | reply: %s", wall, now - before, now, reply)
+        return
+    end
+    misses += 1
+    log("wall %d: the fill did not reach the wall | reply: %s", wall, reply)
+    if misses >= 2 then
+        Stop("two fills in a row did not reach the wall, so nothing more is sent. Copy the lines above for the next fix.")
     end
 end
 

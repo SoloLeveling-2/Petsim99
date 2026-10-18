@@ -139,7 +139,10 @@ data[dirMod].module = {
 }
 -- A Directory table that is only a child module (not yet loaded into Directory).
 local eggsMod = new("ModuleScript", "Eggs", dirMod)
+-- Camp eggs 2-5 have no event word in their name; only their module's folder says so (run 3).
+local dmEggsFolder = new("Folder", "DiamondMountain", new("Folder", "Events", eggsMod))
 data[eggsMod].module = {
+    ["Boulder Ridge Egg"] = { _script = new("ModuleScript", "3 | Boulder Ridge Egg", dmEggsFolder) },
     ["Camp Egg 3"] = { DisplayName = "Camp Egg 3", Currency = "TrailCoins" },
     ["Egg 251"] = { DisplayName = "Summit Egg" }, -- event name only in DisplayName
     ["Cat Egg"] = { DisplayName = "Cat Egg" },
@@ -353,6 +356,8 @@ if KIND == "event" then
     check(report:find('Directory.Eggs["Camp Egg 3"]', 1, true) ~= nil,
         "event entry in a lazily loaded Directory table (camp egg) is shown")
     check(report:find('Directory.Eggs["Egg 251"]', 1, true) ~= nil, "event entry matched by its DisplayName is shown")
+    check(report:find('Directory.Eggs["Boulder Ridge Egg"]', 1, true) ~= nil,
+        "run 3: an event egg named without an event word is found by its module's folder")
     check(report:find('Directory.Currency["Acorns"]', 1, true) ~= nil, "event currency entry is shown")
     check(report:find('Directory.Boosts["Boost | DiamondMountainLuck1"]', 1, true) ~= nil, "event boost entry is shown")
     check(report:find("Garden", 1, true) == nil and report:find('"Cat Egg"', 1, true) == nil,
