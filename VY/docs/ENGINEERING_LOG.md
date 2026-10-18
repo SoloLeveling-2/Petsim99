@@ -2,6 +2,22 @@
 
 Newest first. Each entry: what changed, why, evidence, tests, limits, rollback.
 
+## 2026-10-18 — VY Wall Crew v0.3: protected pet-list lookups
+
+**Live evidence.** v0.2 stopped at start with `ReplicatedStorage.Library.Directory.Pets:28: Unknown Directory Pets.'Nice'`. The stack went through `__index` → `add` → `addPetNames` → the egg-reading block, before any request was sent.
+- The live `Directory.Pets` raises on a name that is not a pet.
+- A camp egg's pet entries contain non-pet strings ("Nice"). v0.2 checked `Pets[name] ~= nil` without protection.
+
+**Red.** The fixture's `Directory.Pets` now raises on unknown names like the live one, and an egg entry carries "Nice". v0.2 failed with "source runs to the end ([string]:110: Unknown Directory Pets.'Common')" in every scenario.
+
+**Change (v0.3, file renamed).**
+- `petEntry()` does every `Directory.Pets` lookup through `gcall` (pcall at identity 2) and caches it; `isBig` and the egg reader use it.
+- The whole egg-reading step runs in `pcall` (it logs and keeps what it read), and each egg runs in its own `pcall`.
+
+**Green.** 8 Wall Crew scenarios pass; compile OK; Selene 0 errors (1 `_G` warning, as before).
+
+**Note.** The other `Directory` reads in the script were also checked: `Directory.Pets` and `Directory.Eggs` go through `gcall`, the Save tables are plain, and remote calls go through `gcall`.
+
 ## 2026-10-18 — VY Wall Crew v0.2: event pets from the camp eggs
 
 **Live evidence.** The user's first live run of v0.1 (DRY_RUN, nothing sent) planned the genuine wall pets (5 Climber Goat, 76 + 4 golden Hiker Raccoon, 25 Hiker Red Panda). It also planned other events' pets: 13,343 + 421 golden + 23 shiny Stitched Cat, 613 Stitched Dragon, 94 Mothman, Lucky Stacked Bunny/Capybara/Elephant, Lucky Surprise Ducky. Cause: v0.1 took `Directory.Pets[id].fromZoneNumber == 279` as "Diamond Mountain pet", and other events' pets share that zone. Without DRY_RUN, the server would probably have refused them (v0.1 then stops after two refusals); either way it was wrong.

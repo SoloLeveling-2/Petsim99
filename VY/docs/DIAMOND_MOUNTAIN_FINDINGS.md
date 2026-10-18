@@ -73,6 +73,7 @@ Camp egg: `CustomEggs_Hatch("<egg uid>", 3)` and `(…, 1)` (InvokeServer). Then
 - Event pets: Marmot, Hiker Raccoon, Hiker Red Panda, Climber Goat, Climber Bear, Expedition Wolf/Leopard/Dog, Equinox Fox/Deer, Amber Markhor, Abominable Yeti.
   - **Zone 279 does not identify them.** The Wall Crew v0.1 dry run (2026-10-18) found other events' pets in that zone too: Stitched Cat/Dragon, Mothman, Lucky Stacked Bunny/Capybara/Elephant, Lucky Surprise Ducky.
   - The reliable source is the camp eggs' modules in the Directory's `Eggs.Events.DiamondMountain` folder.
+- **`Directory.Pets` raises an error for an unknown name:** `ReplicatedStorage.Library.Directory.Pets:28: Unknown Directory Pets.'Nice'`, from its `__index` (live, Wall Crew v0.2). A camp egg's pet entries also hold non-pet words such as "Nice". Look up any name that may not be a pet only inside `pcall`.
 
 ## Client code worth calling or reading
 - `Library.Client.DiamondMountainCmds`, with children:

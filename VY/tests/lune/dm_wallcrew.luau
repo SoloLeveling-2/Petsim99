@@ -23,7 +23,9 @@ W.instance = scenario ~= "not-inside" and "DiamondMountain" or nil
 
 -- Directory.Pets: event pets come from zone 279 (live Directory data).
 local dir = rawget(W.rs:FindFirstChild("Library"):FindFirstChild("Directory"), "__module")
-dir.Pets = {
+-- Live Directory.Pets raises on an unknown name ("Unknown Directory Pets.'Nice'",
+-- Wall Crew v0.2 crashed on it at start, 2026-10-18).
+dir.Pets = setmetatable({
     Marmot = { fromZoneNumber = 279 },
     ["Hiker Raccoon"] = { fromZoneNumber = 279 },
     ["Climber Goat"] = { fromZoneNumber = 279 },
@@ -33,7 +35,7 @@ dir.Pets = {
     ["Stitched Cat"] = { fromZoneNumber = 279 },
     Mothman = { fromZoneNumber = 279 },
     Cat = { fromZoneNumber = 5 },
-}
+}, { __index = function(_, k) error("Unknown Directory Pets.'" .. tostring(k) .. "'", 2) end })
 -- Directory.Eggs: this event's camp eggs are modules under Eggs.Events.DiamondMountain
 -- (live `_script` paths); another event's egg sits beside them.
 local function child(class, name, parent)
@@ -46,7 +48,7 @@ local events = child("Folder", "Events", child("Folder", "Eggs", W.rs))
 local dmEggs, otherEggs = child("Folder", "DiamondMountain", events), child("Folder", "BloodMoon", events)
 dir.Eggs = {
     ["Trailhead Egg"] = { _script = child("ModuleScript", "1 | Trailhead Egg", dmEggs),
-        pets = { { "Marmot", 60 }, { "Hiker Raccoon", 40 } } },
+        pets = { { "Marmot", 60, "Nice" }, { "Hiker Raccoon", 40 } } },
     -- The live pet-list format is unknown: three plausible shapes.
     ["Russet Falls Egg"] = { _script = child("ModuleScript", "2 | Russet Falls Egg", dmEggs),
         pets = { ["Climber Goat"] = 50, ["Huge Marmot"] = 0.01 } },

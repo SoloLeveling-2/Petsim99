@@ -5,7 +5,7 @@ This folder holds VY AutoRank work done from Claude Code cloud sessions. The use
 | Path | What it is |
 | :--- | :--- |
 | `VY_AutoRank-v1.1.9.luau` | Current build: v1.1.8 plus the `gcall` identity fix (see `docs/VY_AUTORANK_v1.1.9_NOTES.md`). Rebuild it byte-identically with `python3 VY/tools/patch_v119.py VY/VY_AutoRank-v1.1.8.luau out.luau`. |
-| `VY_WallCrew-v0.2.luau` | Diamond Mountain helper (separate from VY AutoRank). It keeps every event pet you own on the current Rubble Wall and moves them to the next wall when one breaks. Event pets come from Diamond Mountain's own eggs. It starts in DRY_RUN (prints only). Facts: `docs/DIAMOND_MOUNTAIN_FINDINGS.md`. |
+| `VY_WallCrew-v0.3.luau` | Diamond Mountain helper (separate from VY AutoRank). It keeps every event pet you own on the current Rubble Wall and moves them to the next wall when one breaks. Event pets come from Diamond Mountain's own eggs. It starts in DRY_RUN (prints only). Facts: `docs/DIAMOND_MOUNTAIN_FINDINGS.md`. |
 | `VY_AutoRank-v1.1.8.luau` | Previous build: v1.1.7 plus 12 reproduced fixes (see `docs/VY_AUTORANK_v1.1.8_NOTES.md`). Rebuild it byte-identically with `python3 VY/tools/patch_v118.py VY/source/VY_AutoRank-v1.1.7.luau out.luau`. |
 | `source/VY_AutoRank-v1.1.7.luau` | Frozen baseline, byte-identical to the handoff source (CRLF, 4,700 lines, SHA-256 `CDE5F944688D9722B677755A88708001FFB56F329964BFE2A46B7BE61D6D51FC`). `.gitattributes` keeps it binary-exact. Never edit it. |
 | `tests/run_tests.py` | Runs every offline scenario against one source file: `LUNE=/path/to/lune python3 VY/tests/run_tests.py <file.luau> [version]` |

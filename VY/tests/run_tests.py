@@ -46,7 +46,7 @@ SCENARIOS += [
 ]
 # VY Wall Crew (Diamond Mountain), also independent of SOURCE.
 for case in ["dry-run", "load", "wall-break", "new-hatch", "not-inside", "refused", "stop", "no-egg-data"]:
-    SCENARIOS.append(("wallcrew-" + case, ["dm_wallcrew.luau", "VY/VY_WallCrew-v0.2.luau", case]))
+    SCENARIOS.append(("wallcrew-" + case, ["dm_wallcrew.luau", "VY/VY_WallCrew-v0.3.luau", case]))
 # Scenarios added in v1.1.8 that reproduce v1.1.7 defects (expected to FAIL on v1.1.7).
 V117_KNOWN_RED = {"crystal-zero-drop-tail", "crystal-stars-complete", "crystal-travel-refused",
                   "crystal-retain-strand", "crystal-protect-setup", "crystal-rankup", "persist-race",

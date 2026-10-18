@@ -1,6 +1,6 @@
 -- =====================================================================================
---  VY Wall Crew v0.2 - Pet Simulator 99, Diamond Mountain (update 98)       2026-10-18
---  Status: tested offline (mocked Lune runtime); live: v0.1 dry run only.
+--  VY Wall Crew v0.3 - Pet Simulator 99, Diamond Mountain (update 98)       2026-10-18
+--  Status: tested offline (mocked Lune runtime); live: v0.1 dry run, v0.2 start-up crash.
 --
 --  Keeps every event pet you own on the Rubble Wall you are smashing:
 --    * event pets you hatch are added to the wall's crew;
@@ -10,6 +10,8 @@
 --  Huge, Titanic and Gargantuan pets are never loaded.
 --  v0.2: v0.1 took every pet from game zone 279 for an event pet; its first live dry run
 --  showed other events' pets share that zone (it planned 13,343 Stitched Cats).
+--  v0.3: v0.2 crashed at start: Directory.Pets raises on a name that is not a pet
+--  ("Unknown Directory Pets.'Nice'"), and an egg's pet list holds such words.
 --
 --  DRY_RUN = true (the default) only prints what it WOULD load and sends nothing.
 --  Check the console (F9), then set DRY_RUN = false below and run it again.
@@ -29,7 +31,7 @@ local CONFIG = {
     MAX_LOADS_PER_CHECK = 8,  -- load requests per check, at most
     CONFIRM_SECONDS = 6,      -- how long to wait for the wall's crew to show a load
 }
-local VERSION = "0.2"
+local VERSION = "0.3"
 local INSTANCE = "DiamondMountain"
 local TAG = "[WallCrew] "
 
@@ -93,9 +95,20 @@ end
 local okPets, Pets = gcall(function() return Directory.Pets end)
 if not (okPets and type(Pets) == "table") then Pets = module("Directory", "Pets") end
 
+-- Directory.Pets raises on an unknown name ("Unknown Directory Pets.'Nice'"), so every
+-- lookup is protected (and cached); false = not a pet.
+local petEntries = {}
+local function petEntry(name)
+    if type(Pets) ~= "table" or type(name) ~= "string" then return nil end
+    if petEntries[name] == nil then
+        local ok, entry = gcall(function() return Pets[name] end)
+        petEntries[name] = (ok and type(entry) == "table") and entry or false
+    end
+    return petEntries[name] or nil
+end
 local function isBig(id)
-    local entry = type(Pets) == "table" and Pets[id] or nil
-    if type(entry) == "table" and (entry.huge or entry.titanic or entry.gargantuan) then return true end
+    local entry = petEntry(id)
+    if entry and (entry.huge or entry.titanic or entry.gargantuan) then return true end
     return id:find("^Huge ") ~= nil or id:find("^Titanic ") ~= nil or id:find("^Gargantuan ") ~= nil
 end
 
@@ -107,7 +120,7 @@ local eggPets, eggCount = {}, 0
 -- { Marmot = 60 } pair; take every string and keep only real pet names.
 local function addPetNames(key, entry)
     local function add(name)
-        if type(name) == "string" and (type(Pets) ~= "table" or Pets[name] ~= nil) and not isBig(name) then
+        if type(name) == "string" and (type(Pets) ~= "table" or petEntry(name) ~= nil) and not isBig(name) then
             eggPets[name] = true
         end
     end
@@ -117,7 +130,8 @@ local function addPetNames(key, entry)
         for _, v in pairs(entry) do add(v) end
     end
 end
-do
+-- Reading the eggs can never stop the script: on any surprise it keeps what it read.
+local okRead, readError = pcall(function()
     local okEggs, eggs = gcall(function() return Directory.Eggs end)
     if not (okEggs and type(eggs) == "table") then eggs = module("Directory", "Eggs") end
     for _, egg in pairs(type(eggs) == "table" and eggs or {}) do
@@ -127,12 +141,15 @@ do
         end)
         if okDm and fromMountain then
             eggCount += 1
-            for key, entry in pairs(type(egg.pets) == "table" and egg.pets or {}) do
-                addPetNames(key, entry)
-            end
+            pcall(function() -- one odd egg must not hide the others
+                for key, entry in pairs(type(egg.pets) == "table" and egg.pets or {}) do
+                    addPetNames(key, entry)
+                end
+            end)
         end
     end
-end
+end)
+if not okRead then log("reading the eggs failed (%s); keeping what was read", tostring(readError)) end
 local accepted = {} -- pet ids a wall's crew has held: the server took them
 local function isEventPet(id)
     return (eggPets[id] == true or accepted[id] == true) and not isBig(id)
