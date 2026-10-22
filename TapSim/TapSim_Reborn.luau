@@ -1,9 +1,10 @@
 -- =====================================================================================
---  Tap Simulator REBORN Helper v1.0 (Roblox place 72858262610964, by Cursor Makers)
+--  Tap Simulator REBORN Helper v1.1 (Roblox place 72858262610964, by Cursor Makers)
 --
 --  One plain, readable file. It loads NO code from the internet (no loadstring/HttpGet),
 --  sends nothing anywhere, and only fires the game's own request remotes, the same ones
---  its buttons fire. Everything starts OFF; turn features on in the window.
+--  its buttons fire. Every feature starts OFF except Anti-AFK; turn them on in the window.
+--  Safe in autoexec: anything the game has not loaded yet is looked up again later.
 --
 --    Auto tap        TapService.TapRequested, paced to the server's tap interval
 --    Game clicker    AutoClickService.AutoClickRequested (needs the game's Auto Clicker)
@@ -21,7 +22,7 @@
 --  is written separately. Live status: Implemented Unverified until run in the game.
 --  Using scripts breaks the Roblox Terms of Use and can get an account banned.
 -- =====================================================================================
-local VERSION = "1.0"
+local VERSION = "1.1"
 local GLOBAL_KEY = "TapSimReborn"
 local SETTINGS_FILE = "TapSimReborn_settings.json"
 
@@ -40,6 +41,8 @@ local player = Players.LocalPlayer
 
 -- selene: allow(global_usage)
 local genv = (type(getgenv) == "function" and getgenv()) or _G
+
+if not game:IsLoaded() then game.Loaded:Wait() end
 
 -- Re-execution: stop the copy that is already running before starting this one.
 do
@@ -77,14 +80,22 @@ local function connect(signal, fn)
     return c
 end
 
--- A worker that runs while alive and reports each distinct error once.
+-- Workers report each distinct error once. A worker that errors (a character mid-respawn,
+-- a game module that changed) starts again 3 seconds later instead of staying dead.
 local lastError = {}
+local function report(name, err)
+    if State.alive and lastError[name] ~= tostring(err) then
+        lastError[name] = tostring(err)
+        log("loop error in", name .. ":", err)
+    end
+end
 local function spawnWorker(name, fn)
     task.spawn(function()
-        local ok, err = pcall(fn)
-        if not ok and State.alive and lastError[name] ~= tostring(err) then
-            lastError[name] = tostring(err)
-            log("loop error in", name .. ":", err)
+        while State.alive do
+            local ok, err = pcall(fn)
+            if ok then return end
+            report(name, err)
+            task.wait(3)
         end
     end)
 end
@@ -92,11 +103,8 @@ local function loop(name, every, fn)
     spawnWorker(name, function()
         while State.alive do
             local ok, err = pcall(fn)
-            if not ok and lastError[name] ~= tostring(err) then
-                lastError[name] = tostring(err)
-                log("loop error in", name .. ":", err)
-            end
-            task.wait(type(every) == "function" and every() or every)
+            if not ok then report(name, err) end
+            task.wait(every)
         end
     end)
 end
@@ -124,21 +132,31 @@ local function on(key) return State.alive and Settings[key] == true end
 -- Game access -----------------------------------------------------------------------------
 
 -- Remotes use sleitnick Comm: ReplicatedStorage.RemoteServices.<Service>.RE|RF.<Name>.
-local remoteCache = {}
+-- A remote that is not there yet is waited for as long as it takes (the game may still be
+-- loading); after 30 seconds the wait is logged once, since an update may have renamed it.
+local remoteCache, remoteWaitLogged = {}, {}
+local function findRemote(service, name)
+    local services = RS:FindFirstChild("RemoteServices")
+    local svc = services and services:FindFirstChild(service)
+    if not svc then return nil end
+    local re, rf = svc:FindFirstChild("RE"), svc:FindFirstChild("RF")
+    return (re and re:FindFirstChild(name)) or (rf and rf:FindFirstChild(name))
+end
 local function remote(service, name)
     local key = service .. "/" .. name
     local found = remoteCache[key]
     if found and found.Parent then return found end
-    local services = RS:WaitForChild("RemoteServices", 30)
-    local svc = services and services:WaitForChild(service, 15)
-    assert(svc, "remote service " .. service .. " is missing")
-    local deadline = os.clock() + 10
-    repeat
-        local re, rf = svc:FindFirstChild("RE"), svc:FindFirstChild("RF")
-        found = (re and re:FindFirstChild(name)) or (rf and rf:FindFirstChild(name))
-        if not found then task.wait(0.1) end
-    until found or os.clock() >= deadline or not State.alive
-    assert(found, "remote " .. key .. " is missing")
+    local started = os.clock()
+    found = findRemote(service, name)
+    while not found do
+        if not State.alive then error("stopped", 0) end
+        if os.clock() - started > 30 and not remoteWaitLogged[key] then
+            remoteWaitLogged[key] = true
+            log("still waiting for remote " .. key .. " (renamed by an update? press Print remote list)")
+        end
+        task.wait(0.5)
+        found = findRemote(service, name)
+    end
     remoteCache[key] = found
     return found
 end
@@ -164,20 +182,25 @@ local function invoke(service, name, ...)
     return table.unpack(result, 1, result.n)
 end
 
--- Shared config modules under ReplicatedStorage.Shared, required once (nil when absent).
-local sharedCache = {}
+-- Shared config modules under ReplicatedStorage.Shared, required once. One that is not
+-- there yet (the game is still loading) is looked up again 5 seconds later.
+local sharedCache, sharedRetryAt = {}, {}
 local function shared(...)
     local key = table.concat({ ... }, ".")
-    if sharedCache[key] == nil then
-        local path = { ... }
-        local ok, module = asGame(function()
-            local nodeAt = RS:FindFirstChild("Shared")
-            for _, part in ipairs(path) do nodeAt = nodeAt and nodeAt:FindFirstChild(part) end
-            return nodeAt and require(nodeAt)
-        end)
-        sharedCache[key] = (ok and module) or false
+    if sharedCache[key] then return sharedCache[key] end
+    if os.clock() < (sharedRetryAt[key] or 0) then return nil end
+    local path = { ... }
+    local ok, module = asGame(function()
+        local nodeAt = RS:FindFirstChild("Shared")
+        for _, part in ipairs(path) do nodeAt = nodeAt and nodeAt:FindFirstChild(part) end
+        return nodeAt and require(nodeAt)
+    end)
+    if ok and module then
+        sharedCache[key] = module
+        return module
     end
-    return sharedCache[key] or nil
+    sharedRetryAt[key] = os.clock() + 5
+    return nil
 end
 -- Calls a function of a game module; returns its first result or nil.
 local function call(module, method, ...)
@@ -189,13 +212,17 @@ local function call(module, method, ...)
 end
 
 -- Player data is a MadStudio Replica read through the client's DataController. Read only.
-local dataController
+-- Until the controller exists (the game is still loading) it is looked for every 5 seconds.
+local dataController, dataRetryAt = nil, 0
 local function data()
-    if dataController == nil then
+    if not dataController and os.clock() >= dataRetryAt then
         local ok, module = asGame(function()
-            return require(RS:WaitForChild("Controllers", 20):WaitForChild("Core", 10):WaitForChild("DataController", 10))
+            local controllers = RS:FindFirstChild("Controllers")
+            local core = controllers and controllers:FindFirstChild("Core")
+            local dc = core and core:FindFirstChild("DataController")
+            return dc and require(dc)
         end)
-        dataController = (ok and module) or false
+        if ok and type(module) == "table" then dataController = module else dataRetryAt = os.clock() + 5 end
     end
     if not dataController then return nil end
     local ok, replica = asGame(function()
@@ -232,11 +259,15 @@ end
 -- The server credits one tap per GameConfig.ManualTapInterval (0.1s) and drops faster ones.
 -- It also only accepts a ClientSequence above the last one it took this session, so the
 -- counter lives in getgenv and survives re-execution. If a run of taps goes unanswered on
--- TapResult (the game's own client got ahead), the counter jumps forward.
+-- TapResult (the game's own client got ahead), the counter jumps forward: doubling up to
+-- 2^50, then a million at a time, so it only ever rises and stays an exact integer (a double
+-- stops counting by 1 at 2^53, after which every tap would look stale).
 
-local MIN_GAP = tonumber(field(shared("Core", "GameConfig"), "ManualTapInterval")) or 0.1
-if MIN_GAP <= 0 then MIN_GAP = 0.1 end
-local MAX_RATE = math.max(1, math.floor(1 / MIN_GAP + 1e-6))
+local function tapInterval()
+    local interval = tonumber(field(shared("Core", "GameConfig"), "ManualTapInterval"))
+    return (interval and interval > 0) and interval or 0.1
+end
+local function maxRate() return math.max(1, math.floor(1 / tapInterval() + 1e-6)) end
 local SEQ_KEY = "__TapSimTapSequence"
 local tapSeq = tonumber(genv[SEQ_KEY]) or 0
 local tapStats = { sent = 0, answered = 0, unanswered = 0, lastAnswer = os.clock(), resyncs = 0, listening = false }
@@ -257,7 +288,7 @@ spawnWorker("tap:auto", function()
     while State.alive do
         if on("AutoTap") then
             if tapStats.listening and tapStats.unanswered >= 25 and os.clock() - tapStats.lastAnswer > 2 then
-                tapSeq = math.max(tapSeq * 2, tapSeq + 1000000)
+                tapSeq = math.max(tapSeq + 1000000, math.min(tapSeq * 2, 2 ^ 50))
                 tapStats.unanswered, tapStats.lastAnswer = 0, os.clock()
                 tapStats.resyncs += 1
             end
@@ -266,9 +297,10 @@ spawnWorker("tap:auto", function()
             tapRemote:FireServer({ Auto = false, ClientSequence = tapSeq, Source = "button" })
             tapStats.sent += 1
             tapStats.unanswered += 1
-            local rate = math.clamp(tonumber(Settings.TapRate) or MAX_RATE, 1, MAX_RATE)
+            local top = maxRate()
+            local rate = math.clamp(tonumber(Settings.TapRate) or top, 1, top)
             -- Jitter only lengthens a gap; a gap under the server interval is a wasted tap.
-            task.wait(math.max(1 / rate, MIN_GAP * 1.04) * (1 + math.random() * 0.12))
+            task.wait(math.max(1 / rate, tapInterval() * 1.04) * (1 + math.random() * 0.12))
         else
             task.wait(0.2)
         end
@@ -280,24 +312,22 @@ end)
 -- so the biggest pack you can afford is the cheapest per rebirth. Only unlocked buttons
 -- (1 + Upgrades.RebirthButtons) are pressed, at most every 1.5 seconds.
 
-local RebirthConfig = shared("Progression", "RebirthConfig")
-local RebirthButtonConfig = shared("Progression", "RebirthButtonConfig")
-local SkillTreeFormula = shared("Progression", "SkillTreeFormula")
-local rebirthStats = { last = -math.huge, bought = 0 }
+local rebirthStats = { last = -math.huge, startedAt = nil }
 
 local function packAmount(index)
-    return tonumber(call(RebirthConfig, "GetAmountFromIndex", index)) or 5 ^ (index - 1)
+    return tonumber(call(shared("Progression", "RebirthConfig"), "GetAmountFromIndex", index)) or 5 ^ (index - 1)
 end
 local function packPrice(d, index)
     local rebirths = tonumber(field(d, "Statistics", "Rebirths")) or 0
-    return tonumber(call(RebirthConfig, "GetPrice", packAmount(index), rebirths))
+    return tonumber(call(shared("Progression", "RebirthConfig"), "GetPrice", packAmount(index), rebirths))
 end
 local function unlockedButtons(d)
     local upgrades = tonumber(field(d, "Upgrades", "RebirthButtons")) or 0
     local world = field(d, "Progression", "World") or "Main"
-    if RebirthButtonConfig then
-        local unlocked = call(RebirthButtonConfig, "GetUnlockedCount", upgrades, world)
-        local count = unlocked and call(RebirthButtonConfig, "GetOptionCount", unlocked, world)
+    local buttons = shared("Progression", "RebirthButtonConfig")
+    if buttons then
+        local unlocked = call(buttons, "GetUnlockedCount", upgrades, world)
+        local count = unlocked and call(buttons, "GetOptionCount", unlocked, world)
         if type(count) == "number" then return count end
     end
     return 1 + math.clamp(math.floor(upgrades), 0, 13)
@@ -314,10 +344,13 @@ loop("rebirth", 0.25, function()
     if not on("AutoRebirth") then return end
     local d = data()
     if not d then return end
-    if not RebirthConfig then
-        note("Rebirth", "rebirth prices unreadable (Shared.Progression.RebirthConfig)")
+    if not shared("Progression", "RebirthConfig") then
+        note("Rebirth", "waiting for the game's rebirth prices (Shared.Progression.RebirthConfig)")
         return
     end
+    -- Counted from the save, so a refused request never shows up as a rebirth.
+    local total = tonumber(field(d, "Statistics", "Rebirths")) or 0
+    rebirthStats.startedAt = rebirthStats.startedAt or total
     local index, price = bestPack(d)
     if not index then
         note("Rebirth", "saving for x1 (" .. short(packPrice(d, 1) or 0) .. " coins)")
@@ -325,11 +358,10 @@ loop("rebirth", 0.25, function()
     end
     if os.clock() - rebirthStats.last < 1.5 then return end
     rebirthStats.last = os.clock()
-    local auto = call(SkillTreeFormula, "HasAutoRebirth", d) == true
+    local auto = call(shared("Progression", "SkillTreeFormula"), "HasAutoRebirth", d) == true
     fire("RebirthService", "RebirthRequested", auto and { Auto = true, Index = index } or { Index = index })
-    rebirthStats.bought += packAmount(index)
-    note("Rebirth", string.format("x%s for %s coins (%s this session)", short(packAmount(index)), short(price),
-        short(rebirthStats.bought)))
+    note("Rebirth", string.format("pressed x%s for %s coins (+%s rebirths this session)", short(packAmount(index)),
+        short(price), short(total - rebirthStats.startedAt)))
 end)
 
 -- Auto hatch ------------------------------------------------------------------------------
@@ -337,8 +369,9 @@ end)
 -- Seq; the server holds the answer until the egg may open again, so one request in flight
 -- is the fastest rate. Count: 8 with the x8 pass or an OctoHatch boost, else 3, else 1.
 
-local EGGS = {} -- name -> { price, island }
-do
+local EGGS = {} -- name -> { price, island }, filled once the game's egg config is readable
+local function loadEggs()
+    if next(EGGS) then return EGGS end
     local cfg = shared("Pets", "LaunchEggConfig")
     if type(cfg) == "table" then
         for name, def in pairs(cfg) do
@@ -347,10 +380,8 @@ do
             end
         end
     end
+    return EGGS
 end
-local EggPricing = shared("Pets", "EggPricing")
-local GamepassPerks = shared("Monetization", "GamepassPerks")
-local BoostFormula = shared("Items", "BoostFormula")
 
 -- Where each egg stands (workspace.Eggs is streamed and may be empty far away).
 local EGG_POSITIONS = {
@@ -367,11 +398,12 @@ local STAND_RANGE = 9
 
 local function eggTotal(d, egg, count)
     local base = EGGS[egg].price
-    return tonumber(call(EggPricing, "GetTotal", d, egg, base, count)) or base * count
+    return tonumber(call(shared("Pets", "EggPricing"), "GetTotal", d, egg, base, count)) or base * count
 end
 local function hatchCount(d, egg)
     local have = coins(d)
-    local octo = call(GamepassPerks, "Has", d, "x8Egg") == true or call(BoostFormula, "HasType", d, "OctoHatch") == true
+    local octo = call(shared("Monetization", "GamepassPerks"), "Has", d, "x8Egg") == true
+        or call(shared("Items", "BoostFormula"), "HasType", d, "OctoHatch") == true
     if octo and eggTotal(d, egg, 8) <= have then return 8 end
     if eggTotal(d, egg, 3) <= have then return 3 end
     if eggTotal(d, egg, 1) <= have then return 1 end
@@ -394,14 +426,14 @@ local function eggCenter(egg)
 end
 
 local function hatchable(d, egg)
-    if not EGGS[egg] or field(d, "Eggs", "Unlocked", egg) ~= true or not eggCenter(egg) then return false end
+    if not loadEggs()[egg] or field(d, "Eggs", "Unlocked", egg) ~= true or not eggCenter(egg) then return false end
     local island = EGGS[egg].island
     return island == nil or island == "Spawn" or field(d, "Progression", "UnlockedIslands", island) == true
 end
 
 local function eggList(d)
     local list = {}
-    for egg in pairs(EGGS) do
+    for egg in pairs(loadEggs()) do
         if not d or hatchable(d, egg) then list[#list + 1] = egg end
     end
     table.sort(list, function(a, b) return EGGS[a].price > EGGS[b].price end)
@@ -442,7 +474,12 @@ local function standSpot(egg, center)
     local ok, spot = pcall(function()
         local params = RaycastParams.new()
         params.FilterType = Enum.RaycastFilterType.Exclude
-        params.FilterDescendantsInstances = { eggModel(egg), player.Character }
+        -- Built without nil holes: Roblox cannot cast { nil, character } to an instance list.
+        local ignore = {}
+        for _, inst in ipairs({ eggModel(egg) or false, player.Character or false }) do
+            if inst then ignore[#ignore + 1] = inst end
+        end
+        params.FilterDescendantsInstances = ignore
         for step = 0, 7 do
             local angle = step * math.pi / 4
             local offset = Vector3.new(math.cos(angle), 0, math.sin(angle)) * 5.5
@@ -558,14 +595,14 @@ loop("equip", 1, function()
 end)
 
 local UPGRADE_ORDER = { "FreeAutoClicker", "ClickMultiplier", "HatchSpeed", "CriticalChance", "AutoClickerSpeed", "Teleport" }
-do
+local function upgradeOrder()
     local order = field(shared("Progression", "UpgradeConfig"), "Order")
-    if type(order) == "table" and #order > 0 then UPGRADE_ORDER = order end
+    return (type(order) == "table" and #order > 0) and order or UPGRADE_ORDER
 end
 local upgradeBlocked = {} -- name -> os.clock() until which it is skipped
 loop("upgrades", 2, function()
     if not on("AutoUpgrades") then return end
-    for _, name in ipairs(UPGRADE_ORDER) do
+    for _, name in ipairs(upgradeOrder()) do
         if not on("AutoUpgrades") then return end
         if os.clock() >= (upgradeBlocked[name] or 0) then
             local ok, res = invoke("UpgradeService", "Purchase", { Name = name })
@@ -581,8 +618,9 @@ loop("upgrades", 2, function()
     end
 end)
 
-local SKILL_NODES = {}
-do
+local SKILL_NODES = {} -- filled once the game's skill tree config is readable
+local function loadSkillNodes()
+    if #SKILL_NODES > 0 then return SKILL_NODES end
     local cfg = shared("Progression", "SkillTreeConfig")
     local seen = {}
     local function walk(t, depth)
@@ -599,13 +637,14 @@ do
     end
     if type(cfg) == "table" then walk(cfg, 0) end
     table.sort(SKILL_NODES)
+    return SKILL_NODES
 end
 local skillBlocked = {}
 loop("skilltree", 3, function()
     if not on("AutoSkillTree") then return end
     local d = data()
     if not d then return end
-    for _, nodeName in ipairs(SKILL_NODES) do
+    for _, nodeName in ipairs(loadSkillNodes()) do
         if not on("AutoSkillTree") then return end
         if field(d, "SkillTree", "Unlocked", nodeName) ~= true and os.clock() >= (skillBlocked[nodeName] or 0) then
             local ok, res = invoke("SkillTreeService", "Unlock", { Name = nodeName })
@@ -636,8 +675,10 @@ loop("quests", 2, function()
     if type(quests) ~= "table" then return end
     for id, quest in pairs(quests) do
         if type(quest) == "table" and quest.Completed and not quest.Claimed and due("quest", id, 10) then
-            invoke("QuestService", "ClaimQuest", { Quest = id })
-            note("Quests", "claimed " .. tostring(id))
+            local ok, res = invoke("QuestService", "ClaimQuest", { Quest = id })
+            if ok and res ~= false and not (type(res) == "table" and res.Success == false) then
+                note("Quests", "claimed " .. tostring(id))
+            end
             task.wait(0.3)
         end
     end
@@ -649,19 +690,22 @@ loop("chests", 3, function()
     if type(chests) ~= "table" then return end
     for id in pairs(chests) do
         if due("chest", id, 10) then
-            invoke("TapChestService", "Claim", id)
-            note("Chests", "claimed " .. tostring(id))
+            local ok, res = invoke("TapChestService", "Claim", id)
+            if ok and res ~= false and not (type(res) == "table" and res.Success == false) then
+                note("Chests", "claimed " .. tostring(id))
+            end
             task.wait(0.3)
         end
     end
 end)
 
+local function claimOffline()
+    local ok, res = invoke("OfflineRewardsService", "Claim", false)
+    note("Offline", (ok and res ~= false) and "claimed offline earnings" or "nothing to claim")
+end
 spawnWorker("offline", function()
     task.wait(3)
-    if on("ClaimOffline") then
-        invoke("OfflineRewardsService", "Claim", false)
-        note("Offline", "claimed offline earnings")
-    end
+    if on("ClaimOffline") then claimOffline() end
 end)
 
 -- Anti-AFK: Roblox kicks after 20 idle minutes; a virtual click resets the timer.
@@ -811,7 +855,7 @@ local function button(name, text, fn)
     return b
 end
 
-toggle("AutoTap", "Auto tap (" .. MAX_RATE .. "/s max)")
+toggle("AutoTap", "Auto tap (" .. maxRate() .. "/s max)")
 toggle("GameAutoClicker", "Game auto clicker", function(enabled)
     task.spawn(pcall, fire, "AutoClickService", "AutoClickRequested", { Enabled = enabled == true })
 end)
@@ -834,7 +878,9 @@ toggle("AutoUpgrades", "Auto buy upgrades")
 toggle("AutoSkillTree", "Auto unlock skill tree (gems)")
 toggle("AutoQuests", "Auto claim quests")
 toggle("AutoChests", "Auto claim tap chests")
-toggle("ClaimOffline", "Claim offline earnings on start")
+toggle("ClaimOffline", "Claim offline earnings", function(enabled)
+    if enabled then spawnWorker("offline", claimOffline) end
+end)
 toggle("AntiAfk", "Anti-AFK")
 button("ListRemotes", "Print remote list (read-only)", listRemotes)
 
@@ -902,7 +948,8 @@ local Handle = { Version = VERSION, State = State }
 function Handle.Stop()
     if not State.alive then return end
     -- Turn the game's own auto clicker back off while requests are still allowed.
-    if Settings.GameAutoClicker then pcall(fire, "AutoClickService", "AutoClickRequested", { Enabled = false }) end
+    -- Spawned, so Stop never waits on a remote that has not loaded.
+    if Settings.GameAutoClicker then task.spawn(pcall, fire, "AutoClickService", "AutoClickRequested", { Enabled = false }) end
     State.alive = false
     for _, c in ipairs(connections) do pcall(function() c:Disconnect() end) end
     pcall(function() gui:Destroy() end)

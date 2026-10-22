@@ -64,9 +64,16 @@ function W.build(opts)
         Sky = Vector3.new(-88, -48, -1904),
     }
     for name, at in pairs(W.eggAt) do
+        if opts.noEggModels then continue end
         local model = node("Model", name, eggsFolder)
         local part = node("Part", "Egg", model)
         part.CFrame = CFrame.new(at)
+    end
+
+    -- Collidable ground under every ray, at the height that puts a stand spot level with the egg.
+    local floor = node("Part", "Floor", ws, { CanCollide = true })
+    R.raycast = function(origin)
+        return { Instance = floor, Normal = Vector3.new(0, 1, 0), Position = Vector3.new(origin.X, origin.Y - 7, origin.Z) }
     end
 
     local save = {
@@ -84,10 +91,12 @@ function W.build(opts)
     local replica = { Data = save }
 
     -- Client modules the helper requires.
-    local controllers = node("Folder", "Controllers", rs)
+    local lateParent = rs
+    if opts.lateLoad then lateParent = nil end
+    local controllers = node("Folder", "Controllers", lateParent)
     local core = node("Folder", "Core", controllers)
     moduleScript("DataController", core, { GetReplica = function() return replica end })
-    local sharedFolder = node("Folder", "Shared", rs)
+    local sharedFolder = node("Folder", "Shared", lateParent)
     local function sharedModule(group, name, value)
         local folder = sharedFolder:FindFirstChild(group) or node("Folder", group, sharedFolder)
         moduleScript(name, folder, value)
@@ -115,7 +124,7 @@ function W.build(opts)
     })
 
     -- Remotes (sleitnick Comm layout).
-    local services = node("Folder", "RemoteServices", rs)
+    local services = node("Folder", "RemoteServices", lateParent)
     local remotes = {}
     local function remote(svc, kind, name)
         local s = services:FindFirstChild(svc) or node("Folder", svc, services)
@@ -132,9 +141,17 @@ function W.build(opts)
         { "SkillTreeService", "RF", "Unlock" }, { "QuestService", "RF", "ClaimQuest" },
         { "TapChestService", "RF", "Claim" }, { "OfflineRewardsService", "RF", "Claim" },
     }) do
-        remote(spec[1], spec[2], spec[3])
+        if not (opts.lateTapRemote and spec[3] == "TapRequested") then remote(spec[1], spec[2], spec[3]) end
     end
     W.remotes = remotes
+    if opts.lateLoad then
+        vdelay(opts.lateLoad, function()
+            for _, folder in ipairs({ controllers, sharedFolder, services }) do folder.Parent = rs end
+        end)
+    end
+    if opts.lateTapRemote then
+        vdelay(opts.lateTapRemote, function() remote("TapService", "RE", "TapRequested") end)
+    end
 
     -- Fake server.
     W.server = { lastSeq = opts.serverSeq or 0, lastTap = -math.huge, accepted = 0, tooFast = 0, stale = 0,
@@ -154,7 +171,9 @@ function W.build(opts)
         S.lastSeq, S.lastTap = p.ClientSequence, now
         S.accepted += 1
         save.Currencies.Coins += S.tapPower
-        vdelay(0.05, function() remotes["TapService.TapResult"].OnClientEvent:Fire({ ClientSequence = p.ClientSequence }) end)
+        if not opts.silentTaps then
+            vdelay(0.05, function() remotes["TapService.TapResult"].OnClientEvent:Fire({ ClientSequence = p.ClientSequence }) end)
+        end
     end
     handlers["RebirthService.RebirthRequested"] = function(p)
         table.insert(S.rebirthTimes, R.vclock())
@@ -269,6 +288,17 @@ local function makeEnv(genv)
             table.insert(printed, table.concat(parts, " "))
         end,
         getgenv = function() return genv end,
+        RaycastParams = { new = function()
+            return setmetatable({}, { __newindex = function(t, k, v)
+                if k == "FilterDescendantsInstances" then
+                    local n = 0
+                    for _ in pairs(v) do n += 1 end
+                    for i = 1, #v do if v[i] == nil then n = -1 end end
+                    if n ~= #v then error("Unable to cast value to Objects", 2) end
+                end
+                rawset(t, k, v)
+            end })
+        end },
         setthreadidentity = function() end,
         gethui = function() return W.hui end,
         isfile = function(p) return W.files[p] ~= nil end,

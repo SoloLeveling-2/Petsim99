@@ -2,7 +2,8 @@
 -- Copied from VY/tests/lune/roblox_mock.luau so the TapSim harness is self-contained.
 -- One change: FireServer/InvokeServer report a remote as "<Service>.<Name>" when it sits in
 -- a sleitnick Comm folder (<Service>/RE|RF/<Name>), because Tap Simulator reuses remote names
--- (Claim, Hit, Purchase) across services. Fake Roblox datatypes/instances/signals only.
+-- (Claim, Hit, Purchase) across services. WaitForChild waits on the virtual clock and
+-- workspace:Raycast asks M.raycast. Fake Roblox datatypes/instances/signals only.
 -- Minimal Roblox + PS99 client mock for running the WHOLE RankPilot bundle in
 -- the real Luau VM (Lune). It fakes Instances, datatypes, services and a few
 -- PS99 client modules. Time runs SPEED times faster than real time so a few
@@ -230,8 +231,18 @@ function methods:FindFirstAncestorOfClass(class)
     end
     return nil
 end
-function methods:WaitForChild(name)
-    return self:FindFirstChild(name)
+-- Waits on the virtual clock like Roblox (nil after the timeout; 60s stands in for "forever").
+function methods:WaitForChild(name, timeout)
+    local found = self:FindFirstChild(name)
+    local deadline = vclock() + (timeout or 60)
+    while not found and vclock() < deadline do
+        luneTask.wait(0.1 / M.SPEED)
+        found = self:FindFirstChild(name)
+    end
+    return found
+end
+function methods:Raycast(origin, direction, params)
+    return M.raycast and M.raycast(origin, direction, params) or nil
 end
 function methods:IsDescendantOf(other)
     local node = rawget(self, "__props").Parent
