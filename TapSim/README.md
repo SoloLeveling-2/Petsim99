@@ -36,12 +36,15 @@ Your toggles are saved to `TapSimReborn_settings.json` in the executor workspace
   - `stand-spot`: egg models are not streamed in.
 - **Proof the tests catch bugs:** each v1.1 fix was first reproduced as a failing scenario on v1.0. Planted bugs (no re-sync, taps too fast, no teleport, locked button, or a 2^52 cap on the tap counter) each turn a scenario red.
 
+Run all six scenarios with Lune alone, no Python needed. Run it from the folder that holds `TapSim\`.
 ```
-python TapSim/tests/run_tests.py
-lune run TapSim/tests/lune/smoke.luau TapSim/TapSim_Reborn.luau
-lune run TapSim/tests/lune/edge.luau TapSim/TapSim_Reborn.luau late-load
+.\tools\lune.exe run TapSim/tests/lune/run_all.luau        # Windows, lune.exe in tools\
+lune run TapSim/tests/lune/run_all.luau                    # Linux/macOS, lune on PATH
+lune run TapSim/tests/lune/edge.luau TapSim/TapSim_Reborn.luau late-load   # one scenario
 ```
-The first line runs all six scenarios. It needs `lune` on PATH or `LUNE=<path>`.
+`python TapSim/tests/run_tests.py` does the same if you have Python.
+
+Virtual time runs 40x faster than real time, or 4x on Windows. Windows never sleeps less than ~15.6 ms, which at 40x stretched the 0.1s tap gap and failed the tap checks. On Windows the full run takes about 3 minutes, most of it `silent-taps`. Set `TAPSIM_SPEED=<n>` to override the speed.
 
 ## Changes in v1.1
 - **Autoexec:** v1.0 read the game's config and save data once at start. If the game had not loaded yet, hatch, rebirth and the status line stayed dead all session. They are now looked up again until found, and remotes are waited for instead of timing out.

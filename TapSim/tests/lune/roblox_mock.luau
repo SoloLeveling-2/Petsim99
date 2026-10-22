@@ -3,7 +3,8 @@
 -- One change: FireServer/InvokeServer report a remote as "<Service>.<Name>" when it sits in
 -- a sleitnick Comm folder (<Service>/RE|RF/<Name>), because Tap Simulator reuses remote names
 -- (Claim, Hit, Purchase) across services. WaitForChild waits on the virtual clock and
--- workspace:Raycast asks M.raycast. Fake Roblox datatypes/instances/signals only.
+-- workspace:Raycast asks M.raycast, and SPEED depends on the OS (see below). Fake Roblox
+-- datatypes/instances/signals only.
 -- Minimal Roblox + PS99 client mock for running the WHOLE RankPilot bundle in
 -- the real Luau VM (Lune). It fakes Instances, datatypes, services and a few
 -- PS99 client modules. Time runs SPEED times faster than real time so a few
@@ -12,9 +13,13 @@
 -- errors against these fakes; it does NOT prove live PS99 compatibility.
 local luneTask = require("@lune/task")
 local serde = require("@lune/serde")
+local process = require("@lune/process")
 
 local M = {}
-M.SPEED = 40
+-- Virtual time runs SPEED times faster than real time. Windows never sleeps less than ~15.6 ms,
+-- so at 40x the helper's 0.1 s tap gap (2.6 ms real) stretches about 6x and starves the tap
+-- checks; Windows runs at 4x instead (26 ms real). TAPSIM_SPEED=<n> overrides either.
+M.SPEED = tonumber(process.env.TAPSIM_SPEED) or (process.os == "windows" and 4 or 40)
 local realClock = os.clock
 local startReal = realClock()
 local function vclock() return 1000 + (realClock() - startReal) * M.SPEED end
